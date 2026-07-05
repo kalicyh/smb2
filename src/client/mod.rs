@@ -896,6 +896,21 @@ impl SmbClient {
         }
     }
 
+    /// Open a random-access [`FileReader`](stream::FileReader) over a file on
+    /// the share.
+    ///
+    /// Clones the client's primary connection (cheap `Arc::clone`) and the
+    /// `Tree`, then returns a reader that serves any number of positioned reads
+    /// at arbitrary offsets over one open handle. The returned reader is
+    /// `'static` and does not borrow the client, so concurrent readers proceed
+    /// in parallel over the single SMB session. Call
+    /// [`FileReader::close`](stream::FileReader::close) when done.
+    ///
+    /// No DFS retry; the reader pins to the connection it was built from.
+    pub async fn open_file_reader(&self, tree: &Tree, path: &str) -> Result<stream::FileReader> {
+        stream::open_file_reader(std::sync::Arc::new(tree.clone()), self.conn.clone(), path).await
+    }
+
     /// Create a push-based pipelined streaming file writer.
     ///
     /// Opens (or creates) the file for writing and returns a [`FileWriter`]

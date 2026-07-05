@@ -1986,6 +1986,22 @@ impl Tree {
         Ok(bytes_written)
     }
 
+    /// Open a random-access [`FileReader`](super::stream::FileReader) that owns
+    /// its `Connection` and `Arc<Tree>`.
+    ///
+    /// Opens the file for reading and hands back a reader that serves any number
+    /// of positioned reads at arbitrary offsets over the one open handle, then
+    /// [`close`](super::stream::FileReader::close)s. The returned reader is
+    /// `'static` — multiple readers built from clones of the same `Connection`
+    /// pipeline their READs over a single SMB session.
+    pub async fn open_file_reader(
+        self: &Arc<Self>,
+        conn: Connection,
+        path: &str,
+    ) -> Result<super::stream::FileReader> {
+        super::stream::open_file_reader(Arc::clone(self), conn, path).await
+    }
+
     /// Create a push-based pipelined streaming writer that owns its
     /// `Connection` and `Arc<Tree>`.
     ///

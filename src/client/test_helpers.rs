@@ -164,6 +164,39 @@ pub(crate) fn build_flush_response() -> Vec<u8> {
     pack_message(&h, &body)
 }
 
+/// Build a READ response carrying the given data bytes.
+pub(crate) fn build_read_response(data: Vec<u8>) -> Vec<u8> {
+    use crate::msg::read::ReadResponse;
+    let mut h = Header::new_request(Command::Read);
+    h.flags.set_response();
+    h.credits = 32;
+
+    let body = ReadResponse {
+        data_offset: 0x50,
+        data_remaining: 0,
+        flags: 0,
+        data,
+    };
+
+    pack_message(&h, &body)
+}
+
+/// Build a READ response with a non-success status (for error tests).
+pub(crate) fn build_read_error_response(status: crate::types::status::NtStatus) -> Vec<u8> {
+    use crate::msg::header::ErrorResponse;
+    let mut h = Header::new_request(Command::Read);
+    h.flags.set_response();
+    h.credits = 32;
+    h.status = status;
+
+    let body = ErrorResponse {
+        error_context_count: 0,
+        error_data: vec![],
+    };
+
+    pack_message(&h, &body)
+}
+
 /// Build a TREE_CONNECT response with the given tree ID and share type.
 pub(crate) fn build_tree_connect_response(tree_id: TreeId, share_type: ShareType) -> Vec<u8> {
     let mut h = Header::new_request(Command::TreeConnect);

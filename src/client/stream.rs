@@ -1,6 +1,7 @@
 //! Streaming file I/O with progress reporting.
 //!
 //! Provides [`FileDownload`] for memory-efficient large file downloads,
+//! [`FileReader`] for random-access positioned reads over one open handle,
 //! [`FileUpload`] for streaming uploads with progress,
 //! [`FileWriter`] for push-based pipelined writes (use
 //! [`FileWriter::finish`] for normal completion, [`FileWriter::abort`] for
@@ -289,6 +290,197 @@ impl Drop for FileDownload<'_> {
             );
             // We can't close the handle in Drop because it's async.
             // The caller should consume the download fully or call close().
+        }
+    }
+}
+
+/// A random-access reader over one open file handle.
+///
+/// Where [`FileDownload`] streams a file front-to-back (one chunk in memory,
+/// forward only), `FileReader` holds the handle open and serves any number of
+/// *positioned* reads at arbitrary offsets — the SMB analog of `pread`. It's the
+/// right primitive for a consumer that parses a file's structure by jumping
+/// around it (a zip's end-of-central-directory near the tail, then the central
+/// directory before it, then member data mid-file), all over a SINGLE
+/// open → N reads → close handle lifecycle rather than one open per read.
+///
+/// Owns a cheap `Arc::clone` of [`Connection`] and an `Arc<Tree>`, so it's
+/// `'static` — move it across tasks or hand it to `tokio::spawn`. Because
+/// [`read_at`](FileReader::read_at) takes `&self` and holds no shared cursor,
+/// concurrent positioned reads over one reader are independent and pipeline over
+/// the single SMB session (the receiver task multiplexes responses by
+/// `MessageId`).
+///
+/// Call [`close`](FileReader::close) when done to release the server handle.
+/// Like the other stream handles, `Drop` cannot CLOSE (Rust has no async drop),
+/// so a reader dropped without `close()` leaks the handle until session teardown
+/// and logs a debug warning.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example(client: &smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// let reader = client.open_file_reader(share, "archive.zip").await?;
+/// let size = reader.size();
+/// // Read the 22-byte end-of-central-directory record at the tail, then jump
+/// // to the central directory it points at — two positioned reads, one handle.
+/// let eocd = reader.read_at(size.saturating_sub(22), 22).await?;
+/// let dir = reader.read_at(0x1000, 512).await?;
+/// reader.close().await?;
+/// # let _ = (eocd, dir);
+/// # Ok(())
+/// # }
+/// ```
+pub struct FileReader {
+    tree: Arc<Tree>,
+    conn: Connection,
+    file_id: FileId,
+    file_size: u64,
+    max_read: u32,
+    closed: bool,
+}
+
+/// Open a file for reading and return a random-access [`FileReader`] that owns
+/// its `Connection` and `Arc<Tree>`.
+///
+/// Use this when you hold a cloned `Connection` and want to serve many
+/// positioned reads over one open handle without holding any external lock.
+/// The returned reader is `'static` — it doesn't borrow from anything.
+///
+/// [`SmbClient::open_file_reader`](crate::SmbClient::open_file_reader) and
+/// [`Tree::open_file_reader`] are thin convenience wrappers; reach for them when
+/// you already hold an `&SmbClient` or `&Arc<Tree>` and don't need the explicit
+/// connection clone.
+pub async fn open_file_reader(
+    tree: Arc<Tree>,
+    mut conn: Connection,
+    path: &str,
+) -> Result<FileReader> {
+    let normalized = tree.format_path(path);
+    debug!("stream: open_file_reader path={}", normalized);
+
+    let (file_id, file_size) = tree.open_file(&mut conn, &normalized).await?;
+    let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+
+    Ok(FileReader::new(tree, conn, file_id, file_size, max_read))
+}
+
+impl FileReader {
+    /// Wrap an already-opened read handle. Most callers want
+    /// [`open_file_reader`], [`Tree::open_file_reader`], or
+    /// [`SmbClient::open_file_reader`](crate::SmbClient::open_file_reader),
+    /// which issue the CREATE for you.
+    pub(crate) fn new(
+        tree: Arc<Tree>,
+        conn: Connection,
+        file_id: FileId,
+        file_size: u64,
+        max_read: u32,
+    ) -> Self {
+        Self {
+            tree,
+            conn,
+            file_id,
+            file_size,
+            max_read,
+            closed: false,
+        }
+    }
+
+    /// Total file size in bytes, as seen when the handle was opened.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// Read up to `len` bytes starting at `offset`.
+    ///
+    /// Positioned like `pread`: `offset` is absolute in the file and no cursor
+    /// advances, so calls are independent and may run concurrently. Returns
+    /// fewer than `len` bytes only at end of file — a read wholly at or past the
+    /// end yields an empty `Vec`, and a read that straddles the end is clamped
+    /// to what exists. A range larger than the server's `MaxReadSize` is split
+    /// into that many wire-level READs and reassembled, so the caller passes the
+    /// range it wants without minding the negotiated cap.
+    pub async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        // A read at or past EOF yields no bytes; a read overrunning EOF is
+        // clamped so we never ask the server for bytes that don't exist (which
+        // would come back as STATUS_END_OF_FILE and complicate the loop).
+        if len == 0 || offset >= self.file_size {
+            return Ok(Vec::new());
+        }
+        let to_read = len.min(self.file_size - offset);
+        let end = offset + to_read;
+        let mut out = Vec::with_capacity(to_read as usize);
+        let mut pos = offset;
+
+        while pos < end {
+            let chunk_len = (end - pos).min(self.max_read as u64) as u32;
+            let req = ReadRequest {
+                padding: 0x50,
+                flags: 0,
+                length: chunk_len,
+                offset: pos,
+                file_id: self.file_id,
+                minimum_count: 0,
+                channel: SMB2_CHANNEL_NONE,
+                remaining_bytes: 0,
+                read_channel_info: vec![],
+            };
+
+            let credit_charge = (chunk_len as u64).div_ceil(65536).max(1) as u16;
+            let frame = self
+                .conn
+                .execute_with_credits(
+                    Command::Read,
+                    &req,
+                    Some(self.tree.tree_id),
+                    crate::types::CreditCharge(credit_charge),
+                )
+                .await?;
+
+            // Even after clamping to the size seen at open, a racing truncation
+            // (or a zero-length file) can surface EOF; treat it as a short read.
+            if frame.header.status == NtStatus::END_OF_FILE {
+                break;
+            }
+            if frame.header.status != NtStatus::SUCCESS {
+                return Err(Error::Protocol {
+                    status: frame.header.status,
+                    command: Command::Read,
+                });
+            }
+
+            let mut cursor = ReadCursor::new(&frame.body);
+            let resp = ReadResponse::unpack(&mut cursor)?;
+            if resp.data.is_empty() {
+                break;
+            }
+            pos += resp.data.len() as u64;
+            out.extend_from_slice(&resp.data);
+        }
+
+        Ok(out)
+    }
+
+    /// Close the file handle, releasing it on the server.
+    ///
+    /// Consumes `self` so read-after-close is a compile error. Call this on
+    /// every reader; a dropped-without-close reader leaks the handle (see the
+    /// type-level note).
+    pub async fn close(mut self) -> Result<()> {
+        self.closed = true;
+        self.tree.close_handle(&mut self.conn, self.file_id).await
+    }
+}
+
+impl Drop for FileReader {
+    fn drop(&mut self) {
+        if !self.closed {
+            debug!(
+                "stream: FileReader dropped without close(), file handle may leak \
+                 until session teardown"
+            );
         }
     }
 }
@@ -1010,7 +1202,8 @@ mod tests {
     use super::*;
     use crate::client::test_helpers::{
         build_close_error_response, build_close_response, build_create_response,
-        build_flush_response, build_write_error_response, build_write_response, setup_connection,
+        build_flush_response, build_read_error_response, build_read_response,
+        build_write_error_response, build_write_response, setup_connection,
     };
     use crate::transport::MockTransport;
     use crate::types::status::NtStatus;
@@ -1458,6 +1651,151 @@ mod tests {
         // The writer has been consumed. `Drop` ran inside abort's frame
         // with done=true, so no warning fired. (Behavior-only check;
         // exposing `done` for inspection was not needed.)
+    }
+
+    // ── FileReader tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn file_reader_positioned_reads_one_open_one_close() {
+        // The core no-leak contract: one CREATE, N positioned READs at
+        // arbitrary offsets, one CLOSE — the handle is opened once and released
+        // once no matter how many reads run.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 1000));
+        mock.queue_response(build_read_response(vec![0xAA; 4]));
+        mock.queue_response(build_read_response(vec![0xBB; 8]));
+        mock.queue_response(build_read_response(vec![0xCC; 2]));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let reader = tree.open_file_reader(conn, "archive.zip").await.unwrap();
+        assert_eq!(reader.size(), 1000);
+
+        // Three reads at different offsets, out of order — no shared cursor.
+        assert_eq!(reader.read_at(500, 4).await.unwrap(), vec![0xAA; 4]);
+        assert_eq!(reader.read_at(0, 8).await.unwrap(), vec![0xBB; 8]);
+        assert_eq!(reader.read_at(998, 2).await.unwrap(), vec![0xCC; 2]);
+
+        reader.close().await.unwrap();
+
+        // CREATE + 3 READ + CLOSE = 5. Exactly one open, exactly one close.
+        assert_eq!(mock.sent_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn file_reader_clamps_and_skips_reads_at_or_past_eof() {
+        // A read wholly past EOF issues NO wire READ and returns empty; a read
+        // straddling EOF is clamped to what exists. file_size = 10.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 10));
+        // Only ONE READ hits the wire: the clamped [8, 10) read of 2 bytes.
+        mock.queue_response(build_read_response(vec![0xEE; 2]));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let reader = tree.open_file_reader(conn, "small.bin").await.unwrap();
+
+        // Wholly past EOF → empty, no wire traffic.
+        assert!(reader.read_at(10, 5).await.unwrap().is_empty());
+        assert!(reader.read_at(99, 100).await.unwrap().is_empty());
+        // Zero-length → empty, no wire traffic.
+        assert!(reader.read_at(0, 0).await.unwrap().is_empty());
+        // Straddling EOF: asked for 100 at offset 8, clamped to 2 bytes.
+        assert_eq!(reader.read_at(8, 100).await.unwrap(), vec![0xEE; 2]);
+
+        reader.close().await.unwrap();
+
+        // CREATE + 1 READ (the clamped one) + CLOSE = 3. The past-EOF and
+        // zero-length reads never touched the wire.
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn file_reader_splits_range_larger_than_max_read() {
+        // A single read_at spanning more than MaxReadSize (65536 in the test
+        // params) is split into consecutive wire READs and reassembled.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        let total = 65536usize * 2 + 100; // 3 wire reads: 65536, 65536, 100
+        mock.queue_response(build_create_response(file_id, total as u64));
+        mock.queue_response(build_read_response(vec![1u8; 65536]));
+        mock.queue_response(build_read_response(vec![2u8; 65536]));
+        mock.queue_response(build_read_response(vec![3u8; 100]));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let reader = tree.open_file_reader(conn, "big.bin").await.unwrap();
+        let data = reader.read_at(0, total as u64).await.unwrap();
+        assert_eq!(data.len(), total);
+        assert_eq!(&data[..65536], &vec![1u8; 65536][..]);
+        assert_eq!(&data[65536..65536 * 2], &vec![2u8; 65536][..]);
+        assert_eq!(&data[65536 * 2..], &vec![3u8; 100][..]);
+
+        reader.close().await.unwrap();
+
+        // CREATE + 3 READ + CLOSE = 5 — still ONE open and ONE close for the
+        // whole split range.
+        assert_eq!(mock.sent_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn file_reader_surfaces_read_error() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 100));
+        mock.queue_response(build_read_error_response(NtStatus::ACCESS_DENIED));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let reader = tree.open_file_reader(conn, "denied.bin").await.unwrap();
+        let result = reader.read_at(0, 10).await;
+        assert!(matches!(
+            result,
+            Err(Error::Protocol {
+                status: NtStatus::ACCESS_DENIED,
+                command: Command::Read,
+            })
+        ));
+        // The caller still owns the handle and can close it cleanly.
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_reader_dropped_without_close_sends_no_close() {
+        // Documents the leak contract: dropping without close() issues NO CLOSE
+        // (the handle lingers server-side until session teardown). Drop logs a
+        // debug warning; we assert the wire behavior it implies.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 100));
+        mock.queue_response(build_read_response(vec![0x11; 4]));
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        {
+            let reader = tree.open_file_reader(conn, "leak.bin").await.unwrap();
+            assert_eq!(reader.read_at(0, 4).await.unwrap(), vec![0x11; 4]);
+            // Dropped here without close().
+        }
+
+        // CREATE + 1 READ, and crucially NO CLOSE.
+        assert_eq!(mock.sent_count(), 2);
     }
 
     // ── Progress tests ─────────────────────────────────────────────────

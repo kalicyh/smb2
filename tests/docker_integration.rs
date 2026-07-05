@@ -319,6 +319,83 @@ async fn guest_pipelined_write() {
     tree.disconnect(&mut conn).await.expect("disconnect failed");
 }
 
+// ── Random-access reads (smb-guest) ──────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn guest_file_reader_positioned_reads() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_guest().await;
+    let tree = std::sync::Arc::new(tree);
+
+    let test_path = "docker_test_read_at.tmp";
+    // A non-repeating-per-window byte pattern so an offset mistake shows up as a
+    // content mismatch rather than passing by luck.
+    let test_data: Vec<u8> = (0..100_000u32).map(|i| (i % 256) as u8).collect();
+    tree.write_file(&mut conn, test_path, &test_data)
+        .await
+        .expect("write_file failed");
+
+    // One open handle serves every read below, then one close — proving the
+    // primitive's open -> N positioned reads -> close lifecycle end to end.
+    let reader = tree
+        .open_file_reader(conn.clone(), test_path)
+        .await
+        .expect("open_file_reader failed");
+    assert_eq!(reader.size(), test_data.len() as u64);
+
+    // Out-of-order positioned reads: head, mid, tail.
+    let head = reader.read_at(0, 16).await.expect("head read failed");
+    assert_eq!(head, &test_data[0..16], "head mismatch");
+
+    let mid = reader.read_at(50_000, 4096).await.expect("mid read failed");
+    assert_eq!(mid, &test_data[50_000..54_096], "mid mismatch");
+
+    let tail_off = test_data.len() as u64 - 10;
+    let tail = reader
+        .read_at(tail_off, 10)
+        .await
+        .expect("tail read failed");
+    assert_eq!(tail, &test_data[test_data.len() - 10..], "tail mismatch");
+
+    // A read wholly past EOF yields nothing.
+    assert!(
+        reader
+            .read_at(test_data.len() as u64, 100)
+            .await
+            .expect("past-eof read failed")
+            .is_empty(),
+        "read past EOF should be empty"
+    );
+
+    // A read straddling EOF is clamped to the bytes that exist.
+    let straddle = reader
+        .read_at(test_data.len() as u64 - 5, 100)
+        .await
+        .expect("straddle read failed");
+    assert_eq!(
+        straddle,
+        &test_data[test_data.len() - 5..],
+        "straddle-EOF read should clamp to 5 bytes"
+    );
+
+    // A full-file positioned read exercises reassembly across wire READs.
+    let whole = reader
+        .read_at(0, test_data.len() as u64)
+        .await
+        .expect("whole read failed");
+    assert_eq!(whole.len(), test_data.len(), "whole-file size mismatch");
+    assert_eq!(whole, test_data, "whole-file content mismatch");
+
+    reader.close().await.expect("close failed");
+
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
 // ── Share enumeration ────────────────────────────────────────────────
 
 #[tokio::test]

@@ -10,7 +10,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `connection.rs` | `Connection` -- credit tracking, message sequencing, signing, encryption, `execute` / `execute_compound` |
 | `session.rs` | `Session::setup()` -- NTLM auth, key derivation, signing/encryption activation |
 | `tree.rs` | `Tree` -- share connection, file CRUD, compound and pipelined I/O |
-| `stream.rs` | `FileDownload` / `FileUpload` / `FileWriter` (owns `Connection` + `Arc<Tree>`, `'static`) / `open_file_writer` -- streaming I/O with progress |
+| `stream.rs` | `FileDownload` / `FileReader` (random-access positioned reads) / `FileUpload` / `FileWriter` (owns `Connection` + `Arc<Tree>`, `'static`) / `open_file_writer` / `open_file_reader` -- streaming and positioned I/O |
 | `watcher.rs` | `Watcher` -- directory change notifications via CHANGE_NOTIFY long-poll |
 | `pipeline.rs` | `Pipeline` / `Op` / `OpResult` -- batched concurrent operations (the core feature) |
 | `shares.rs` | Share enumeration via IPC$ + srvsvc RPC |
@@ -97,6 +97,12 @@ For large files, `read_file_pipelined` / `write_file_pipelined` issue multiple `
 `FileWriter` owns its `Connection` (cheap `Arc::clone`) and `Arc<Tree>` — no lifetime parameter, no borrow against the `SmbClient` that built it. It keeps an owned `FuturesUnordered<BoxedWriteFut>` field — `launch_wire_chunk` pushes a boxed `execute_with_credits` future, `drain_one` awaits `in_flight.next()`, and the public `write_chunk` / `finish` / `abort` drive that state machine.
 
 FileWriter provides push-based pipelined writes. The consumer pushes chunks at their own pace via `write_chunk`, with the sliding window handling backpressure. Complement to FileDownload (read streaming). Build one via `open_file_writer(tree, conn, path)` (free function), `Tree::create_file_writer(&Arc<Self>, conn, path)`, or `SmbClient::create_file_writer(&self, tree, path)` — the last clones the client's primary connection internally for convenience.
+
+## Random-access reads (`FileReader`)
+
+`FileReader` (in `stream.rs`) holds ONE open handle and serves any number of *positioned* reads (`read_at(offset, len)`, the SMB analog of `pread`) before an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (zip central-directory browse + entry extract), where reopening per read would leak a handle each time. Build one via `open_file_reader(tree: Arc<Tree>, conn, path)` (free fn), `Tree::open_file_reader(&Arc<Self>, conn, path)`, or `SmbClient::open_file_reader(&self, tree, path)` (clones the primary connection).
+
+Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`. `read_at` takes `&self` (no shared cursor) and issues `execute_with_credits` READs, splitting a range larger than `MaxReadSize` into consecutive wire reads and reassembling. It clamps to the size seen at open, so a read at/after EOF returns empty and a straddling read is short — never an error. `close()` consumes `self` (read-after-close is a compile error); like the other stream handles, `Drop` can't CLOSE (no async drop) and only logs a debug warning, so a dropped-without-close reader leaks the handle until session teardown. Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop-sends-no-close) and the `guest_file_reader_positioned_reads` Docker test.
 
 ## Streaming download entry points
 
