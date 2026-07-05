@@ -7,6 +7,12 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-06
+
+### Added
+
+- **`FileReader`: random-access positioned reads over one open handle.** Opens a file once and serves any number of `read_at(offset, len)` calls — the SMB analog of `pread` — at arbitrary offsets, then an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (a media container's index, a database page, a zip's end-of-central-directory then its central directory then member data) rather than streaming front-to-back, where the previous public read paths (`FileDownload` sequential, `read_file` whole-file) forced a reopen-and-leak per read. Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`; `read_at` takes `&self` (no shared cursor), so concurrent positioned reads pipeline over the single SMB session. A range larger than the negotiated `MaxReadSize` splits into consecutive wire READs and reassembles; reads clamp to the size seen at open, so a read at or past EOF returns empty and a straddling read is short, never an error. `close()` consumes `self` (read-after-close is a compile error); like the other stream handles, `Drop` can't CLOSE (no async drop) and only logs a debug warning, so close explicitly. Build one via `open_file_reader(tree, conn, path)` (free fn), `Tree::open_file_reader`, or `SmbClient::open_file_reader`. Exported at the crate root. Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop-sends-no-close proving the no-leak contract) and the `guest_file_reader_positioned_reads` Docker test against real Samba.
+
 ## [0.11.4] - 2026-06-28
 
 ### Changed
