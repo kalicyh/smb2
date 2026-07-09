@@ -64,6 +64,28 @@ pub enum Error {
     /// when reauthentication itself fails.
     #[error("Session expired and reauthentication failed")]
     SessionExpired,
+
+    /// The file is larger than a single READ can return, so a one-shot read
+    /// would truncate it.
+    ///
+    /// Returned by [`Tree::read_file`](crate::Tree::read_file) and
+    /// [`Tree::read_file_compound`](crate::Tree::read_file_compound) when the
+    /// file's size exceeds the server's negotiated per-READ maximum
+    /// (`MaxReadSize`). Those paths issue a single READ, so a larger file can't
+    /// come back whole — rather than silently dropping the tail, they fail with
+    /// this. Switch to [`Tree::read_file_pipelined`](crate::Tree::read_file_pipelined),
+    /// which reads the whole file in a sliding window of chunked READs
+    /// regardless of size. Classifies as [`ErrorKind::TooLarge`].
+    #[error(
+        "file is {size} bytes, larger than the server's {max_read}-byte \
+         single-read limit; use read_file_pipelined for files this size"
+    )]
+    FileTooLargeForSingleRead {
+        /// The file's size in bytes.
+        size: u64,
+        /// The server's negotiated maximum bytes per READ (`MaxReadSize`).
+        max_read: u32,
+    },
 }
 
 impl Error {
@@ -178,6 +200,14 @@ pub enum ErrorKind {
     DfsReferral,
     /// Invalid data or malformed response.
     InvalidData,
+    /// The file is too large for a single-read path.
+    ///
+    /// Returned by [`Tree::read_file`](crate::Tree::read_file) /
+    /// [`read_file_compound`](crate::Tree::read_file_compound) when the file
+    /// exceeds the server's per-READ maximum. Switch to
+    /// [`read_file_pipelined`](crate::Tree::read_file_pipelined), which reads
+    /// any size in chunked, pipelined READs.
+    TooLarge,
     /// An I/O error (transport or callback). Not necessarily a connection loss.
     ///
     /// Distinct from `ConnectionLost`: the connection may still be usable.
@@ -219,6 +249,7 @@ impl Error {
             Error::Cancelled => ErrorKind::Cancelled,
             Error::SessionExpired => ErrorKind::SessionExpired,
             Error::DfsReferralRequired { .. } => ErrorKind::DfsReferral,
+            Error::FileTooLargeForSingleRead { .. } => ErrorKind::TooLarge,
             Error::Protocol { status, .. } => classify_status(*status),
         }
     }
@@ -351,6 +382,22 @@ mod tests {
         assert_eq!(Error::Cancelled.kind(), ErrorKind::Cancelled);
         assert_eq!(Error::SessionExpired.kind(), ErrorKind::SessionExpired);
         assert_eq!(Error::invalid_data("test").kind(), ErrorKind::InvalidData);
+        assert_eq!(
+            Error::FileTooLargeForSingleRead {
+                size: 20_000_000,
+                max_read: 8_388_608,
+            }
+            .kind(),
+            ErrorKind::TooLarge
+        );
+        assert!(
+            !Error::FileTooLargeForSingleRead {
+                size: 20_000_000,
+                max_read: 8_388_608,
+            }
+            .is_retryable(),
+            "too-large is not fixed by retrying the same call"
+        );
         assert_eq!(
             Error::DfsReferralRequired {
                 path: "test".into()

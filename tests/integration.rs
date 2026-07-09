@@ -239,9 +239,7 @@ async fn server_side_copy_on_nas() {
     };
     assert_eq!(copied, data.len() as u64);
     let wire = after - before;
-    println!(
-        "NAS server-side copy: {copied} bytes copied, {wire} wire bytes moved"
-    );
+    println!("NAS server-side copy: {copied} bytes copied, {wire} wire bytes moved");
     assert!(
         wire < data.len() as u64 / 10,
         "server-side copy moved {wire} wire bytes for a {}-byte file",

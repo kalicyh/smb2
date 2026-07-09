@@ -271,7 +271,11 @@ impl Tree {
     /// round-trips from 3 to 1. Best for files that fit in a single
     /// READ (up to MaxReadSize).
     ///
-    /// For files larger than MaxReadSize, use `read_file_pipelined` instead.
+    /// A single READ can't return more than the server's `MaxReadSize`, so a
+    /// file larger than that fails with
+    /// [`Error::FileTooLargeForSingleRead`](crate::Error::FileTooLargeForSingleRead)
+    /// rather than coming back truncated. Use
+    /// [`read_file_pipelined`](Self::read_file_pipelined) for files of any size.
     pub async fn read_file_compound(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
         let normalized = self.format_path(path);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
@@ -365,6 +369,22 @@ impl Tree {
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
 
+        // A single READ returns at most `max_read` bytes, so a larger file
+        // would come back truncated. Fail with a typed error instead of
+        // silently dropping the tail; the caller switches to
+        // `read_file_pipelined`. The compound's CLOSE already released the
+        // handle, so there's nothing to clean up here.
+        if create_resp.end_of_file > max_read as u64 {
+            debug!(
+                "tree: read_file_compound path={} is {} bytes > {}-byte single-read limit",
+                normalized, create_resp.end_of_file, max_read
+            );
+            return Err(Error::FileTooLargeForSingleRead {
+                size: create_resp.end_of_file,
+                max_read,
+            });
+        }
+
         // Check READ response.
         if read_header.status != NtStatus::SUCCESS && read_header.status != NtStatus::END_OF_FILE {
             // READ failed. CLOSE also failed in the compound (cascaded).
@@ -410,9 +430,13 @@ impl Tree {
     /// that fit in MaxReadSize (typically 8 MB), this is the fastest
     /// path -- 1 round-trip instead of 3+.
     ///
-    /// For files larger than MaxReadSize, the compound returns only the
-    /// first chunk. In that case, use [`read_file_pipelined`](Self::read_file_pipelined)
-    /// for concurrent chunked reads.
+    /// A file larger than the server's `MaxReadSize` can't be returned by a
+    /// single READ, so this fails with
+    /// [`Error::FileTooLargeForSingleRead`](crate::Error::FileTooLargeForSingleRead)
+    /// (classified [`ErrorKind::TooLarge`](crate::ErrorKind::TooLarge)) instead
+    /// of silently returning only the first chunk. Reach for
+    /// [`read_file_pipelined`](Self::read_file_pipelined), which reads any size
+    /// with concurrent chunked READs.
     pub async fn read_file(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
         self.read_file_compound(conn, path).await
     }
@@ -3622,6 +3646,51 @@ mod tests {
 
         let data = tree.read_file(&mut conn, "test.txt").await.unwrap();
         assert_eq!(data, file_data);
+    }
+
+    #[tokio::test]
+    async fn read_file_errors_when_larger_than_single_read() {
+        // The mock negotiates a 64 KiB MaxReadSize (see setup_connection). A
+        // file bigger than that can't come back in one READ, so read_file must
+        // fail with a typed error rather than silently returning the first
+        // 64 KiB. Pre-fix this returned a truncated buffer.
+        let mock = Arc::new(MockTransport::new());
+        let tree_id = TreeId(21);
+        let file_id = FileId {
+            persistent: 0x55,
+            volatile: 0x66,
+        };
+        let big_size = 100_000u64; // > 65536
+
+        // Even though we error on size, the compound still carried READ + CLOSE
+        // sub-responses; queue a well-formed frame so routing is realistic.
+        let create_resp = build_create_response(file_id, big_size);
+        let read_resp = build_read_response(NtStatus::SUCCESS, vec![0u8; 65536]);
+        let close_resp = build_close_response();
+        let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id,
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let err = tree.read_file(&mut conn, "big.bin").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::FileTooLargeForSingleRead {
+                    size: 100_000,
+                    max_read: 65536
+                }
+            ),
+            "expected FileTooLargeForSingleRead, got {err:?}"
+        );
+        assert_eq!(err.kind(), crate::ErrorKind::TooLarge);
     }
 
     #[tokio::test]

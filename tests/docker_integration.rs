@@ -1902,6 +1902,53 @@ async fn maxread_large_file_still_works() {
 
 #[tokio::test]
 #[ignore]
+async fn maxread_read_file_errors_on_file_larger_than_single_read() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(MAXREAD_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "public")
+        .await
+        .expect("tree connect failed");
+
+    // The server negotiates a 64 KiB MaxReadSize; a 128 KiB file can't come
+    // back in a single READ. read_file must fail with a typed error, not a
+    // truncated 64 KiB buffer.
+    let test_path = "docker_test_maxread_toolarge.tmp";
+    let test_data: Vec<u8> = (0..128 * 1024_usize).map(|i| (i % 251) as u8).collect();
+    tree.write_file_pipelined(&mut conn, test_path, &test_data)
+        .await
+        .expect("write_file_pipelined failed");
+
+    let err = tree
+        .read_file(&mut conn, test_path)
+        .await
+        .expect_err("read_file must reject a file larger than MaxReadSize");
+    assert!(
+        matches!(err, smb2::Error::FileTooLargeForSingleRead { .. }),
+        "expected FileTooLargeForSingleRead, got {err:?}"
+    );
+
+    // The pipelined reader handles it fine — same file, whole content.
+    let data = tree
+        .read_file_pipelined(&mut conn, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(data, test_data, "pipelined read returns the whole file");
+
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
 async fn maxread_streaming_download() {
     let _ = env_logger::try_init();
 
