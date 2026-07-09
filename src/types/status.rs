@@ -137,6 +137,10 @@ nt_status_codes! {
     /// The file that was specified as a target is a directory.
     FILE_IS_A_DIRECTORY = 0xC000_00BA, "STATUS_FILE_IS_A_DIRECTORY";
 
+    /// The request is not supported. Returned, for example, by a server that
+    /// does not implement a requested FSCTL such as server-side copy.
+    NOT_SUPPORTED = 0xC000_00BB, "STATUS_NOT_SUPPORTED";
+
     /// The network path cannot be located.
     BAD_NETWORK_PATH = 0xC000_00BE, "STATUS_BAD_NETWORK_PATH";
 
@@ -359,6 +363,7 @@ mod tests {
             NtStatus::ACCOUNT_DISABLED,
             NtStatus::INSUFFICIENT_RESOURCES,
             NtStatus::FILE_IS_A_DIRECTORY,
+            NtStatus::NOT_SUPPORTED,
             NtStatus::BAD_NETWORK_PATH,
             NtStatus::NETWORK_NAME_DELETED,
             NtStatus::BAD_NETWORK_NAME,

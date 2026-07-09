@@ -208,6 +208,56 @@ async fn write_and_read_file_on_nas() {
 
 #[tokio::test]
 #[ignore]
+async fn server_side_copy_on_nas() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_to_nas().await;
+
+    let src = "smb2_ssc_src.tmp";
+    let dst = "smb2_ssc_dst.tmp";
+    // 2 MiB: one conservative request, and under read_file's small-file range so
+    // we can byte-match the result directly.
+    let data: Vec<u8> = (0..2 * 1024 * 1024_usize)
+        .map(|i| i.wrapping_mul(37).wrapping_add(11) as u8)
+        .collect();
+    tree.write_file(&mut conn, src, &data)
+        .await
+        .expect("write source");
+
+    // The copy must not move the file's bytes over the wire.
+    let before = {
+        let m = conn.diagnostics().metrics;
+        m.wire_bytes_sent + m.wire_bytes_received
+    };
+    let copied = tree
+        .server_side_copy_file(&mut conn, src, dst)
+        .await
+        .expect("server-side copy on NAS");
+    let after = {
+        let m = conn.diagnostics().metrics;
+        m.wire_bytes_sent + m.wire_bytes_received
+    };
+    assert_eq!(copied, data.len() as u64);
+    let wire = after - before;
+    println!(
+        "NAS server-side copy: {copied} bytes copied, {wire} wire bytes moved"
+    );
+    assert!(
+        wire < data.len() as u64 / 10,
+        "server-side copy moved {wire} wire bytes for a {}-byte file",
+        data.len()
+    );
+
+    let got = tree.read_file(&mut conn, dst).await.expect("read dest");
+    assert_eq!(got, data, "NAS destination must byte-match the source");
+
+    tree.delete_file(&mut conn, src).await.expect("delete src");
+    tree.delete_file(&mut conn, dst).await.expect("delete dst");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
 async fn read_file_compound_on_nas() {
     let _ = env_logger::try_init();
 

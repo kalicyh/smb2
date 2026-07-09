@@ -806,6 +806,51 @@ pub async fn open_file_writer_exclusive(
     Ok(FileWriter::new(tree, conn, file_id, max_write))
 }
 
+/// Open a file for writing at an arbitrary starting offset, returning a
+/// [`FileWriter`] whose first byte lands at `offset`.
+///
+/// Unlike [`open_file_writer`] (which truncates), this opens with `FileOpenIf`
+/// disposition and does *not* truncate: existing content is preserved, and the
+/// writer's chunks are written starting at `offset` (overwriting or extending
+/// from there). This is the positioned-write analog of
+/// [`FileReader`]'s positioned reads — the natural shape for appending after a
+/// server-side-copied prefix, or patching a known region of an existing file.
+///
+/// `bytes_written()` counts bytes this writer confirmed, not the absolute file
+/// position. `SmbClient::create_file_writer_at` and `Tree::create_file_writer_at`
+/// are thin convenience wrappers.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example(client: &smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// // Append after a 4 KiB prefix already present in the file.
+/// let mut writer = client.create_file_writer_at(share, "patched.bin", 4096).await?;
+/// writer.write_chunk(b"appended tail").await?;
+/// writer.finish().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn open_file_writer_at(
+    tree: Arc<Tree>,
+    mut conn: Connection,
+    path: &str,
+    offset: u64,
+) -> Result<FileWriter> {
+    let normalized = tree.format_path(path);
+    debug!(
+        "stream: open_file_writer_at path={} offset={}",
+        normalized, offset
+    );
+
+    let file_id = tree.open_file_for_write_at(&mut conn, &normalized).await?;
+    let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
+
+    let mut writer = FileWriter::new(tree, conn, file_id, max_write);
+    writer.offset = offset;
+    Ok(writer)
+}
+
 impl FileWriter {
     /// Create a new push-based streaming writer.
     ///
@@ -1228,6 +1273,44 @@ mod tests {
     }
 
     // ── FileWriter tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn file_writer_at_offset_writes_from_given_position() {
+        use crate::msg::header::Header;
+        use crate::msg::write::WriteRequest;
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        // CREATE (FileOpenIf) + WRITE(50) + FLUSH + CLOSE.
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(50));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree
+            .create_file_writer_at(conn, "patched.bin", 4096)
+            .await
+            .unwrap();
+        writer.write_chunk(&[7u8; 50]).await.unwrap();
+        let total = writer.finish().await.unwrap();
+        assert_eq!(total, 50);
+
+        // The WRITE must have gone out at offset 4096, not 0.
+        let sent = mock.sent_messages();
+        let write_frame = sent
+            .iter()
+            .find_map(|bytes| {
+                let mut c = ReadCursor::new(&bytes[Header::SIZE..]);
+                WriteRequest::unpack(&mut c)
+                    .ok()
+                    .filter(|w| !w.data.is_empty())
+            })
+            .expect("a WRITE with data was sent");
+        assert_eq!(write_frame.offset, 4096);
+    }
 
     #[tokio::test]
     async fn file_writer_single_chunk() {

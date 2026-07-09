@@ -7,6 +7,24 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-09
+
+### Added
+
+- **Server-side copy (`FSCTL_SRV_COPYCHUNK`): copy byte ranges between two files on the server without the data crossing the wire.** This is the mechanism Windows Explorer uses for same-share copies — the server copies the bytes between two of its own open files, so a multi-gigabyte copy moves only a handful of small control messages instead of the whole file twice (down and back up). Two tiers, both on `Tree` with `SmbClient` wrappers:
+  - **Convenience:** `server_side_copy_file(source, dest)` copies a whole file (truncating the destination); `server_side_copy_file_range(source, source_offset, dest, dest_offset, length)` copies a byte range to a chosen destination offset without truncating. Both open source (read) and destination (read+write), fetch a resume key, batch the copy within the server's limits, flush and close both handles, and never leak a handle on an error path. They return the number of bytes copied.
+  - **Primitives:** `request_resume_key` (turn an open source handle into an opaque `ResumeKey`), `copy_chunks` (one copychunk IOCTL against an open read+write destination, returning a typed `CopyChunkOutcome`), and `server_side_copy_range` (batch a range over already-open handles). New public types: `ResumeKey`, `CopyChunk`, `CopyChunkResult`, `CopyChunkOutcome`, `ServerSideCopyLimits`.
+  - **Limits are negotiated transparently.** A server that receives a request exceeding its per-request limits doesn't fail — it returns `STATUS_INVALID_PARAMETER` carrying a `SRV_COPYCHUNK_RESPONSE` that advertises the limits (MS-SMB2 3.2.5.14.3). The batched methods start at a conservative 16 × 1 MiB / 16 MiB per request (the common Windows/Samba minimum) and re-batch within the advertised limits if rejected; `copy_chunks` surfaces this as `Ok(CopyChunkOutcome::Rejected { limits })` rather than an error.
+  - **Unsupported servers are typed, not string-matched.** Older Samba builds and some NAS firmware lack copychunk and return `STATUS_NOT_SUPPORTED` / `STATUS_INVALID_DEVICE_REQUEST`; these now classify as the new `ErrorKind::Unsupported`, so a consumer can branch on it and fall back to a read-then-write copy. The `server_side_copy` example shows the fallback.
+  - Pinned by unit tests (copychunk wire round-trips including the limits-negotiation path; batching across chunk and per-request limits; renegotiation; the full open→copy→close choreography; chunk offsets) and three Docker tests against real Samba: a whole-file copy verified to move <10% of the file size on the wire (proving the data stays server-side), a 20 MiB copy that spans multiple copychunk requests and byte-matches, and a range-copy-then-positioned-append round-trip.
+- **Positioned `FileWriter`: `create_file_writer_at(path, offset)`.** Opens a file without truncating (`FileOpenIf`) and starts writing at an arbitrary offset — the write analog of `FileReader`'s positioned reads. The natural way to append after a server-side-copied prefix (the archive tail-rewrite shape) or to patch a known region of an existing file. Available as `open_file_writer_at` (free fn), `Tree::create_file_writer_at`, and `SmbClient::create_file_writer_at`.
+- **`Tree::open_file_readwrite` and public `Tree::close_handle`.** A read+write open (needed as a server-side copy destination) and a public close for the raw handles that `open_file` / `open_file_readwrite` / `request_resume_key` hand back — completing the raw-handle open/close pair for advanced callers.
+- **`ErrorKind::Unsupported`** (and the `STATUS_NOT_SUPPORTED` NTSTATUS): the typed classification for "the server doesn't implement this operation". `ErrorKind` is `#[non_exhaustive]`, so adding it is non-breaking; `STATUS_NOT_IMPLEMENTED` now classifies here too (previously `Other`).
+
+### Notes
+
+- New public API (server-side copy, positioned writer, the read+write/close handle methods, `ErrorKind::Unsupported`) is additive; this is a minor bump per the crate's pre-1.0 SemVer (minor = potentially breaking). No existing signatures changed.
+
 ## [0.12.1] - 2026-07-09
 
 ### Changed

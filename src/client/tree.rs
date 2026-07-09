@@ -2043,6 +2043,22 @@ impl Tree {
         super::stream::open_file_writer_exclusive(Arc::clone(self), conn, path).await
     }
 
+    /// Open a push-based pipelined file writer positioned at `offset`. Same
+    /// shape as [`Tree::create_file_writer`], but the file is opened without
+    /// truncating (`FileOpenIf`) and the writer's first byte lands at `offset`.
+    ///
+    /// The natural way to append after a server-side-copied prefix
+    /// ([`server_side_copy_range`](Self::server_side_copy_range)) or to patch a
+    /// known region of an existing file.
+    pub async fn create_file_writer_at(
+        self: &Arc<Self>,
+        conn: Connection,
+        path: &str,
+        offset: u64,
+    ) -> Result<super::stream::FileWriter> {
+        super::stream::open_file_writer_at(Arc::clone(self), conn, path, offset).await
+    }
+
     /// Create a directory.
     ///
     /// Opens the path with `FileCreate` disposition and `FILE_DIRECTORY_FILE`
@@ -2357,6 +2373,102 @@ impl Tree {
     ) -> Result<FileId> {
         self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileCreate)
             .await
+    }
+
+    /// Open an existing file (or create it if absent) for writing *without*
+    /// truncating it, returning the file handle.
+    ///
+    /// Uses `FileOpenIf` disposition and requests write access. Unlike
+    /// [`open_file_for_write`](Self::open_file_for_write) (`FileOverwriteIf`,
+    /// which truncates), this preserves existing content so a caller can write
+    /// at an arbitrary offset over or past it. Used by the positioned
+    /// [`FileWriter`](crate::client::stream::FileWriter) built via
+    /// [`create_file_writer_at`](Self::create_file_writer_at).
+    pub(crate) async fn open_file_for_write_at(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<FileId> {
+        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileOpenIf)
+            .await
+    }
+
+    /// Open (or create) a file with combined read+write access, **without**
+    /// truncating it, returning the handle and its current size.
+    ///
+    /// Requests `FILE_READ_DATA | FILE_WRITE_DATA` with `FileOpenIf`
+    /// disposition (open if present, create if absent) and preserves existing
+    /// content. Use it to open a destination for the low-level server-side copy
+    /// primitives ([`copy_chunks`](Self::copy_chunks),
+    /// [`server_side_copy_range`](Self::server_side_copy_range)) — those need
+    /// the destination handle to carry read access as well as write for
+    /// [`FSCTL_SRV_COPYCHUNK`](crate::msg::ioctl::FSCTL_SRV_COPYCHUNK) (MS-SMB2
+    /// 3.3.5.15.6). Close it with [`close_handle`](Self::close_handle) when done.
+    pub async fn open_file_readwrite(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<(FileId, u64)> {
+        self.open_readwrite_with_disposition(conn, path, CreateDisposition::FileOpenIf)
+            .await
+    }
+
+    /// Read+write open with `FileOverwriteIf` (truncating). Used by the
+    /// whole-file [`server_side_copy_file`](Self::server_side_copy_file), where
+    /// the destination becomes an exact copy of the source.
+    pub(crate) async fn open_readwrite_overwrite(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<(FileId, u64)> {
+        self.open_readwrite_with_disposition(conn, path, CreateDisposition::FileOverwriteIf)
+            .await
+    }
+
+    /// Shared body for the read+write opens. Requests read+write data access so
+    /// the handle works as a server-side copy destination.
+    async fn open_readwrite_with_disposition(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        create_disposition: CreateDisposition,
+    ) -> Result<(FileId, u64)> {
+        let req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_READ_DATA
+                    | FileAccessMask::FILE_WRITE_DATA
+                    | FileAccessMask::FILE_READ_ATTRIBUTES
+                    | FileAccessMask::FILE_WRITE_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition,
+            create_options: FILE_NON_DIRECTORY_FILE,
+            name: path.to_string(),
+            create_contexts: vec![],
+        };
+
+        let frame = conn
+            .execute(Command::Create, &req, Some(self.tree_id))
+            .await?;
+
+        if frame.header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: frame.header.status,
+                command: Command::Create,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&frame.body);
+        let resp = CreateResponse::unpack(&mut cursor)?;
+        Ok((resp.file_id, resp.end_of_file))
     }
 
     /// Loop QUERY_DIRECTORY until STATUS_NO_MORE_FILES.
@@ -3111,8 +3223,13 @@ impl Tree {
         Ok(())
     }
 
-    /// Close a file handle.
-    pub(crate) async fn close_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
+    /// Close an open file handle, releasing it on the server.
+    ///
+    /// Pairs with the raw-handle opens ([`open_file`](Self::open_file),
+    /// [`open_file_readwrite`](Self::open_file_readwrite)): a handle you opened
+    /// and did not hand to a streaming type (which close themselves) must be
+    /// closed with this, or it leaks server-side until session teardown.
+    pub async fn close_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
         let req = CloseRequest { flags: 0, file_id };
 
         let frame = conn

@@ -6,6 +6,7 @@
 //! for batched concurrent operations.
 
 pub mod connection;
+pub mod copy;
 pub(crate) mod dfs;
 pub mod diagnostics;
 pub mod pipeline;
@@ -958,6 +959,30 @@ impl SmbClient {
             std::sync::Arc::new(tree.clone()),
             self.conn.clone(),
             path,
+        )
+        .await
+    }
+
+    /// Create a positioned push-based streaming file writer.
+    ///
+    /// Same shape as [`create_file_writer`](Self::create_file_writer), but the
+    /// file is opened without truncating and the writer's first byte lands at
+    /// `offset`. Use it to append after a server-side-copied prefix (see
+    /// [`server_side_copy_range`](Tree::server_side_copy_range)) or to patch a
+    /// known region of an existing file.
+    ///
+    /// No DFS retry; the writer pins to the connection it was built from.
+    pub async fn create_file_writer_at(
+        &self,
+        tree: &Tree,
+        path: &str,
+        offset: u64,
+    ) -> Result<stream::FileWriter> {
+        stream::open_file_writer_at(
+            std::sync::Arc::new(tree.clone()),
+            self.conn.clone(),
+            path,
+            offset,
         )
         .await
     }

@@ -197,6 +197,54 @@ pub(crate) fn build_read_error_response(status: crate::types::status::NtStatus) 
     pack_message(&h, &body)
 }
 
+/// Build a successful IOCTL response carrying the given output buffer.
+pub(crate) fn build_ioctl_response(ctl_code: u32, output_data: Vec<u8>) -> Vec<u8> {
+    build_ioctl_response_status(
+        ctl_code,
+        crate::types::status::NtStatus::SUCCESS,
+        output_data,
+    )
+}
+
+/// Build an IOCTL response with an explicit status and output buffer. Used for
+/// the server-side-copy limits negotiation, where the server returns
+/// `STATUS_INVALID_PARAMETER` *with* a 12-byte copychunk response payload.
+pub(crate) fn build_ioctl_response_status(
+    ctl_code: u32,
+    status: crate::types::status::NtStatus,
+    output_data: Vec<u8>,
+) -> Vec<u8> {
+    use crate::msg::ioctl::IoctlResponse;
+    let mut h = Header::new_request(Command::Ioctl);
+    h.flags.set_response();
+    h.credits = 32;
+    h.status = status;
+
+    let body = IoctlResponse {
+        ctl_code,
+        file_id: FileId::SENTINEL,
+        flags: crate::msg::ioctl::SMB2_0_IOCTL_IS_FSCTL,
+        output_data,
+    };
+    pack_message(&h, &body)
+}
+
+/// Build an IOCTL error response (an `ErrorResponse` body, no output buffer) --
+/// for example a server that lacks server-side copy replying `STATUS_NOT_SUPPORTED`.
+pub(crate) fn build_ioctl_error_response(status: crate::types::status::NtStatus) -> Vec<u8> {
+    use crate::msg::header::ErrorResponse;
+    let mut h = Header::new_request(Command::Ioctl);
+    h.flags.set_response();
+    h.credits = 32;
+    h.status = status;
+
+    let body = ErrorResponse {
+        error_context_count: 0,
+        error_data: vec![],
+    };
+    pack_message(&h, &body)
+}
+
 /// Build a TREE_CONNECT response with the given tree ID and share type.
 pub(crate) fn build_tree_connect_response(tree_id: TreeId, share_type: ShareType) -> Vec<u8> {
     let mut h = Header::new_request(Command::TreeConnect);

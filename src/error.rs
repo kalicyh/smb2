@@ -184,6 +184,15 @@ pub enum ErrorKind {
     /// For example, a callback error in `write_file_streamed` produces `Io`,
     /// but the connection is still in a clean state.
     Io,
+    /// The server does not support the requested operation.
+    ///
+    /// Returned when the server rejects an operation it does not implement --
+    /// for example, an older Samba build or NAS firmware that lacks server-side
+    /// copy. Consumers branch on this to fall back to a client-side path (for
+    /// server-side copy, a plain read-then-write). Maps from
+    /// `STATUS_NOT_SUPPORTED`, `STATUS_INVALID_DEVICE_REQUEST`, and
+    /// `STATUS_NOT_IMPLEMENTED`.
+    Unsupported,
     /// A protocol error not covered by other variants.
     ///
     /// Use [`Error::status()`] to get the raw NTSTATUS code. Some defined
@@ -258,6 +267,11 @@ fn classify_status(status: NtStatus) -> ErrorKind {
         // DFS
         NtStatus::PATH_NOT_COVERED => ErrorKind::DfsReferral,
 
+        // Unsupported operation (server lacks the feature, e.g. server-side copy)
+        NtStatus::NOT_SUPPORTED | NtStatus::INVALID_DEVICE_REQUEST | NtStatus::NOT_IMPLEMENTED => {
+            ErrorKind::Unsupported
+        }
+
         // Everything else
         _ => ErrorKind::Other,
     }
@@ -304,8 +318,11 @@ mod tests {
         (NtStatus::NETWORK_SESSION_EXPIRED, ErrorKind::SessionExpired),
         // DFS
         (NtStatus::PATH_NOT_COVERED, ErrorKind::DfsReferral),
+        // Unsupported operation
+        (NtStatus::NOT_SUPPORTED, ErrorKind::Unsupported),
+        (NtStatus::INVALID_DEVICE_REQUEST, ErrorKind::Unsupported),
+        (NtStatus::NOT_IMPLEMENTED, ErrorKind::Unsupported),
         // Documented `Other` (no current consumer demand for a typed variant)
-        (NtStatus::NOT_IMPLEMENTED, ErrorKind::Other),
         (NtStatus::INVALID_PARAMETER, ErrorKind::Other),
         (NtStatus::DELETE_PENDING, ErrorKind::Other),
         (NtStatus::INSUFFICIENT_RESOURCES, ErrorKind::Other),

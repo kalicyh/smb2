@@ -179,6 +179,32 @@ use std::ops::ControlFlow;
 All write methods (`write_file`, `write_file_pipelined`, `write_file_with_progress`) flush data to persistent storage
 before closing the file handle.
 
+### Server-side copy
+
+When source and destination live on the same share, the server can copy the bytes between its own files directly — the
+data never crosses the wire, so even a multi-gigabyte copy finishes in moments. Not every server supports it (older
+Samba builds, some NAS firmware), so branch on `ErrorKind::Unsupported` to fall back to a read-then-write copy:
+
+```rust
+use smb2::ErrorKind;
+
+# async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
+match client.server_side_copy_file(share, "movie.mkv", "movie-backup.mkv").await {
+    Ok(bytes) => println!("copied {bytes} bytes without touching the network"),
+    Err(e) if e.kind() == ErrorKind::Unsupported => {
+        let data = client.read_file(share, "movie.mkv").await?;
+        client.write_file(share, "movie-backup.mkv", &data).await?;
+    }
+    Err(e) => return Err(e),
+}
+# Ok(())
+# }
+```
+
+`server_side_copy_file_range` copies a byte range to a chosen destination offset (pair it with
+`create_file_writer_at` to append after a copied prefix), and `request_resume_key` / `copy_chunks` are the low-level
+primitives. See the runnable `server_side_copy` example.
+
 ## Diagnostics
 
 `SmbClient::diagnostics()` captures a snapshot of the client's state for dashboards, MCP tools, log dumps, and tests
@@ -238,7 +264,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb2 = "0.12"
+smb2 = "0.13"
 ```
 
 You'll also need an async runtime. The library is runtime-agnostic, but [tokio](https://github.com/tokio-rs/tokio) is

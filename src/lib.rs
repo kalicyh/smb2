@@ -71,6 +71,12 @@ pub use client::{connect, ClientConfig, SmbClient};
 // Streaming I/O
 pub use client::stream::{FileDownload, FileReader, FileUpload, FileWriter, Progress};
 
+// Server-side copy (FSCTL_SRV_COPYCHUNK): copy byte ranges between two files
+// on the server without the data crossing the wire.
+pub use client::copy::{
+    CopyChunk, CopyChunkOutcome, CopyChunkResult, ResumeKey, ServerSideCopyLimits,
+};
+
 // Tree and file types
 pub use client::tree::{DirectoryEntry, FileInfo, FsInfo, Tree};
 

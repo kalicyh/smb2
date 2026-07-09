@@ -15,6 +15,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `pipeline.rs` | `Pipeline` / `Op` / `OpResult` -- batched concurrent operations (the core feature) |
 | `shares.rs` | Share enumeration via IPC$ + srvsvc RPC |
 | `dfs.rs` | DFS referral IOCTL helper, `DfsResolver` with TTL-based referral cache |
+| `copy.rs` | Server-side copy (`FSCTL_SRV_COPYCHUNK`): resume-key + copychunk primitives, batched range/whole-file convenience, `ResumeKey` / `CopyChunk` / `ServerSideCopyLimits` public types |
 
 ## Layering
 
@@ -103,6 +104,21 @@ FileWriter provides push-based pipelined writes. The consumer pushes chunks at t
 `FileReader` (in `stream.rs`) holds ONE open handle and serves any number of *positioned* reads (`read_at(offset, len)`, the SMB analog of `pread`) before an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (zip central-directory browse + entry extract), where reopening per read would leak a handle each time. Build one via `open_file_reader(tree: Arc<Tree>, conn, path)` (free fn), `Tree::open_file_reader(&Arc<Self>, conn, path)`, or `SmbClient::open_file_reader(&self, tree, path)` (clones the primary connection).
 
 Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`. `read_at` takes `&self` (no shared cursor) and issues `execute_with_credits` READs, splitting a range larger than `MaxReadSize` into consecutive wire reads and reassembling. It clamps to the size seen at open, so a read at/after EOF returns empty and a straddling read is short — never an error. `close()` consumes `self` (read-after-close is a compile error); like the other stream handles, `Drop` can't CLOSE (no async drop) and only logs a debug warning, so a dropped-without-close reader leaks the handle until session teardown. Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop-sends-no-close) and the `guest_file_reader_positioned_reads` Docker test.
+
+## Server-side copy (`copy.rs`)
+
+`FSCTL_SRV_COPYCHUNK` copies byte ranges between two files *on the server* — the data never crosses the wire. Two tiers, both on `Tree` (with `SmbClient` wrappers that route via `connection_for_tree`):
+
+- **Convenience**: `server_side_copy_file` (whole file, truncating dest) and `server_side_copy_file_range` (a range at a chosen dest offset, non-truncating dest). Both open source (read) + dest (read+write), get a resume key, batch the copy, flush+close both, and never leak a handle on an error path (shared `copy_paths` helper).
+- **Primitives**: `request_resume_key` (source handle → opaque `ResumeKey`), `copy_chunks` (one IOCTL against an open read+write dest), and `server_side_copy_range` (batches over open handles). These take caller-held `FileId`s like `open_file` does; `open_file_readwrite` opens a dest and `close_handle` (now public) releases it.
+
+Gotchas / why:
+- **Dest needs read+write.** `FSCTL_SRV_COPYCHUNK` requires the destination open to carry `FILE_READ_DATA` *and* `FILE_WRITE_DATA` (MS-SMB2 3.3.5.15.6). The read+write opens grant both; a plain write handle would get `ACCESS_DENIED`.
+- **Limits negotiation is a normal path, not an error.** When a request exceeds the server's per-request limits it returns `STATUS_INVALID_PARAMETER` *with* a 12-byte `SRV_COPYCHUNK_RESPONSE` carrying the limits (MS-SMB2 3.2.5.14.3). `copy_chunks` surfaces that as `Ok(CopyChunkOutcome::Rejected { limits })`, not `Err`; `server_side_copy_range` starts at `ServerSideCopyLimits::CONSERVATIVE` (16×1 MiB / 16 MiB, the common Windows/Samba minimum) and re-batches within advertised limits, guarding against an infinite loop via "advertised == current → error".
+- **Unsupported servers are typed.** Old Samba / NAS firmware without copychunk return `STATUS_NOT_SUPPORTED` / `STATUS_INVALID_DEVICE_REQUEST`, classified `ErrorKind::Unsupported`. Consumers branch on it to fall back to read-then-write — no string matching.
+- **Positioned append pairs with it.** `create_file_writer_at(path, offset)` opens non-truncating (`FileOpenIf`) and seeds the writer's offset, so a consumer can server-side-copy a retained prefix into a temp, then append (the archive tail-rewrite shape).
+
+Full behavioral detail lives in the `copy.rs` module rustdoc.
 
 ## Streaming download entry points
 

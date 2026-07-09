@@ -129,6 +129,7 @@ pub(crate) mod roundtrip_strategies;
 pub mod cancel;
 pub mod change_notify;
 pub mod close;
+pub mod copychunk;
 pub mod create;
 pub mod dfs;
 pub mod echo;

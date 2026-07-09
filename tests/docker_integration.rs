@@ -3629,3 +3629,161 @@ async fn diagnostics_reconnects_counter_survives_reconnect() {
         after.primary.metrics.responses_routed_ok,
     );
 }
+
+// ── Server-side copy (smb-guest) ─────────────────────────────────────
+//
+// Samba implements FSCTL_SRV_COPYCHUNK, so these exercise the real protocol
+// against a live server: the copy runs entirely server-side (verified via wire
+// counters), and byte ranges land where asked.
+
+#[tokio::test]
+#[ignore]
+async fn guest_server_side_copy_file_matches_and_stays_off_the_wire() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_guest().await;
+
+    let src = "ssc_source.bin";
+    let dst = "ssc_dest.bin";
+    // 3 MiB — one conservative request (16 MiB budget), but big enough that a
+    // read-then-write copy would be obvious on the wire counters.
+    let data: Vec<u8> = (0..3 * 1024 * 1024_usize)
+        .map(|i| i.wrapping_mul(31).wrapping_add(7) as u8)
+        .collect();
+    tree.write_file(&mut conn, src, &data)
+        .await
+        .expect("write source");
+
+    // The copy must move far fewer bytes than the file size — the data never
+    // crosses the wire, only the small IOCTL control messages do.
+    let before = {
+        let m = conn.diagnostics().metrics;
+        m.wire_bytes_sent + m.wire_bytes_received
+    };
+    let copied = tree
+        .server_side_copy_file(&mut conn, src, dst)
+        .await
+        .expect("server-side copy");
+    let after = {
+        let m = conn.diagnostics().metrics;
+        m.wire_bytes_sent + m.wire_bytes_received
+    };
+    assert_eq!(copied, data.len() as u64, "reports every byte copied");
+
+    let wire = after - before;
+    assert!(
+        wire < data.len() as u64 / 10,
+        "server-side copy moved {wire} wire bytes for a {}-byte file; the data \
+         must not cross the wire",
+        data.len()
+    );
+
+    let got = tree.read_file(&mut conn, dst).await.expect("read dest");
+    assert_eq!(got, data, "destination must byte-match the source");
+
+    let _ = tree.delete_file(&mut conn, src).await;
+    let _ = tree.delete_file(&mut conn, dst).await;
+    tree.disconnect(&mut conn).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_server_side_copy_batches_large_file() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_guest().await;
+
+    let src = "ssc_big_source.bin";
+    let dst = "ssc_big_dest.bin";
+    // 20 MiB exceeds the 16 MiB conservative per-request budget, so the copy
+    // must span more than one FSCTL_SRV_COPYCHUNK request (batching path).
+    let data: Vec<u8> = (0..20 * 1024 * 1024_usize)
+        .map(|i| i.wrapping_mul(131).wrapping_add(17) as u8)
+        .collect();
+    tree.write_file(&mut conn, src, &data)
+        .await
+        .expect("write source");
+
+    let copied = tree
+        .server_side_copy_file(&mut conn, src, dst)
+        .await
+        .expect("server-side copy of large file");
+    assert_eq!(copied, data.len() as u64, "reports every byte copied");
+
+    // The destination is the full size on the server.
+    let dst_info = tree.stat(&mut conn, dst).await.expect("stat dest");
+    assert_eq!(
+        dst_info.size,
+        data.len() as u64,
+        "destination is fully sized"
+    );
+
+    // Read it all back (pipelined; read_file is for small files only) and
+    // byte-match — this proves the second batch (the 16..20 MiB request) landed
+    // at the right offset, not just that the totals add up.
+    let got = tree
+        .read_file_pipelined(&mut conn, dst)
+        .await
+        .expect("pipelined read dest");
+    assert_eq!(got.len(), data.len());
+    assert_eq!(
+        got.iter().zip(data.iter()).position(|(a, b)| a != b),
+        None,
+        "large destination must byte-match the source"
+    );
+
+    let _ = tree.delete_file(&mut conn, src).await;
+    let _ = tree.delete_file(&mut conn, dst).await;
+    tree.disconnect(&mut conn).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_server_side_copy_range_then_positioned_append() {
+    use std::sync::Arc;
+
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_guest().await;
+
+    // The archive tail-rewrite shape: keep the head of a source, drop its tail,
+    // then append fresh data — the head moves server-side, only the new bytes
+    // cross the wire.
+    let head: Vec<u8> = std::iter::repeat_n(b'H', 2000).collect();
+    let tail: Vec<u8> = std::iter::repeat_n(b'T', 1000).collect();
+    let mut source = head.clone();
+    source.extend_from_slice(&tail);
+
+    let src = "ssc_range_src.bin";
+    let tmp = "ssc_range_tmp.bin";
+    tree.write_file(&mut conn, src, &source)
+        .await
+        .expect("write source");
+
+    // Server-side copy just the retained head into a fresh temp.
+    let copied = tree
+        .server_side_copy_file_range(&mut conn, src, 0, tmp, 0, head.len() as u64)
+        .await
+        .expect("server-side copy of head range");
+    assert_eq!(copied, head.len() as u64);
+
+    // Append new data right after the copied head with a positioned writer.
+    let appended = b"...freshly appended entries...";
+    let tree = Arc::new(tree);
+    let mut writer = tree
+        .create_file_writer_at(conn.clone(), tmp, head.len() as u64)
+        .await
+        .expect("open positioned writer");
+    writer.write_chunk(appended).await.expect("append chunk");
+    writer.finish().await.expect("finish append");
+
+    // The temp must be head + appended, with the source tail gone.
+    let got = tree.read_file(&mut conn, tmp).await.expect("read temp");
+    let mut expected = head.clone();
+    expected.extend_from_slice(appended);
+    assert_eq!(got, expected, "temp = retained head + appended tail");
+
+    let _ = tree.delete_file(&mut conn, src).await;
+    let _ = tree.delete_file(&mut conn, tmp).await;
+    tree.disconnect(&mut conn).await.expect("disconnect");
+}

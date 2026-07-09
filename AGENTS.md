@@ -40,6 +40,7 @@ src/
     tree_disconnect.rs    # TreeDisconnectRequest/Response
     create.rs             # CreateRequest/Response, create contexts
     close.rs              # CloseRequest/Response
+    copychunk.rs          # Server-side copy structures (SRV_COPYCHUNK_COPY/RESPONSE, RESUME_KEY)
     flush.rs              # FlushRequest/Response
     read.rs               # ReadRequest/Response
     write.rs              # WriteRequest/Response
@@ -91,6 +92,7 @@ src/
     directory.rs          # Directory listing helpers
     shares.rs             # Share enumeration (IPC$ + srvsvc RPC)
     dfs.rs                # DFS referral IOCTL, DfsResolver with TTL cache
+    copy.rs               # Server-side copy API (FSCTL_SRV_COPYCHUNK): resume-key + copychunk, batched convenience
 
 tests/
   pack_roundtrip.rs       # Property-based tests for pack/unpack

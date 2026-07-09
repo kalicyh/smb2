@@ -24,6 +24,9 @@ pub const FSCTL_SRV_COPYCHUNK: u32 = 0x0014_40F2;
 /// Server-side copy chunk (write handle).
 pub const FSCTL_SRV_COPYCHUNK_WRITE: u32 = 0x0014_80F2;
 
+/// Request an opaque resume key for a server-side copy source handle.
+pub const FSCTL_SRV_REQUEST_RESUME_KEY: u32 = 0x0014_0078;
+
 /// DFS referral request.
 pub const FSCTL_DFS_GET_REFERRALS: u32 = 0x0006_0194;
 
