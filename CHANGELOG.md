@@ -7,6 +7,12 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-09
+
+### Changed
+
+- **RustCrypto dependencies relaxed from release-candidate pins to stable.** `aes` (`=0.9.0-rc.4` → `0.9.1`), `aes-gcm` (`=0.11.0-rc.3` → `0.11.0`), `cmac` (`=0.8.0-rc.5` → `0.8.0`), and `pbkdf2` (`=0.13.0-rc.10` → `0.13.0`) now track the stable releases. These crates had been hard-pinned to specific pre-releases because a stable `aes 0.9` didn't exist yet; now that it does, the exact `=` pins were forcing every downstream that also wants a RustCrypto crate onto the same rc, causing unresolvable version conflicts. In particular this unblocks Cmdr from enabling `zip`'s `aes-crypto` and `sevenz-rust2`'s `aes256` features, both of which require stable `aes ^0.9`. No API or behavior change — the rc-to-stable transition of these crates carried no public-API drift, so smb2's own surface is unchanged; verified by a clean `--all-features` build, the full check suite, both Docker suites, and real-hardware AES-CMAC/GMAC signing against a QNAP NAS. `ccm` stays pinned at `=0.6.0-rc.3` because it has no stable 0.6 release yet; it unifies cleanly with the stable `aes`/`aes-gcm`/`aead`/`cipher` versions in one lockfile with no duplicate crates. Revisit and unpin `ccm` when its stable ships.
+
 ## [0.12.0] - 2026-07-06
 
 ### Added
