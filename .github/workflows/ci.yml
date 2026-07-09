@@ -124,13 +124,21 @@ jobs:
     if: always()
     steps:
       - name: Check all jobs passed
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
-            echo "Some jobs failed"
-            exit 1
-          fi
-          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "Some jobs were cancelled"
+          # Don't trust `needs.*.result`: it can't see individual matrix legs.
+          # GitHub aggregates a matrix into one result, and legs cancelled because
+          # a hosted runner was never acquired can aggregate to SUCCESS (run
+          # 29009362774: four macOS/Windows legs queued 15 min, were cancelled,
+          # and the old expression-based gate passed). Ask the API for every job
+          # in this run instead and require each one (except this gate) to have
+          # concluded success or skipped.
+          not_green=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.name != "CI OK") | select(.conclusion != null) | select(.conclusion != "success" and .conclusion != "skipped") | "\(.name): \(.conclusion)"] | .[]')
+          if [[ -n "$not_green" ]]; then
+            echo "Jobs not green:"
+            echo "$not_green"
             exit 1
           fi
           echo "All jobs passed"
