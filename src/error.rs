@@ -258,8 +258,21 @@ impl Error {
 /// Map an NTSTATUS to an ErrorKind.
 fn classify_status(status: NtStatus) -> ErrorKind {
     match status {
-        // Auth / signing
-        NtStatus::LOGON_FAILURE | NtStatus::ACCOUNT_DISABLED => ErrorKind::AuthRequired,
+        // Auth / signing -- the logon-rejection family. The credentials or the
+        // account itself were refused (bad password, account disabled/expired/
+        // locked, password expired, or a time/workstation restriction). All mean
+        // the same thing to a consumer: this logon won't work, supply different
+        // credentials. A guest/anonymous SessionSetup that the server rejects
+        // (macOS smbd answers with STATUS_ACCOUNT_RESTRICTION) lands here too.
+        NtStatus::LOGON_FAILURE
+        | NtStatus::ACCOUNT_RESTRICTION
+        | NtStatus::INVALID_LOGON_HOURS
+        | NtStatus::INVALID_WORKSTATION
+        | NtStatus::PASSWORD_EXPIRED
+        | NtStatus::ACCOUNT_DISABLED
+        | NtStatus::ACCOUNT_EXPIRED
+        | NtStatus::PASSWORD_MUST_CHANGE
+        | NtStatus::ACCOUNT_LOCKED_OUT => ErrorKind::AuthRequired,
         NtStatus::ACCESS_DENIED => {
             // Could be signing-required or genuinely access-denied.
             // Callers with NegotiatedParams context can distinguish further.
@@ -320,13 +333,21 @@ mod tests {
     /// Every code listed here is asserted to map to its expected variant. When
     /// adding a new `NtStatus` to `types/status.rs`, also add a row here — either
     /// pointing at a dedicated `ErrorKind`, or `ErrorKind::Other` if there is
-    /// genuinely no consumer-meaningful classification yet. The companion test
-    /// `classify_status_no_silent_other` then guarantees the table stays in sync
-    /// with what `classify_status` actually does.
+    /// genuinely no consumer-meaningful classification yet. The `classify_status_contract`
+    /// test then asserts every row maps the way this table says it should, so the
+    /// table stays in sync with what `classify_status` actually does.
     const STATUS_CLASSIFICATION_CONTRACT: &[(NtStatus, ErrorKind)] = &[
-        // Auth / signing
+        // Auth / signing -- the logon-rejection family (credentials or the
+        // account itself were refused; the caller needs different credentials)
         (NtStatus::LOGON_FAILURE, ErrorKind::AuthRequired),
+        (NtStatus::ACCOUNT_RESTRICTION, ErrorKind::AuthRequired),
+        (NtStatus::INVALID_LOGON_HOURS, ErrorKind::AuthRequired),
+        (NtStatus::INVALID_WORKSTATION, ErrorKind::AuthRequired),
+        (NtStatus::PASSWORD_EXPIRED, ErrorKind::AuthRequired),
         (NtStatus::ACCOUNT_DISABLED, ErrorKind::AuthRequired),
+        (NtStatus::ACCOUNT_EXPIRED, ErrorKind::AuthRequired),
+        (NtStatus::PASSWORD_MUST_CHANGE, ErrorKind::AuthRequired),
+        (NtStatus::ACCOUNT_LOCKED_OUT, ErrorKind::AuthRequired),
         (NtStatus::ACCESS_DENIED, ErrorKind::AccessDenied),
         // Not found
         (NtStatus::NO_SUCH_FILE, ErrorKind::NotFound),

@@ -273,7 +273,7 @@ impl Tree {
     ///
     /// A single READ can't return more than the server's `MaxReadSize`, so a
     /// file larger than that fails with
-    /// [`Error::FileTooLargeForSingleRead`](crate::Error::FileTooLargeForSingleRead)
+    /// [`Error::FileTooLargeForSingleRead`]
     /// rather than coming back truncated. Use
     /// [`read_file_pipelined`](Self::read_file_pipelined) for files of any size.
     pub async fn read_file_compound(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
@@ -432,7 +432,7 @@ impl Tree {
     ///
     /// A file larger than the server's `MaxReadSize` can't be returned by a
     /// single READ, so this fails with
-    /// [`Error::FileTooLargeForSingleRead`](crate::Error::FileTooLargeForSingleRead)
+    /// [`Error::FileTooLargeForSingleRead`]
     /// (classified [`ErrorKind::TooLarge`](crate::ErrorKind::TooLarge)) instead
     /// of silently returning only the first chunk. Reach for
     /// [`read_file_pipelined`](Self::read_file_pipelined), which reads any size

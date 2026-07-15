@@ -125,11 +125,35 @@ nt_status_codes! {
     /// The disk is full.
     DISK_FULL = 0xC000_007F, "STATUS_DISK_FULL";
 
-    /// The attempted logon is invalid.
+    /// The attempted logon is invalid. The user name or authentication
+    /// information was rejected.
     LOGON_FAILURE = 0xC000_006D, "STATUS_LOGON_FAILURE";
+
+    /// The user name and authentication information are valid, but an account
+    /// restriction (such as time-of-day rules) prevented a successful logon.
+    ACCOUNT_RESTRICTION = 0xC000_006E, "STATUS_ACCOUNT_RESTRICTION";
+
+    /// The account has time restrictions and cannot log on at this time.
+    INVALID_LOGON_HOURS = 0xC000_006F, "STATUS_INVALID_LOGON_HOURS";
+
+    /// The account is restricted so it cannot log on from this workstation.
+    INVALID_WORKSTATION = 0xC000_0070, "STATUS_INVALID_WORKSTATION";
+
+    /// The account password has expired.
+    PASSWORD_EXPIRED = 0xC000_0071, "STATUS_PASSWORD_EXPIRED";
 
     /// The referenced account is currently disabled.
     ACCOUNT_DISABLED = 0xC000_0072, "STATUS_ACCOUNT_DISABLED";
+
+    /// The account has expired.
+    ACCOUNT_EXPIRED = 0xC000_0193, "STATUS_ACCOUNT_EXPIRED";
+
+    /// The account password must be changed before the first logon.
+    PASSWORD_MUST_CHANGE = 0xC000_0224, "STATUS_PASSWORD_MUST_CHANGE";
+
+    /// The account was automatically locked out after too many invalid logon
+    /// or password-change attempts.
+    ACCOUNT_LOCKED_OUT = 0xC000_0234, "STATUS_ACCOUNT_LOCKED_OUT";
 
     /// Insufficient system resources exist to complete the API.
     INSUFFICIENT_RESOURCES = 0xC000_009A, "STATUS_INSUFFICIENT_RESOURCES";
@@ -360,7 +384,14 @@ mod tests {
             NtStatus::FILE_LOCK_CONFLICT,
             NtStatus::DELETE_PENDING,
             NtStatus::LOGON_FAILURE,
+            NtStatus::ACCOUNT_RESTRICTION,
+            NtStatus::INVALID_LOGON_HOURS,
+            NtStatus::INVALID_WORKSTATION,
+            NtStatus::PASSWORD_EXPIRED,
             NtStatus::ACCOUNT_DISABLED,
+            NtStatus::ACCOUNT_EXPIRED,
+            NtStatus::PASSWORD_MUST_CHANGE,
+            NtStatus::ACCOUNT_LOCKED_OUT,
             NtStatus::INSUFFICIENT_RESOURCES,
             NtStatus::FILE_IS_A_DIRECTORY,
             NtStatus::NOT_SUPPORTED,

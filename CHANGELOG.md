@@ -7,6 +7,16 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-07-15
+
+### Fixed
+
+- **Logon-rejection statuses now classify as `ErrorKind::AuthRequired` instead of `ErrorKind::Other`.** When a server refuses a session because the credentials or the account itself were rejected, the response NTSTATUS is one of a known logon-failure family — but only `STATUS_LOGON_FAILURE` and `STATUS_ACCOUNT_DISABLED` were mapped, so the rest fell through to the generic `ErrorKind::Other` and a consumer couldn't tell an auth refusal from an unrelated protocol error. In particular, macOS smbd answers a guest/anonymous `SessionSetup` it won't accept with `STATUS_ACCOUNT_RESTRICTION` (0xC000006E), which consumers were treating as a generic failure (a misleading warning plus a pointless CLI fallback in Cmdr). The full family now maps to `AuthRequired`: `STATUS_ACCOUNT_RESTRICTION`, `STATUS_INVALID_LOGON_HOURS`, `STATUS_INVALID_WORKSTATION`, `STATUS_PASSWORD_EXPIRED`, `STATUS_ACCOUNT_EXPIRED`, `STATUS_PASSWORD_MUST_CHANGE`, and `STATUS_ACCOUNT_LOCKED_OUT`, alongside the existing `STATUS_LOGON_FAILURE` and `STATUS_ACCOUNT_DISABLED`. They all mean the same thing to a caller: this logon won't work, supply different credentials. No new `ErrorKind` variant, so no `match` needs updating. Pinned by rows in the `classify_status_contract` test.
+
+### Added
+
+- **`NtStatus` constants for the logon-rejection family** (from MS-ERREF): `ACCOUNT_RESTRICTION` (0xC000006E), `INVALID_LOGON_HOURS` (0xC000006F), `INVALID_WORKSTATION` (0xC0000070), `PASSWORD_EXPIRED` (0xC0000071), `ACCOUNT_EXPIRED` (0xC0000193), `PASSWORD_MUST_CHANGE` (0xC0000224), and `ACCOUNT_LOCKED_OUT` (0xC0000234). Additive constants on the `NtStatus` newtype, so they carry named `Debug`/`Display` output and feed the classification above.
+
 ## [0.13.0] - 2026-07-09
 
 ### Added
