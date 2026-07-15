@@ -20,6 +20,7 @@
 #     fix         - Auto-fix formatting and clippy warnings
 #
 #   Utility commands:
+#     toolchain-fresh - Update the stable toolchain to match CI (runs as part of check)
 #     clean       - Remove build artifacts
 #     install-tools - Install required development tools
 #
@@ -137,8 +138,18 @@ udeps:
 # Composite Commands
 # ==============================================================================
 
-# Run fast checks: fmt-check, clippy, test, doc
-check: fmt-check clippy test doc
+# Keep the local stable toolchain current so checks run against the same
+# clippy/rustc as CI (CI always installs the latest stable; a stale local
+# stable once passed `just check` while CI's newer clippy failed the same
+# code). Soft-fails offline: checking against a slightly-stale stable beats
+# blocking all local work.
+toolchain-fresh:
+    @echo "[*] Updating stable toolchain (CI runs latest stable)..."
+    @rustup update stable --no-self-update || echo "[!] Couldn't update stable (offline?); continuing with the installed one"
+    @echo "[+] Toolchain: $(rustc --version)"
+
+# Run fast checks: fmt-check, clippy, test, doc (on a current stable toolchain)
+check: toolchain-fresh fmt-check clippy test doc
     @echo ""
     @echo "[+] All fast checks passed!"
 

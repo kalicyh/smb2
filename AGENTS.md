@@ -303,8 +303,9 @@ tests/CLAUDE.md         # Test categories, how to run, writing new tests, AWS ac
 
 ## Code style
 
-Run `just check` before committing. This runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and
-`cargo doc --no-deps`.
+Run `just check` before committing. This first updates the stable toolchain (`rustup update stable`, soft-failing
+offline) so local clippy matches CI's always-latest stable, then runs `cargo fmt --check`,
+`cargo clippy -- -D warnings`, `cargo test`, and `cargo doc --no-deps`.
 
 - `#![forbid(unsafe_code)]`: no unsafe
 - `#![warn(missing_docs)]`: doc comments for public APIs
