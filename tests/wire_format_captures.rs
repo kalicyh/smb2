@@ -165,7 +165,7 @@ async fn negotiate_request_is_accepted_by_real_server() {
 
     // Print raw bytes for future use as offline test vectors.
     println!("--- Negotiate response ({} bytes) ---", resp_bytes.len());
-    println!("Raw hex: {:02x?}", &resp_bytes);
+    println!("Raw hex: {:02x?}", resp_bytes);
 
     // Parse the response header.
     let mut cursor = ReadCursor::new(&resp_bytes);

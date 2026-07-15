@@ -409,8 +409,8 @@ impl KerberosAuthenticator {
             "kerberos: user_key len={}, etype={:?}, salt={}{}, key_prefix={:02x?}",
             user_key.len(),
             self.etype,
-            &self.credentials.realm,
-            &self.credentials.username,
+            self.credentials.realm,
+            self.credentials.username,
             &user_key[..user_key.len().min(8)],
         );
 
