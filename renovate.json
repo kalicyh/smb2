@@ -1,0 +1,45 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["before 6am on monday"],
+  "timezone": "Europe/Budapest",
+  "automerge": true,
+  "platformAutomerge": true,
+  "minimumReleaseAge": "3 days",
+  "packageRules": [
+    {
+      "description": "Group all non-major updates into one weekly PR",
+      "groupName": "all non-major updates",
+      "matchUpdateTypes": ["patch", "minor", "pin", "digest"],
+      "automerge": true
+    },
+    {
+      "description": "Group all major updates into one monthly PR",
+      "groupName": "all major updates",
+      "matchUpdateTypes": ["major"],
+      "schedule": ["before 6am on the first day of the month"],
+      "automerge": false
+    },
+    {
+      "description": "Security patches get immediate PRs, auto-merge",
+      "matchCategories": ["security"],
+      "schedule": ["at any time"],
+      "automerge": true,
+      "groupName": null
+    },
+    {
+      "description": "The SMB benchmark harness is excluded from the workspace because sspi pins digest =0.11.0-rc.5, which conflicts with digest 0.11.2. Independent bumps there can never resolve.",
+      "matchFileNames": ["benchmarks/smb/**"],
+      "enabled": false
+    }
+  ],
+  "cargo": {
+    "enabled": true
+  },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "schedule": ["at any time"],
+    "automerge": true,
+    "minimumReleaseAge": "3 days"
+  }
+}
