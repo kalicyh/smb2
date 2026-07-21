@@ -6,6 +6,7 @@
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, trace, warn};
 
@@ -99,6 +100,71 @@ pub struct DirectoryEntry {
     pub created: FileTime,
     /// The last modification time.
     pub modified: FileTime,
+}
+
+/// One QUERY_DIRECTORY round trip within a directory listing, captured by
+/// [`Tree::list_directory_instrumented`].
+#[derive(Debug, Clone)]
+pub struct QueryStep {
+    /// Wall-clock time for this QUERY_DIRECTORY request and its response.
+    pub elapsed: Duration,
+    /// Directory entries this round trip returned (0 for the terminal
+    /// NO_MORE_FILES reply).
+    pub entries: usize,
+    /// Output-buffer bytes the server returned for this round trip.
+    pub bytes: usize,
+    /// True for the terminal round trip that returned STATUS_NO_MORE_FILES.
+    pub no_more_files: bool,
+}
+
+/// Per-phase timing for a single directory listing, returned by
+/// [`Tree::list_directory_instrumented`]. Every field is a real wire round
+/// trip, so [`total`](Self::total) sums to the listing's wall time minus
+/// local parse cost. Useful for diagnosing slow shares: it shows whether the
+/// CREATE, the QUERY_DIRECTORY loop, or the CLOSE dominates, and how many
+/// QUERY round trips a directory needs (which the query buffer size drives).
+#[derive(Debug, Clone)]
+pub struct ListingTrace {
+    /// Time for the CREATE that opens the directory handle.
+    pub create: Duration,
+    /// One entry per QUERY_DIRECTORY round trip, in order. The last one is the
+    /// terminal NO_MORE_FILES reply.
+    pub queries: Vec<QueryStep>,
+    /// Time for the CLOSE that releases the handle.
+    pub close: Duration,
+    /// Output-buffer length (bytes) requested per QUERY_DIRECTORY.
+    pub query_buffer_len: u32,
+    /// Total directory entries returned (includes `.` and `..`).
+    pub entries: usize,
+}
+
+impl ListingTrace {
+    /// Total wire time: CREATE + every QUERY_DIRECTORY + CLOSE.
+    pub fn total(&self) -> Duration {
+        self.create + self.query_total() + self.close
+    }
+
+    /// Summed time of all QUERY_DIRECTORY round trips (including the terminal
+    /// NO_MORE_FILES reply).
+    pub fn query_total(&self) -> Duration {
+        self.queries.iter().map(|q| q.elapsed).sum()
+    }
+
+    /// Total round trips: CREATE + every QUERY_DIRECTORY + CLOSE.
+    pub fn round_trips(&self) -> usize {
+        1 + self.queries.len() + 1
+    }
+}
+
+/// Outcome of a single QUERY_DIRECTORY round trip.
+enum QueryStepOutcome {
+    /// The server returned entries. `bytes` is the output-buffer length.
+    Entries {
+        entries: Vec<DirectoryEntry>,
+        bytes: usize,
+    },
+    /// The server returned STATUS_NO_MORE_FILES, ending the scan.
+    NoMoreFiles { bytes: usize },
 }
 
 /// File metadata returned by [`Tree::stat`].
@@ -263,6 +329,81 @@ impl Tree {
         close_result?;
         trace!("tree: list_directory done, entries={}", entries.len());
         Ok(entries)
+    }
+
+    /// List a directory while recording a per-phase timing breakdown.
+    ///
+    /// Same wire path as [`list_directory`](Self::list_directory) (CREATE →
+    /// QUERY_DIRECTORY loop → CLOSE), but returns a [`ListingTrace`] alongside
+    /// the entries, timing each round trip. Meant for diagnosing slow shares
+    /// and sizing protocol tweaks, not for the hot path.
+    ///
+    /// `query_buffer_len` overrides the output-buffer length requested per
+    /// QUERY_DIRECTORY. `None` uses the production default (min of the server's
+    /// max transact size and 65536). A larger buffer packs more entries per
+    /// round trip, cutting the number of QUERY_DIRECTORY calls a fat directory
+    /// needs; the request charges credits to match (ceil(len / 65536)).
+    pub async fn list_directory_instrumented(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        query_buffer_len: Option<u32>,
+    ) -> Result<(Vec<DirectoryEntry>, ListingTrace)> {
+        let normalized = self.format_path(path);
+        let buffer_len = query_buffer_len.unwrap_or_else(|| Self::default_query_buffer_len(conn));
+
+        let create_start = Instant::now();
+        let file_id = self.open_directory(conn, &normalized).await?;
+        let create = create_start.elapsed();
+
+        let mut queries = Vec::new();
+        let mut all_entries = Vec::new();
+        let mut restart = true;
+        let query_result = loop {
+            let step_start = Instant::now();
+            match self
+                .query_directory_step(conn, file_id, restart, buffer_len)
+                .await
+            {
+                Ok(QueryStepOutcome::Entries { entries, bytes }) => {
+                    queries.push(QueryStep {
+                        elapsed: step_start.elapsed(),
+                        entries: entries.len(),
+                        bytes,
+                        no_more_files: false,
+                    });
+                    all_entries.extend(entries);
+                }
+                Ok(QueryStepOutcome::NoMoreFiles { bytes }) => {
+                    queries.push(QueryStep {
+                        elapsed: step_start.elapsed(),
+                        entries: 0,
+                        bytes,
+                        no_more_files: true,
+                    });
+                    break Ok(());
+                }
+                Err(e) => break Err(e),
+            }
+            restart = false;
+        };
+
+        // Close the handle regardless of query result, mirroring `list_directory`.
+        let close_start = Instant::now();
+        let close_result = self.close_handle(conn, file_id).await;
+        let close = close_start.elapsed();
+
+        query_result?;
+        close_result?;
+
+        let trace = ListingTrace {
+            create,
+            queries,
+            close,
+            query_buffer_len: buffer_len,
+            entries: all_entries.len(),
+        };
+        Ok((all_entries, trace))
     }
 
     /// Read a small file using a compound CREATE+READ+CLOSE request.
@@ -2496,67 +2637,105 @@ impl Tree {
     }
 
     /// Loop QUERY_DIRECTORY until STATUS_NO_MORE_FILES.
+    /// Default per-QUERY_DIRECTORY output-buffer length.
+    ///
+    /// Capped at 65536 so that CreditCharge=1 is valid: the spec requires
+    /// CreditCharge = 1 + (OutputBufferLength - 1) / 65536 for multi-credit
+    /// dialects, and 65536 keeps it at 1 while still holding plenty of entries.
+    fn default_query_buffer_len(conn: &Connection) -> u32 {
+        conn.params()
+            .map(|p| p.max_transact_size.min(65536))
+            .unwrap_or(65536)
+    }
+
+    /// Issue one QUERY_DIRECTORY round trip and parse its reply.
+    ///
+    /// The single-source of the CREATE-less half of a listing: both
+    /// [`query_directory_loop`](Self::query_directory_loop) and
+    /// [`list_directory_instrumented`](Self::list_directory_instrumented) drive
+    /// this, so they always exercise the same wire request.
+    ///
+    /// `output_buffer_length` above 65536 needs a matching multi-credit charge;
+    /// this computes it as ceil(len / 65536).
+    async fn query_directory_step(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+        restart: bool,
+        output_buffer_length: u32,
+    ) -> Result<QueryStepOutcome> {
+        let req = QueryDirectoryRequest {
+            file_information_class: FileInformationClass::FileBothDirectoryInformation,
+            flags: QueryDirectoryFlags(if restart {
+                QueryDirectoryFlags::RESTART_SCANS
+            } else {
+                0
+            }),
+            file_index: 0,
+            file_id,
+            output_buffer_length,
+            file_name: "*".to_string(),
+        };
+        let credit_charge =
+            CreditCharge((output_buffer_length as u64).div_ceil(65536).max(1) as u16);
+
+        let frame = conn
+            .execute_with_credits(
+                Command::QueryDirectory,
+                &req,
+                Some(self.tree_id),
+                credit_charge,
+            )
+            .await?;
+
+        if frame.header.status == NtStatus::NO_MORE_FILES {
+            return Ok(QueryStepOutcome::NoMoreFiles {
+                bytes: frame.body.len(),
+            });
+        }
+
+        if frame.header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: frame.header.status,
+                command: Command::QueryDirectory,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&frame.body);
+        let resp = QueryDirectoryResponse::unpack(&mut cursor)?;
+        let bytes = resp.output_buffer.len();
+
+        // Parse FileBothDirectoryInformation entries from the output buffer.
+        let entries = parse_file_both_directory_info(&resp.output_buffer)?;
+        for e in &entries {
+            trace!(
+                "tree: dir_entry name={}, size={}, is_dir={}",
+                e.name,
+                e.size,
+                e.is_directory
+            );
+        }
+        Ok(QueryStepOutcome::Entries { entries, bytes })
+    }
+
     async fn query_directory_loop(
         &self,
         conn: &mut Connection,
         file_id: FileId,
     ) -> Result<Vec<DirectoryEntry>> {
-        // Cap output buffer to 65536 so that CreditCharge=1 is valid.
-        // The spec requires CreditCharge = 1 + (OutputBufferLength - 1) / 65536
-        // for multi-credit dialects. Using 65536 keeps CreditCharge=1 which
-        // matches what send_request sets, while still being plenty for dir entries.
-        let max_output = conn
-            .params()
-            .map(|p| p.max_transact_size.min(65536))
-            .unwrap_or(65536);
-
+        let output_buffer_length = Self::default_query_buffer_len(conn);
         let mut all_entries = Vec::new();
-        let mut first = true;
+        let mut restart = true;
 
         loop {
-            let req = QueryDirectoryRequest {
-                file_information_class: FileInformationClass::FileBothDirectoryInformation,
-                flags: QueryDirectoryFlags(if first {
-                    QueryDirectoryFlags::RESTART_SCANS
-                } else {
-                    0
-                }),
-                file_index: 0,
-                file_id,
-                output_buffer_length: max_output,
-                file_name: "*".to_string(),
-            };
-            first = false;
-
-            let frame = conn
-                .execute(Command::QueryDirectory, &req, Some(self.tree_id))
-                .await?;
-
-            if frame.header.status == NtStatus::NO_MORE_FILES {
-                break;
+            match self
+                .query_directory_step(conn, file_id, restart, output_buffer_length)
+                .await?
+            {
+                QueryStepOutcome::NoMoreFiles { .. } => break,
+                QueryStepOutcome::Entries { entries, .. } => all_entries.extend(entries),
             }
-
-            if frame.header.status != NtStatus::SUCCESS {
-                return Err(Error::Protocol {
-                    status: frame.header.status,
-                    command: Command::QueryDirectory,
-                });
-            }
-
-            let mut cursor = ReadCursor::new(&frame.body);
-            let resp = QueryDirectoryResponse::unpack(&mut cursor)?;
-
-            // Parse FileBothDirectoryInformation entries from the output buffer.
-            let entries = parse_file_both_directory_info(&resp.output_buffer)?;
-            for e in &entries {
-                trace!(
-                    "tree: dir_entry name={}, size={}, is_dir={}",
-                    e.name,
-                    e.size,
-                    e.is_directory
-                );
-            }
-            all_entries.extend(entries);
+            restart = false;
         }
 
         Ok(all_entries)
@@ -3616,6 +3795,69 @@ mod tests {
         assert!(!entries[0].is_directory);
         assert_eq!(entries[1].name, "subdir");
         assert!(entries[1].is_directory);
+    }
+
+    #[tokio::test]
+    async fn list_directory_instrumented_reports_phase_breakdown() {
+        let mock = Arc::new(MockTransport::new());
+        let tree_id = TreeId(10);
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+
+        let entry1 = build_file_both_dir_info("file1.txt", 1024, false, 0);
+        let entry1_with_next =
+            build_file_both_dir_info("file1.txt", 1024, false, entry1.len() as u32);
+        let entry2 = build_file_both_dir_info("subdir", 0, true, 0);
+        let mut entries_data = entry1_with_next;
+        entries_data.extend_from_slice(&entry2);
+        let payload_len = entries_data.len();
+
+        // CREATE, one QUERY with entries, one QUERY NO_MORE_FILES, CLOSE.
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::SUCCESS,
+            entries_data,
+        ));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::NO_MORE_FILES,
+            vec![],
+        ));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id,
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let (entries, trace) = tree
+            .list_directory_instrumented(&mut conn, "somedir", None)
+            .await
+            .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(trace.entries, 2);
+
+        // Two QUERY round trips: the data reply, then the terminal NO_MORE_FILES.
+        assert_eq!(trace.queries.len(), 2);
+        assert_eq!(trace.queries[0].entries, 2);
+        assert_eq!(trace.queries[0].bytes, payload_len);
+        assert!(!trace.queries[0].no_more_files);
+        assert_eq!(trace.queries[1].entries, 0);
+        assert!(trace.queries[1].no_more_files);
+
+        // CREATE + 2 QUERY + CLOSE.
+        assert_eq!(trace.round_trips(), 4);
+        // total() sums the phases; query_total() only the QUERY round trips.
+        assert_eq!(
+            trace.total(),
+            trace.create + trace.query_total() + trace.close
+        );
     }
 
     #[tokio::test]

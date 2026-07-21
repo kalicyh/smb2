@@ -237,3 +237,98 @@ round-trips to 1. This brought small-file download from 1.55s to 617ms (2.5x imp
 downloads" result turned out to be a VFS cache artifact. With compound requests, small file downloads went from 2.7x to
 5.0x faster than native. For what Cmdr does most (browsing directories, reading file metadata, copying files to/from
 NAS), smb2 is the clear winner.
+
+## Directory-listing throughput probe (2026-07-22)
+
+Cmdr's background index scan of the QNAP ran at ~39 dirs/s (~1,454 entries/s) over SMB at 64 concurrent listings, while
+an earlier Cmdr bench on the same NAS hit ~137 dirs/s at the same concurrency. To explain that gap we built the
+`benchmarks/smb-listing` probe (see its [README](../benchmarks/smb-listing/README.md)), which instruments the real
+listing path (CREATE → QUERY_DIRECTORY loop → CLOSE) against the live NAS. It adds `Tree::list_directory_instrumented`
+to the crate: same wire path as `list_directory`, but it returns a per-round-trip `ListingTrace` and takes an optional
+QUERY_DIRECTORY buffer override. Read-only.
+
+- **Setup:** MacBook on Wi-Fi, QNAP TS-464 ("Naspolya") at 192.168.1.111 over Gigabit, raidz1 HDD pool with ZFS ARC.
+  SMB 3.1.1, MaxTransactSize 8 MB. Sample tree: David's `naspi` share, ~236 entries/dir average.
+- **Cache caveat:** the QNAP ARC caches directory metadata across runs, so "cold" numbers are only trustworthy on the
+  first pass over never-listed dirs. The authoritative cold data is the first full run
+  (`results/listing-2026-07-22-012435.txt`); repeated probing warmed the ARC and inflated later "cold" passes.
+
+### Per-phase breakdown (serial, one connection, 250 dirs)
+
+| Phase        | Cold p50 | Cold mean | Warm p50 | Warm mean |
+|--------------|----------|-----------|----------|-----------|
+| CREATE       | 4.2 ms   | 4.4 ms    | 3.9 ms   | 4.1 ms    |
+| QUERY (all)  | 40.0 ms  | 113.9 ms  | 8.6 ms   | 24.3 ms   |
+| CLOSE        | 3.3 ms   | 3.7 ms    | 3.1 ms   | 3.4 ms    |
+| TOTAL (wire) | 47.6 ms  | 122.0 ms  | 16.2 ms  | 31.8 ms   |
+
+- Cold serial throughput 8.2 dirs/s; warm 31.4 dirs/s (same 250 dirs, second pass).
+- 4.43 round trips per dir on average (CREATE + ~2.4 QUERY + CLOSE; the trailing QUERY always returns NO_MORE_FILES).
+- **QUERY_DIRECTORY dominates:** ~93% of cold wire time, ~70% warm. CREATE + CLOSE together are a fixed ~8 ms.
+- Cold QUERY p90 hit 170 ms (some dirs 400 ms+): random HDD seeks for uncached metadata. The warm QUERY mean (24 ms) is
+  inflated by fat multi-round-trip dirs; the p50 of 8.6 ms is representative of a typical dir.
+
+### Query-buffer sweep (fat dirs, warm)
+
+64 KiB vs 256 KiB vs 1024 KiB output buffers were **identical** in round trips and timing. Even the fattest real dir
+(139 entries) completes in 2 round trips at 64 KiB (1 data reply + 1 terminal NO_MORE_FILES). A bigger buffer only helps
+dirs with ~500+ entries in one directory, which this tree does not have.
+
+### Throughput vs in-flight window (one TCP session)
+
+| Window | Cold dirs/s | Warm dirs/s |
+|--------|-------------|-------------|
+| 1      | 3.5         | 31.7        |
+| 8      | 10.8        | 69.1        |
+| 32     | 10.1        | 75.2        |
+| 64     | 11.9        | 71.7        |
+| 128    | 10.0        | 77.2        |
+
+Cold uses a fresh disjoint slice per window (the real scan scenario); warm reuses the cached sample. **Cold throughput
+plateaus at ~10-12 dirs/s past a window of 8: concurrency beyond that buys nothing when metadata is cold.** Warm scales
+to ~75 dirs/s and holds (on this fat sample).
+
+### Throughput across N TCP sessions (window 64)
+
+| Sessions | Warm dirs/s |
+|----------|-------------|
+| 1        | 74.1        |
+| 2        | 117.9       |
+| 4        | 218.2       |
+
+Warm scaling across separate TCP sessions is near-linear (2.9x at 4 sessions). The probe also runs a cold session sweep,
+but each session count necessarily lists a different cold slice and cold per-dir cost varies ~10x, so those numbers are
+too noisy to read as a scaling curve (they came out super-linear, a slice-composition artifact).
+
+### Verdict: the gap is cache state, not the protocol or the code
+
+**Hypothesis #2 (cold metadata on the raidz1 pool) explains the 39-vs-137 gap.** Cmdr's 137 dirs/s bench ran warm (ARC
+had the metadata); its 39 dirs/s index scan is a cold first-ever walk, and cold listing is disk-IOPS-bound. The raidz1
+HDD pool does ~150 random read IOPS; a cold listing of a ~236-entry dir needs ~12-15 metadata reads (the directory
+object plus per-entry dnodes for the size/time fields in FileBothDirectoryInformation), so ~150 IOPS / ~13 per dir ≈ the
+observed ~10-12 cold dirs/s ceiling. At a 64-deep window the connection is mostly idle waiting on disk seeks. Cmdr's 39
+dirs/s (a tree with many small dirs, cheaper than this fat sample) sits in the same cold regime.
+
+**Hypothesis #1 (per-session serialization) is refuted.** A single TCP session scales cleanly from 31 to 75 dirs/s as
+the in-flight window grows (warm), so the session multiplexes concurrent requests fine; it does not serialize. The cold
+plateau is the disk, a resource shared across all sessions, not the connection.
+
+**Hypothesis #3 (per-phase distribution):** QUERY_DIRECTORY is the whole story; CREATE and CLOSE are a fixed ~8 ms.
+
+### Expected gains
+
+- **(a) Compound CREATE + QUERY + CLOSE in one frame:** saves the ~8 ms of CREATE + CLOSE (2 of ~4 round trips). On
+  **warm** listings that's ~25% off the ~32 ms per-dir wire time (more on small dirs, where the QUERY is cheap) — a real
+  win for interactive browsing and warm re-scans. On **cold** listings it's ~7%: the disk-bound QUERY (114 ms) dwarfs the
+  fixed overhead, so compounding does **not** speed up the cold index scan.
+- **(b) Bigger QUERY_DIRECTORY buffer (>64 KiB):** no measurable win on this tree; dirs are small enough to finish in one
+  data round trip at 64 KiB. Only worth it for pathological dirs with hundreds-to-thousands of entries. Skip for now.
+- **(c) Multiple TCP sessions:** near-linear **warm** scaling (2.9x at 4 sessions) — the single biggest throughput lever
+  for warm/repeat scans. For the **cold** scan it won't beat the shared disk-IOPS ceiling, so it won't rescue the
+  first-ever walk.
+
+**Actionable lead for Cmdr (not smb2):** the cold index scan is fundamentally disk-metadata-bound (~40 dirs/s for a
+mixed tree is near this NAS's hardware ceiling), so throwing more concurrency at it can't help. The lever is reading
+*less* per cold dir: if the first-pass index only needs names (not size/mtime), a lighter info class like
+FileNamesInformation would skip the per-entry dnode reads that dominate cold cost, and could raise the cold ceiling
+several-fold. Worth a Cmdr-side experiment.

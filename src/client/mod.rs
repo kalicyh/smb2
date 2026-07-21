@@ -29,7 +29,7 @@ pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
-pub use tree::{DirectoryEntry, FileInfo, FsInfo, Tree};
+pub use tree::{DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
 // Re-export high-level client types.
