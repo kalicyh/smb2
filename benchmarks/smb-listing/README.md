@@ -8,6 +8,9 @@ directories.
 Built to diagnose why Cmdr's background index scan of a QNAP NAS ran far slower than an earlier benchmark on the same
 box. See [`docs/benchmark-findings.md`](../../docs/benchmark-findings.md) for the verdict.
 
+For the NAS-side counterpart (disk/ARC/CPU counters sampled on the QNAP while this probe runs, which is what confirmed
+the disk is *not* saturated by a single session), see [`scripts/`](scripts/).
+
 **Read-only.** The probe only ever issues CREATE(dir) + QUERY_DIRECTORY + CLOSE. It never writes, renames, or deletes.
 
 ## Setup

@@ -332,3 +332,87 @@ mixed tree is near this NAS's hardware ceiling), so throwing more concurrency at
 *less* per cold dir: if the first-pass index only needs names (not size/mtime), a lighter info class like
 FileNamesInformation would skip the per-entry dnode reads that dominate cold cost, and could raise the cold ceiling
 several-fold. Worth a Cmdr-side experiment.
+
+## NAS-side ground truth during cold listing (2026-07-22)
+
+The client-side probe above inferred the cold bottleneck from the Mac only. To confirm it, we sampled the QNAP's own
+disk, ARC, and CPU counters *while* the probe drove load. The NAS-side numbers **revise the earlier verdict**: the
+raidz1 pool is **not** disk-saturated by a single SMB session, and multiple TCP sessions do lift cold throughput, which
+the client-only run couldn't prove.
+
+### NAS setup and instrumentation
+
+- **Box:** QNAP TS-464 "Naspolya", QTS 5.2.9, 4 CPU cores, 64 GB RAM. The `naspi` share is dataset `zpool2/zfs18` on
+  **`zpool2`, a raidz1 of 4× Seagate HDDs** (the 14.4 TB pool). `zpool1` is a *separate* 2-disk NVMe mirror, **not** an
+  L2ARC or special vdev for `zpool2` (`secondarycache=none`, `l2_hits=0`), so cold reads on the share hit the 4 HDDs
+  directly. Dataset: `recordsize=128K`, `compression=on`, `atime=relatime`, `primarycache=all`.
+- **ARC:** `c_max` 47.7 GB, ~41 GB resident throughout. Big enough that directory structure stays warm across runs; only
+  never-touched leaf metadata is genuinely cold.
+- **SMB server is ksmbd** (in-kernel: threads `ksmbd-<conn>.<n>`), not Samba. SMB work therefore shows up as kernel
+  `sys`/`softirq` CPU, not a userland `smbd` process.
+- **Sampler:** [`benchmarks/smb-listing/scripts/nas_sample.sh`](../benchmarks/smb-listing/scripts/nas_sample.sh),
+  read-only, 2 s cadence: `zpool iostat -Hlp zpool2` (per-second rates, ns latencies), `arcstats` deltas, `/proc/stat`
+  CPU deltas. The probe's stdout was epoch-stamped per line so each phase aligns to the samples.
+- **Measurement caveats:** (1) `iostat -x` cannot see the raidz HDDs — QNAP's `qzfs` layer hides `/dev/sd*` (only NVMe
+  and eMMC appear), so there is **no per-disk %util**; the saturation signal is `zpool iostat -l` `disk_wait` latency
+  plus how IOPS scale with added connections. (2) `zpool iostat` "read ops" are ZFS-level (metadata-dominated) read
+  operations fanned across the 4 raidz members, not physical head-seeks. (3) Idle ambient is ~0 read IOPS (a running
+  immich + docker sit quiet at rest); one early "baseline" was contaminated by a stray `du` walk we'd left running and
+  is discarded.
+
+### Cold fat-directory listing (fresh `photos` slices, ~140 entries/dir)
+
+This is the regime that reproduces the earlier ~8–12 dirs/s cold plateau. Each row is a distinct probe phase over a
+never-listed, disjoint slice; NAS columns are the average over that phase's 2 s samples.
+
+| Phase (fat dirs, window 64)        | Client dirs/s | Read IOPS avg (peak) | Read MB/s | disk_wait read | ARC hit% (demand-meta) | ARC miss/s | CPU busy (of 4 cores) | iowait |
+|------------------------------------|---------------|----------------------|-----------|----------------|------------------------|------------|-----------------------|--------|
+| Cold, 1 session (400 dirs, 53.9 s) | 7.4           | 1280 (2209)          | 6.0       | 2.6 ms         | 84% (83%)              | 1256       | 20%                   | ~0%    |
+| Cold, 1 session (400 dirs, 41.2 s) | 9.7           | 814 (1614)           | 3.8       | 4.2 ms         | 82% (81%)              | 856        | 15%                   | ~0%    |
+| Cold, 4 sessions (400 dirs, 10.8s) | 37.0          | 2239 (2717)          | 10.1      | 3.3 ms         | 82% (80%)              | 2386       | 23%                   | ~0%    |
+| Warm (same dirs, ARC-cached)       | ~90           | 336 (388)            | 1.5       | 4.5 ms         | 92% (93%)              | 401        | 24%                   | ~0%    |
+
+The two cold 1-session rows are the same configuration over different slices; the 7.4-vs-9.7 spread is the
+slice-composition variance the client-side caveat warned about (the cheaper slice lists more dirs/s *and* does fewer
+disk reads).
+
+Both cold-vs-warm and 1-vs-4-session comparisons hold the total in-flight depth constant at 64 (the multi-session sweep
+spreads 64 workers as 16 × 4 connections), so the only variable between the 1- and 4-session rows is the **number of TCP
+connections**.
+
+### Small-directory cold listing (contrast)
+
+Cold slices of small dirs barely touch the disk: `projects-archive` (~48 entries/dir) cold-listed at 40–55 dirs/s, and
+`projects` (~10 entries/dir) at 217–680 dirs/s with `disk_wait` ~1.4 ms. **Cold dirs/s scales inversely with
+entries/dir** because each entry costs roughly one metadata read; a fat 140-entry dir triggers ~170 metadata misses,
+a 10-entry dir ~12. This is the same mechanism behind the original 39-vs-137 gap: it's the tree's shape, not a fixed
+per-dir cost.
+
+### The three questions, answered NAS-side
+
+1. **During the cold plateau, are the disks saturated?** **No — there is real headroom.** `disk_wait` sat at
+   2.6–4.5 ms, well under the ~8–10 ms of a random HDD seek; even a *single* session momentarily peaked at 2209 read
+   IOPS while averaging 1280, i.e. the pool idled between pipeline stalls rather than hitting a wall. Decisively, adding
+   TCP connections at the **same** total in-flight depth raised read IOPS from ~1280 to ~2240 (peak 2717) with latency
+   essentially flat (2.6 → 3.3 ms). A saturated pool can't hand you 1.75× more IOPS for free. The single-session cold
+   ceiling is a **per-connection serialization in ksmbd** (one SMB connection can't drive the ZFS read queue deep enough
+   regardless of SMB in-flight window), not the disk.
+2. **Does the ARC miss rate explain cold vs warm?** **Yes.** A cold fat dir costs ~170 metadata misses/dir (1256 miss/s
+   ÷ 7.4 dirs/s); warm drops to ~4–5 misses/dir (401 ÷ ~90) and runs ~12× faster. Even "cold" is ~84% ARC hits because
+   the directory object and indirect blocks stay cached; the cold penalty is specifically the per-entry **dnode** reads
+   that miss ARC and hit the HDDs. Warm rises to 92%+.
+3. **Is anything CPU-bound?** **No.** CPU stayed at 15–25% of 4 cores (~0.6–1.0 core), softirq < 1%, iowait ~0% in every
+   phase. Neither ksmbd nor ZFS is CPU-starved; there is ample CPU headroom.
+
+### Revised verdict
+
+The earlier "cold is disk-IOPS-bound at ~150 IOPS, so more concurrency can't help the first-ever walk" was a
+**client-side inference that mis-identified per-session pipeline stalls as the disk ceiling.** The ~150 figure came from
+`10–12 dirs/s × ~13 reads/dir`; the pool in fact serves **1200–2700 read ops/s cold at 1.4–4.5 ms**, is not saturated by
+one session, and has headroom that extra TCP connections extract.
+
+What still holds: cold listing *is* metadata-read-bound (per-entry dnode misses on the HDD pool), and cold cost scales
+with entries/dir. What flips: the Cmdr lever. **Multiple TCP connections now look worthwhile for the cold first-ever
+scan too, not just warm re-scans** — the NAS-side IOPS lift at flat latency is composition-independent evidence, where
+the client-side dirs/s alone was too noisy to trust. Both levers stack: open several connections for the cold walk
+*and* read less per cold dir (a names-only info class skips the per-entry dnode reads that dominate cold cost).
