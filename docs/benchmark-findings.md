@@ -285,8 +285,9 @@ dirs with ~500+ entries in one directory, which this tree does not have.
 | 128    | 10.0        | 77.2        |
 
 Cold uses a fresh disjoint slice per window (the real scan scenario); warm reuses the cached sample. **Cold throughput
-plateaus at ~10-12 dirs/s past a window of 8: concurrency beyond that buys nothing when metadata is cold.** Warm scales
-to ~75 dirs/s and holds (on this fat sample).
+plateaus at ~10-12 dirs/s past a window of 8: raising the in-flight depth on a *single* connection buys nothing when
+metadata is cold.** (Adding separate TCP *connections* is a different lever and does help cold — see the NAS-side ground
+truth below.) Warm scales to ~75 dirs/s and holds (on this fat sample).
 
 ### Throughput across N TCP sessions (window 64)
 
@@ -297,21 +298,34 @@ to ~75 dirs/s and holds (on this fat sample).
 | 4        | 218.2       |
 
 Warm scaling across separate TCP sessions is near-linear (2.9x at 4 sessions). The probe also runs a cold session sweep,
-but each session count necessarily lists a different cold slice and cold per-dir cost varies ~10x, so those numbers are
-too noisy to read as a scaling curve (they came out super-linear, a slice-composition artifact).
+but from the client side each session count necessarily lists a different cold slice and cold per-dir cost varies ~10x,
+so the client dirs/s alone is too noisy to read as a scaling curve. The NAS-side counters resolve it: at the same total
+in-flight depth, more connections raise the pool's read IOPS ~1.75x at flat latency (composition-independent), so the
+cold session gain is real, not a slice artifact. See the NAS-side ground truth below.
 
 ### Verdict: the gap is cache state, not the protocol or the code
 
-**Hypothesis #2 (cold metadata on the raidz1 pool) explains the 39-vs-137 gap.** Cmdr's 137 dirs/s bench ran warm (ARC
-had the metadata); its 39 dirs/s index scan is a cold first-ever walk, and cold listing is disk-IOPS-bound. The raidz1
-HDD pool does ~150 random read IOPS; a cold listing of a ~236-entry dir needs ~12-15 metadata reads (the directory
-object plus per-entry dnodes for the size/time fields in FileBothDirectoryInformation), so ~150 IOPS / ~13 per dir ≈ the
-observed ~10-12 cold dirs/s ceiling. At a 64-deep window the connection is mostly idle waiting on disk seeks. Cmdr's 39
-dirs/s (a tree with many small dirs, cheaper than this fat sample) sits in the same cold regime.
+> The bottleneck attribution below was corrected by direct NAS-side measurement. The wire-level numbers in this section
+> stand; for what actually limits the cold walk, the authority is
+> [NAS-side ground truth](#nas-side-ground-truth-during-cold-listing-2026-07-22) further down, which this verdict now
+> reflects.
 
-**Hypothesis #1 (per-session serialization) is refuted.** A single TCP session scales cleanly from 31 to 75 dirs/s as
-the in-flight window grows (warm), so the session multiplexes concurrent requests fine; it does not serialize. The cold
-plateau is the disk, a resource shared across all sessions, not the connection.
+**Hypothesis #2 (cache state) explains the 39-vs-137 gap.** Cmdr's 137 dirs/s bench ran warm (ARC had the metadata); its
+39 dirs/s index scan is a cold first-ever walk. Cold listing is **metadata-read-bound**: each directory entry costs
+roughly one per-entry dnode read that misses ARC and hits the HDD pool, so cold cost scales with entries/dir (NAS-side:
+a ~140-entry dir triggers ~170 metadata misses, a ~10-entry dir ~12). That tree-shape effect — not a fixed per-dir cost
+— is the 39-vs-137 gap; Cmdr's real tree has many small dirs, cheaper than this fat sample.
+
+**The single-session cold ceiling is NOT a disk wall.** The client-side numbers alone suggested a ~150 IOPS disk ceiling
+(~10-12 dirs/s × ~13 reads/dir), but that was a client-side inference that mistook per-connection pipeline stalls for the
+disk. The NAS counters show the raidz1 pool serves **1,200-2,700 read ops/s cold at 1.4-4.5 ms** with headroom to spare.
+The single-session cold plateau is **per-connection serialization in ksmbd** (one SMB connection can't drive the ZFS
+read queue deep enough, regardless of SMB in-flight window), which extra TCP connections relieve.
+
+**Hypothesis #1 (per-session serialization), refined — not simply refuted.** The **warm** path multiplexes fine on one
+session (31 → 75 dirs/s as the in-flight window grows), so warm is not serialized. The **cold** path *is*
+per-connection-limited: adding TCP connections at the same total in-flight depth lifts NAS read IOPS ~1.75x at flat
+latency (composition-independent evidence), and cold client throughput ~3.8x at 4 connections.
 
 **Hypothesis #3 (per-phase distribution):** QUERY_DIRECTORY is the whole story; CREATE and CLOSE are a fixed ~8 ms.
 
@@ -319,19 +333,19 @@ plateau is the disk, a resource shared across all sessions, not the connection.
 
 - **(a) Compound CREATE + QUERY + CLOSE in one frame:** saves the ~8 ms of CREATE + CLOSE (2 of ~4 round trips). On
   **warm** listings that's ~25% off the ~32 ms per-dir wire time (more on small dirs, where the QUERY is cheap) — a real
-  win for interactive browsing and warm re-scans. On **cold** listings it's ~7%: the disk-bound QUERY (114 ms) dwarfs the
-  fixed overhead, so compounding does **not** speed up the cold index scan.
+  win for interactive browsing and warm re-scans. On **cold** listings it's ~7%: the metadata-bound QUERY (114 ms) dwarfs
+  the fixed overhead, so compounding does **not** speed up the cold index scan.
 - **(b) Bigger QUERY_DIRECTORY buffer (>64 KiB):** no measurable win on this tree; dirs are small enough to finish in one
   data round trip at 64 KiB. Only worth it for pathological dirs with hundreds-to-thousands of entries. Skip for now.
-- **(c) Multiple TCP sessions:** near-linear **warm** scaling (2.9x at 4 sessions) — the single biggest throughput lever
-  for warm/repeat scans. For the **cold** scan it won't beat the shared disk-IOPS ceiling, so it won't rescue the
-  first-ever walk.
+- **(c) Multiple TCP connections:** the single biggest throughput lever, and it helps **both** regimes. Warm scales
+  near-linearly (2.9x at 4 sessions). **Cold scales too** (~3.8x at 4 connections, NAS-side-verified as real IOPS-headroom
+  extraction at flat latency, not a slice artifact), because the single-connection cold ceiling is ksmbd per-connection
+  serialization, not the disk. So open several connections for the cold first-ever scan, not just warm re-scans.
 
-**Actionable lead for Cmdr (not smb2):** the cold index scan is fundamentally disk-metadata-bound (~40 dirs/s for a
-mixed tree is near this NAS's hardware ceiling), so throwing more concurrency at it can't help. The lever is reading
-*less* per cold dir: if the first-pass index only needs names (not size/mtime), a lighter info class like
-FileNamesInformation would skip the per-entry dnode reads that dominate cold cost, and could raise the cold ceiling
-several-fold. Worth a Cmdr-side experiment.
+**Actionable lead for Cmdr (not smb2):** the cold index scan has two stacking levers. (1) Spread it across several TCP
+connections to extract the pool's real IOPS headroom (verified: ~3.8x at 4 connections). (2) Read *less* per cold dir: if
+the first-pass index only needs names (not size/mtime), a lighter info class like FileNamesInformation skips the
+per-entry dnode reads that dominate cold cost. Both are Cmdr-side and compound.
 
 ## NAS-side ground truth during cold listing (2026-07-22)
 
