@@ -18,6 +18,73 @@ use std::time::Duration;
 use log::{debug, info, trace, warn};
 use tokio::sync::oneshot;
 
+/// One in-flight request: who is waiting, what they asked for, and since when.
+///
+/// The command and timestamp exist purely so a request that never comes back can
+/// be NAMED. Without them a wedged connection is only observable as "the caller
+/// is still awaiting", which is exactly the dead end a 2026-07-31 Cmdr incident
+/// hit: three requests appear to have gone unanswered while small operations on
+/// the same connection kept flowing, and nothing recorded enough to confirm it.
+struct Waiter {
+    tx: oneshot::Sender<Result<Frame>>,
+    command: Command,
+    dispatched_at: std::time::Instant,
+}
+
+/// How often the receiver task sweeps for requests that have gone unanswered,
+/// and how long a request may be outstanding before it is called out.
+const STALE_WAITER_SWEEP: std::time::Duration = std::time::Duration::from_secs(10);
+const STALE_WAITER_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Periodically report requests that have gone unanswered, for as long as the
+/// connection lives.
+///
+/// A separate task rather than a check inside `receiver_loop`: the loop is parked
+/// in `transport_recv.receive()` exactly when a wedged connection most needs
+/// reporting, and racing that read with a timer would mean dropping a read that
+/// is not necessarily cancel-safe. Holds a `Weak` so it exits once the last
+/// `Connection` clone drops.
+fn spawn_stale_waiter_sweeper(inner: &Arc<Inner>) {
+    let weak = Arc::downgrade(inner);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(STALE_WAITER_SWEEP).await;
+            let Some(inner) = weak.upgrade() else {
+                return; // connection dropped
+            };
+            if inner.disconnected.load(Ordering::Acquire) {
+                return;
+            }
+            warn_on_stale_waiters(&inner);
+        }
+    });
+}
+
+/// Log any request outstanding longer than `STALE_WAITER_AFTER`.
+///
+/// Deliberately re-reports on every sweep: a connection that keeps serving small
+/// requests while a large write hangs looks healthy by every other measure, so
+/// the repetition is the signal.
+fn warn_on_stale_waiters(inner: &Inner) {
+    let now = std::time::Instant::now();
+    let stale: Vec<(MessageId, Command, std::time::Duration)> = inner
+        .waiters
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(id, w)| {
+            let age = now.saturating_duration_since(w.dispatched_at);
+            (age >= STALE_WAITER_AFTER).then_some((*id, w.command, age))
+        })
+        .collect();
+    for (msg_id, command, age) in stale {
+        warn!(
+            "outstanding request: cmd={:?}, msg_id={}, no response for {:?}",
+            command, msg_id.0, age
+        );
+    }
+}
+
 use crate::crypto::compression::{compress_message, decompress_message, CompressedMessage};
 use crate::crypto::encryption::{self, Cipher, NonceGenerator};
 use crate::crypto::kdf::PreauthHasher;
@@ -187,7 +254,7 @@ impl CryptoState {
 /// all now — `Connection` is just a handle to `Arc<Inner>`.
 struct Inner {
     /// Per-request routing: msg_id → oneshot sender waiting for its response.
-    waiters: StdMutex<HashMap<MessageId, oneshot::Sender<Result<Frame>>>>,
+    waiters: StdMutex<HashMap<MessageId, Waiter>>,
     /// Credits available to the caller. Updated by the receiver task on every
     /// frame (orphans included), read by the caller thread for pre-send checks.
     credits: AtomicU32,
@@ -384,6 +451,7 @@ impl Connection {
             receiver_loop(receiver, inner_for_task).await;
         });
         *inner.receiver_task.lock().unwrap() = Some(handle);
+        spawn_stale_waiter_sweeper(&inner);
         Self { inner }
     }
 
@@ -450,7 +518,7 @@ impl Connection {
         // Update preauth hash with request bytes.
         self.inner.preauth_hasher.lock().unwrap().update(&req_bytes);
 
-        let rx = self.register_waiter(msg_id)?;
+        let rx = self.register_waiter(msg_id, Command::Negotiate)?;
 
         let rtt_start = std::time::Instant::now();
         if let Err(e) = self.inner.send_and_count(&req_bytes).await {
@@ -781,7 +849,7 @@ impl Connection {
         let mut msg_bytes = pack_message(&header, body);
         let captured = msg_bytes.clone();
 
-        let rx = self.register_waiter(msg_id)?;
+        let rx = self.register_waiter(msg_id, command)?;
 
         let wire_bytes = if should_encrypt {
             match self.encrypt_bytes(&msg_bytes) {
@@ -895,7 +963,7 @@ impl Connection {
         // teardown between the early fast-path check above and this
         // insertion returns `Err(Disconnected)` instead of leaving a
         // ghost Sender that never gets routed.
-        let rx = self.register_waiter(msg_id)?;
+        let rx = self.register_waiter(msg_id, command)?;
 
         // Build the wire bytes with encryption / signing / compression.
         let wire_bytes = if should_encrypt {
@@ -1024,7 +1092,7 @@ impl Connection {
 
         let mut msg_bytes = pack_message(&header, body);
 
-        let rx = self.register_waiter(msg_id)?;
+        let rx = self.register_waiter(msg_id, command)?;
 
         let wire_bytes = if should_encrypt {
             match self.encrypt_bytes(&msg_bytes) {
@@ -1194,8 +1262,8 @@ impl Connection {
         let mut receivers: Vec<oneshot::Receiver<Result<Frame>>> =
             Vec::with_capacity(message_ids.len());
         let mut registered: Vec<MessageId> = Vec::with_capacity(message_ids.len());
-        for id in &message_ids {
-            match self.register_waiter(*id) {
+        for (idx, id) in message_ids.iter().enumerate() {
+            match self.register_waiter(*id, ops[idx].command) {
                 Ok(rx) => {
                     receivers.push(rx);
                     registered.push(*id);
@@ -1398,13 +1466,24 @@ impl Connection {
     ///
     /// `fan_error_to_waiters` sets `disconnected = true` under the
     /// same lock, making the two paths strictly ordered.
-    fn register_waiter(&self, msg_id: MessageId) -> Result<oneshot::Receiver<Result<Frame>>> {
+    fn register_waiter(
+        &self,
+        msg_id: MessageId,
+        command: Command,
+    ) -> Result<oneshot::Receiver<Result<Frame>>> {
         let mut waiters = self.inner.waiters.lock().unwrap();
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
         }
         let (tx, rx) = oneshot::channel();
-        waiters.insert(msg_id, tx);
+        waiters.insert(
+            msg_id,
+            Waiter {
+                tx,
+                command,
+                dispatched_at: std::time::Instant::now(),
+            },
+        );
         trace!("register_waiter: msg_id={}", msg_id.0);
         Ok(rx)
     }
@@ -1690,7 +1769,7 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
         }
 
         for (msg_id, result) in routable {
-            let maybe_tx = inner.waiters.lock().unwrap().remove(&msg_id);
+            let maybe_tx = inner.waiters.lock().unwrap().remove(&msg_id).map(|w| w.tx);
             match maybe_tx {
                 Some(tx) => {
                     let was_err = result.is_err();
@@ -1907,13 +1986,13 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
 /// never "inserted but already drained" (which would leave the caller
 /// hanging on `rx.await`).
 fn fan_error_to_waiters(inner: &Inner, e: &Error) {
-    let drained: Vec<(MessageId, oneshot::Sender<Result<Frame>>)> = {
+    let drained: Vec<(MessageId, Waiter)> = {
         let mut waiters = inner.waiters.lock().unwrap();
         inner.disconnected.store(true, Ordering::Release);
         waiters.drain().collect()
     };
-    for (_id, tx) in drained {
-        let _ = tx.send(Err(clone_err_as_disconnected(e)));
+    for (_id, waiter) in drained {
+        let _ = waiter.tx.send(Err(clone_err_as_disconnected(e)));
     }
 }
 
@@ -2668,7 +2747,7 @@ mod tests {
 
         // Register a waiter manually so we can inject a bad frame without
         // racing with a real send.
-        let rx = conn.register_waiter(MessageId(4)).unwrap();
+        let rx = conn.register_waiter(MessageId(4), Command::Read).unwrap();
 
         // Build a frame that starts with TRANSFORM_PROTOCOL_ID so the
         // receiver task takes the decrypt path, but whose ciphertext
