@@ -2824,14 +2824,11 @@ impl Tree {
         let mut chunks_sent = 0usize;
         let mut chunks_received = 0usize;
 
-        let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
-        let initial_window = total_chunks.min(max_from_credits).min(MAX_PIPELINE_WINDOW);
-
-        if initial_window == 0 {
-            return Err(Error::invalid_data(
-                "no credits available for pipelined read",
-            ));
-        }
+        // How many requests to keep queued, not how many the credit budget
+        // allows: `Connection` reserves credits per send and parks a request
+        // that can't afford one, so throttling here as well could only
+        // under-send.
+        let initial_window = total_chunks.min(MAX_PIPELINE_WINDOW);
 
         debug!(
             "tree: pipeline read sliding window: initial_window={}, total_chunks={}, credits={}",
@@ -2916,11 +2913,8 @@ impl Tree {
             }
 
             if chunks_sent < total_chunks {
-                let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
-                if credits_available > 0 {
-                    in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
-                    chunks_sent += 1;
-                }
+                in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
+                chunks_sent += 1;
             }
         }
 
@@ -2951,14 +2945,11 @@ impl Tree {
         let mut chunks_received = 0usize;
         let mut bytes_received = 0u64;
 
-        let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
-        let initial_window = total_chunks.min(max_from_credits).min(MAX_PIPELINE_WINDOW);
-
-        if initial_window == 0 {
-            return Err(Error::invalid_data(
-                "no credits available for pipelined read",
-            ));
-        }
+        // How many requests to keep queued, not how many the credit budget
+        // allows: `Connection` reserves credits per send and parks a request
+        // that can't afford one, so throttling here as well could only
+        // under-send.
+        let initial_window = total_chunks.min(MAX_PIPELINE_WINDOW);
 
         let mut in_flight = FuturesUnordered::new();
         let build_req = |chunk_index: usize| -> ReadRequest {
@@ -3039,11 +3030,8 @@ impl Tree {
             }
 
             if chunks_sent < total_chunks {
-                let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
-                if credits_available > 0 {
-                    in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
-                    chunks_sent += 1;
-                }
+                in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
+                chunks_sent += 1;
             }
         }
 
@@ -3069,14 +3057,11 @@ impl Tree {
         let mut chunks_received = 0usize;
         let mut total_written = 0u64;
 
-        let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
-        let initial_window = total_chunks.min(max_from_credits).min(MAX_PIPELINE_WINDOW);
-
-        if initial_window == 0 {
-            return Err(Error::invalid_data(
-                "no credits available for pipelined write",
-            ));
-        }
+        // How many requests to keep queued, not how many the credit budget
+        // allows: `Connection` reserves credits per send and parks a request
+        // that can't afford one, so throttling here as well could only
+        // under-send.
+        let initial_window = total_chunks.min(MAX_PIPELINE_WINDOW);
 
         debug!(
             "tree: pipeline write sliding window: initial_window={}, total_chunks={}, credits={}",
@@ -3142,11 +3127,8 @@ impl Tree {
             total_written += resp.count as u64;
 
             if chunks_sent < total_chunks {
-                let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
-                if credits_available > 0 {
-                    in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
-                    chunks_sent += 1;
-                }
+                in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
+                chunks_sent += 1;
             }
         }
 
@@ -3184,10 +3166,6 @@ impl Tree {
         // Buffer for leftover data when a callback chunk is larger than max_write.
         let mut pending_data: Vec<u8> = Vec::new();
         let mut pending_offset = 0usize;
-
-        // Chunk that was pulled but couldn't be sent due to credit exhaustion.
-        // Re-checked before pulling the next chunk from the callback.
-        let mut stashed_chunk: Option<Vec<u8>> = None;
 
         // Helper: try to get the next wire-level chunk (up to max_write bytes).
         // Returns Some(data) or None if no more data available.
@@ -3243,16 +3221,11 @@ impl Tree {
             }
         };
 
-        // Initial fill: send up to window_size writes.
-        loop {
-            let credit_charge_per = max_write.div_ceil(65536).max(1) as u16;
-            let max_from_credits = conn.credits() as usize / credit_charge_per.max(1) as usize;
-            let can_send = max_from_credits.min(MAX_PIPELINE_WINDOW.saturating_sub(in_flight));
-
-            if can_send == 0 {
-                break;
-            }
-
+        // Initial fill: queue up to a full window of writes. The window is a
+        // queue bound, not a credit bound — `Connection` reserves credits per
+        // send and parks a write that can't afford one, so a chunk pulled from
+        // the callback is always eventually sent.
+        while in_flight < MAX_PIPELINE_WINDOW {
             let chunk = next_wire_chunk(
                 &mut pending_data,
                 &mut pending_offset,
@@ -3316,7 +3289,7 @@ impl Tree {
             let resp = WriteResponse::unpack(&mut cursor)?;
             total_written += resp.count as u64;
 
-            if callback_err.is_none() && stashed_chunk.is_none() {
+            if callback_err.is_none() {
                 let chunk = next_wire_chunk(
                     &mut pending_data,
                     &mut pending_offset,
@@ -3328,43 +3301,6 @@ impl Tree {
                 if let Some(chunk_data) = chunk {
                     let data_len = chunk_data.len() as u64;
                     let cc = data_len.div_ceil(65536).max(1) as u16;
-                    let credits_available = conn.credits() as usize / cc.max(1) as usize;
-
-                    if credits_available > 0 {
-                        let c = conn.clone();
-                        let tree_id = self.tree_id;
-                        let req = WriteRequest {
-                            data_offset: 0x70,
-                            offset,
-                            file_id,
-                            channel: 0,
-                            remaining_bytes: 0,
-                            write_channel_info_offset: 0,
-                            write_channel_info_length: 0,
-                            flags: 0,
-                            data: chunk_data,
-                        };
-                        in_flight_futs.push(Box::pin(async move {
-                            c.execute_with_credits(
-                                Command::Write,
-                                &req,
-                                Some(tree_id),
-                                CreditCharge(cc),
-                            )
-                            .await
-                        }));
-                        offset += data_len;
-                        in_flight += 1;
-                    } else {
-                        stashed_chunk = Some(chunk_data);
-                    }
-                }
-            } else if let Some(chunk_data) = stashed_chunk.take() {
-                let data_len = chunk_data.len() as u64;
-                let cc = data_len.div_ceil(65536).max(1) as u16;
-                let credits_available = conn.credits() as usize / cc.max(1) as usize;
-
-                if credits_available > 0 {
                     let c = conn.clone();
                     let tree_id = self.tree_id;
                     let req = WriteRequest {
@@ -3389,8 +3325,6 @@ impl Tree {
                     }));
                     offset += data_len;
                     in_flight += 1;
-                } else {
-                    stashed_chunk = Some(chunk_data);
                 }
             }
         }
@@ -7048,6 +6982,7 @@ mod tests {
         );
         conn_primary.set_test_params(params);
         conn_primary.set_session_id(crate::types::SessionId(0x1234));
+        conn_primary.set_credits(512);
         let mut conn_secondary = conn_primary.clone();
 
         let tree = Arc::new(Tree {

@@ -11,10 +11,11 @@
 //! See `docs/specs/connection-actor.md` for the full design (Phase 2).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
+use futures_util::future::{select, Either};
 use log::{debug, info, trace, warn};
 use tokio::sync::oneshot;
 
@@ -35,6 +36,11 @@ struct Waiter {
 /// and how long a request may be outstanding before it is called out.
 const STALE_WAITER_SWEEP: std::time::Duration = std::time::Duration::from_secs(10);
 const STALE_WAITER_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a send parked on credits rechecks whether anything is still
+/// outstanding. Short enough that "the last response landed while we waited"
+/// surfaces quickly, long enough to cost nothing.
+const CREDIT_STARVATION_RECHECK: Duration = Duration::from_millis(250);
 
 /// Periodically report requests that have gone unanswered, for as long as the
 /// connection lives.
@@ -88,6 +94,7 @@ fn warn_on_stale_waiters(inner: &Inner) {
     }
 }
 
+use crate::client::credits::{CreditPool, CreditReservation};
 use crate::crypto::compression::{compress_message, decompress_message, CompressedMessage};
 use crate::crypto::encryption::{self, Cipher, NonceGenerator};
 use crate::crypto::kdf::PreauthHasher;
@@ -262,9 +269,10 @@ struct Inner {
     /// to stay silent. Consumers with a legitimately slow server tune or disable
     /// it; see `Connection::set_stale_request_warning`.
     stale_request_after: StdMutex<Option<std::time::Duration>>,
-    /// Credits available to the caller. Updated by the receiver task on every
-    /// frame (orphans included), read by the caller thread for pre-send checks.
-    credits: AtomicU32,
+    /// The server's credit budget. Every send reserves its `CreditCharge`
+    /// here before the bytes go out; the receiver task banks the grant off
+    /// every frame (orphans included). See `credits.rs`.
+    credits: CreditPool,
     /// Next message id to allocate. Incremented by caller on send.
     next_message_id: AtomicU64,
     /// Crypto state for signing / encryption.
@@ -312,7 +320,7 @@ impl Inner {
         Self {
             waiters: StdMutex::new(HashMap::new()),
             stale_request_after: StdMutex::new(Some(STALE_WAITER_AFTER)),
-            credits: AtomicU32::new(1),
+            credits: CreditPool::new(),
             next_message_id: AtomicU64::new(0),
             crypto: StdMutex::new(CryptoState::new()),
             disconnected: AtomicBool::new(false),
@@ -338,6 +346,90 @@ impl Inner {
             .wire_bytes_sent
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         self.sender.send(bytes).await
+    }
+
+    /// Reserve `charge` credits for a request that is about to be sent.
+    ///
+    /// The reservation is refunded on drop, so a request that fails to sign,
+    /// encrypt, or reach the transport gives its credits back; `commit` it
+    /// once the bytes are out.
+    ///
+    /// Waiting is bounded three ways, because an unbounded wait would trade
+    /// the over-spend hang for a starvation hang:
+    ///
+    /// 1. Nothing outstanding and not enough on hand: no grant can ever
+    ///    arrive, so fail immediately rather than wait out the deadline.
+    /// 2. The connection dies: `CreditPool::close` wakes every waiter.
+    /// 3. Otherwise the deadline from
+    ///    [`Connection::set_credit_wait_timeout`] applies.
+    async fn reserve_credits(
+        &self,
+        charge: u16,
+        command: Command,
+    ) -> Result<CreditReservation<'_>> {
+        if self.credits.try_reserve(charge) {
+            return Ok(CreditReservation::new(&self.credits, charge));
+        }
+        if self.credits.is_closed() || self.disconnected.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
+        if self.waiters.lock().unwrap().is_empty() {
+            // Every credit the server will ever return rides on a response,
+            // and there is no request outstanding to carry one.
+            return Err(self.starvation(charge, Duration::ZERO));
+        }
+
+        self.metrics.credit_waits.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            "credits: {:?} needs {} credit(s) but only {} are available; waiting for the server to grant more",
+            command,
+            charge,
+            self.credits.available()
+        );
+
+        let started = std::time::Instant::now();
+        let deadline = started + self.credits.wait_timeout();
+        let mut reserving = Box::pin(self.credits.reserve(charge));
+        loop {
+            // `select` polls the reservation first, so credits that land in
+            // the same tick as a recheck are taken rather than declared lost.
+            let recheck = Box::pin(tokio::time::sleep(CREDIT_STARVATION_RECHECK));
+            match select(reserving, recheck).await {
+                Either::Left((res, _)) => {
+                    return match res {
+                        Ok(()) => {
+                            debug!(
+                                "credits: {:?} acquired {} credit(s) after {:?}",
+                                command,
+                                charge,
+                                started.elapsed()
+                            );
+                            Ok(CreditReservation::new(&self.credits, charge))
+                        }
+                        // The pool only closes on connection teardown.
+                        Err(_) => Err(Error::Disconnected),
+                    };
+                }
+                Either::Right((_, still_reserving)) => {
+                    let nothing_outstanding = self.waiters.lock().unwrap().is_empty();
+                    if nothing_outstanding || std::time::Instant::now() >= deadline {
+                        self.metrics
+                            .credit_starvations
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(self.starvation(charge, started.elapsed()));
+                    }
+                    reserving = still_reserving;
+                }
+            }
+        }
+    }
+
+    fn starvation(&self, charge: u16, waited: Duration) -> Error {
+        Error::CreditStarvation {
+            needed: charge,
+            available: self.credits.available(),
+            waited,
+        }
     }
 
     /// Snapshot the counters into a plain-value `MetricsSnapshot`.
@@ -383,6 +475,15 @@ pub(crate) struct Metrics {
     pub malformed_frames: AtomicU64,
     pub session_expired_events: AtomicU64,
 
+    // Credit accounting
+    /// Sends that had to park because the connection's whole credit budget
+    /// was in flight. A steady trickle is normal on a saturated pipeline; a
+    /// flood means the server's window is too small for the chunk size.
+    pub credit_waits: AtomicU64,
+    /// Sends that gave up waiting for a grant. Non-zero means a server went
+    /// silent while its socket stayed open.
+    pub credit_starvations: AtomicU64,
+
     // Caller-observed outcomes
     pub requests_returned_err: AtomicU64,
 }
@@ -409,6 +510,8 @@ impl Metrics {
             decompress_failures: self.decompress_failures.load(Relaxed),
             malformed_frames: self.malformed_frames.load(Relaxed),
             session_expired_events: self.session_expired_events.load(Relaxed),
+            credit_waits: self.credit_waits.load(Relaxed),
+            credit_starvations: self.credit_starvations.load(Relaxed),
             requests_returned_err: self.requests_returned_err.load(Relaxed),
         }
     }
@@ -516,7 +619,11 @@ impl Connection {
             negotiate_contexts,
         };
 
-        // Register a waiter for msg_id=0 (negotiate is always first).
+        // Register a waiter for msg_id=0 (negotiate is always first). The one
+        // credit a fresh pool holds (MS-SMB2 § 3.2.5.1.1) is exactly enough,
+        // so this reservation never waits — it just keeps the books straight
+        // for whatever the response grants.
+        let reservation = self.inner.reserve_credits(1, Command::Negotiate).await?;
         let mut header = Header::new_request(Command::Negotiate);
         let msg_id = self.allocate_msg_id(1);
         header.message_id = msg_id;
@@ -533,6 +640,7 @@ impl Connection {
             self.remove_waiter(msg_id);
             return Err(e);
         }
+        reservation.commit();
 
         let frame = await_frame(rx).await?;
         *self.inner.estimated_rtt.lock().unwrap() = Some(rtt_start.elapsed());
@@ -725,9 +833,30 @@ impl Connection {
         self.inner.crypto.lock().unwrap().should_encrypt
     }
 
-    /// Get the current number of available credits.
+    /// Credits on hand: granted by the server and not yet spent on a request
+    /// that is still in flight.
+    ///
+    /// This is the budget a new request can draw on right now, so it drops as
+    /// requests go out and climbs as their responses come back. It is *not*
+    /// the size of the server's window — subtract it from that and you have
+    /// what the pipeline is currently holding.
     pub fn credits(&self) -> u16 {
-        self.inner.credits.load(Ordering::Acquire) as u16
+        self.inner.credits.available()
+    }
+
+    /// How long a send waits for the server to grant credits before failing
+    /// with [`Error::CreditStarvation`].
+    ///
+    /// Defaults to 30 s. A send only waits at all once the connection's whole
+    /// credit budget is in flight, which on a healthy server clears in
+    /// milliseconds; the deadline exists so a server that stops answering
+    /// surfaces as an error instead of a wait that never ends. Raise it for a
+    /// server that is legitimately slow under heavy load.
+    ///
+    /// There is deliberately no way to wait forever: that is the failure this
+    /// bound exists to prevent.
+    pub fn set_credit_wait_timeout(&self, after: Duration) {
+        self.inner.credits.set_wait_timeout(after);
     }
 
     /// The `MessageId` that will be assigned to the next request.
@@ -831,11 +960,12 @@ impl Connection {
             return Err(Error::Disconnected);
         }
         let charge = credit_charge.0.max(1);
+        let reservation = self.inner.reserve_credits(charge, command).await?;
         let msg_id = self.allocate_msg_id(charge as u64);
 
         let mut header = Header::new_request(command);
         header.message_id = msg_id;
-        header.credits = 256;
+        header.credits = self.inner.credits.request_for(charge);
         header.credit_charge = CreditCharge(charge);
         header.session_id = self.session_id();
         if let Some(tid) = tree_id {
@@ -887,6 +1017,7 @@ impl Connection {
             self.remove_waiter(msg_id);
             return Err(e);
         }
+        reservation.commit();
         // TRACE, not DEBUG: per-request frame plumbing. Fires for every request, so at
         // DEBUG it floods a consumer during high-throughput ops (e.g. a recursive
         // directory scan). Lifecycle/errors stay at DEBUG. See AGENTS.md § Logging.
@@ -940,11 +1071,16 @@ impl Connection {
             return Err(Error::Disconnected);
         }
         let charge = credit_charge.0.max(1);
+        // Spend the credits BEFORE allocating a MessageId: the two advance
+        // together (MS-SMB2 § 3.2.4.1.6 consumes `CreditCharge` sequence
+        // numbers per request), and a reservation that has to wait must not
+        // leave a hole in the sequence window meanwhile.
+        let reservation = self.inner.reserve_credits(charge, command).await?;
         let msg_id = self.allocate_msg_id(charge as u64);
 
         let mut header = Header::new_request(command);
         header.message_id = msg_id;
-        header.credits = 256;
+        header.credits = self.inner.credits.request_for(charge);
         header.credit_charge = CreditCharge(charge);
         header.session_id = self.session_id();
         if let Some(tid) = tree_id {
@@ -1000,6 +1136,7 @@ impl Connection {
                     let framed = build_compressed_frame(&compressed);
                     match self.inner.send_and_count(&framed).await {
                         Ok(()) => {
+                            reservation.commit();
                             // TRACE: per-request frame plumbing (see execute_cap above).
                             trace!(
                                 "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
@@ -1022,6 +1159,7 @@ impl Connection {
             self.remove_waiter(msg_id);
             return Err(e);
         }
+        reservation.commit();
         // TRACE: per-request frame plumbing (see execute_cap above).
         trace!(
             "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}, len={}",
@@ -1075,11 +1213,12 @@ impl Connection {
             return Err(Error::Disconnected);
         }
         let charge = credit_charge.0.max(1);
+        let reservation = self.inner.reserve_credits(charge, command).await?;
         let msg_id = self.allocate_msg_id(charge as u64);
 
         let mut header = Header::new_request(command);
         header.message_id = msg_id;
-        header.credits = 256;
+        header.credits = self.inner.credits.request_for(charge);
         header.credit_charge = CreditCharge(charge);
         header.session_id = self.session_id();
         if let Some(tid) = tree_id {
@@ -1128,6 +1267,7 @@ impl Connection {
                     let framed = build_compressed_frame(&compressed);
                     match self.inner.send_and_count(&framed).await {
                         Ok(()) => {
+                            reservation.commit();
                             debug!(
                                 "dispatch: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
                                 command, msg_id.0, charge, tree_id, should_sign,
@@ -1149,6 +1289,7 @@ impl Connection {
             self.remove_waiter(msg_id);
             return Err(e);
         }
+        reservation.commit();
         debug!(
             "dispatch: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}, len={}",
             command, msg_id.0, charge, tree_id, should_sign, should_encrypt, wire_bytes.len()
@@ -1210,6 +1351,18 @@ impl Connection {
             (c.should_sign, c.should_encrypt)
         };
 
+        // One frame, but the server charges every sub-request, so reserve the
+        // whole chain up front — reserving per sub-op could let another task
+        // slip in between and leave this compound half-funded on the wire.
+        let total_charge = ops
+            .iter()
+            .map(|op| op.credit_charge.0.max(1))
+            .fold(0u16, |acc, c| acc.saturating_add(c));
+        let reservation = self
+            .inner
+            .reserve_credits(total_charge, ops[0].command)
+            .await?;
+
         let session_id = self.session_id();
         let mut message_ids: Vec<MessageId> = Vec::with_capacity(ops.len());
         let mut sub_requests: Vec<Vec<u8>> = Vec::with_capacity(ops.len());
@@ -1220,7 +1373,7 @@ impl Connection {
 
             let mut header = Header::new_request(op.command);
             header.message_id = msg_id;
-            header.credits = 256;
+            header.credits = self.inner.credits.request_for(charge);
             header.credit_charge = CreditCharge(charge);
             header.session_id = session_id;
             header.tree_id = op.tree_id;
@@ -1311,6 +1464,7 @@ impl Connection {
             }
             return Err(e);
         }
+        reservation.commit();
 
         // TRACE: per-request frame plumbing (see execute_cap above).
         trace!(
@@ -1543,8 +1697,8 @@ impl Connection {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_credits(&mut self, credits: u16) {
-        self.inner.credits.store(credits as u32, Ordering::Release);
+    pub(crate) fn set_credits(&self, credits: u16) {
+        self.inner.credits.set_available(credits);
     }
 
     #[cfg(test)]
@@ -1613,7 +1767,7 @@ impl Connection {
 
         // Wait-free reads.
         let credits = CreditInfo {
-            available: (self.inner.credits.load(Ordering::Acquire) & 0xFFFF) as u16,
+            available: self.inner.credits.available(),
             in_flight,
             next_message_id: self.inner.next_message_id.load(Ordering::Acquire),
         };
@@ -1917,12 +2071,15 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
         }
     };
 
-    // Always update credits.
-    if header.credits > 0 {
-        let prev = inner.credits.load(Ordering::Relaxed) as u16;
-        let next = prev.saturating_add(header.credits);
-        inner.credits.store(next as u32, Ordering::Release);
-    }
+    // Bank the grant off every frame, orphans included: the server has
+    // released those credits regardless of whether anyone is still waiting for
+    // the response that carried them. Interim STATUS_PENDING frames count too.
+    //
+    // Nothing is subtracted here. The charge was already spent when the
+    // request went out (see `Inner::reserve_credits`); charging again on
+    // receipt would double-count, and charging *only* on receipt is what let
+    // concurrent senders each spend the same credits.
+    inner.credits.grant(header.credits);
 
     // Oplock break notification: MessageId=UNSOLICITED. Skip silently.
     if header.message_id == MessageId::UNSOLICITED {
@@ -1949,13 +2106,6 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
         );
         return Ok(SubFrameAction::Skip);
     }
-
-    // Consume credit_charge (or 1 if zero).
-    let consume = header.credit_charge.0.max(1);
-    let prev = inner.credits.load(Ordering::Relaxed) as u16;
-    inner
-        .credits
-        .store(prev.saturating_sub(consume) as u32, Ordering::Release);
 
     // Verify signature if signing is active and not encrypted.
     let (should_sign, signing_key, signing_algorithm) = {
@@ -2033,6 +2183,9 @@ fn fan_error_to_waiters(inner: &Inner, e: &Error) {
         inner.disconnected.store(true, Ordering::Release);
         waiters.drain().collect()
     };
+    // Sends parked on credits are waiting for a grant that can no longer
+    // arrive. Wake them now instead of letting each burn its full deadline.
+    inner.credits.close();
     for (_id, waiter) in drained {
         let _ = waiter.tx.send(Err(clone_err_as_disconnected(e)));
     }
@@ -2332,6 +2485,192 @@ mod tests {
 
         // Server granted 32 credits, minus 1 consumed for our request.
         assert_eq!(conn.credits(), 32);
+    }
+
+    // ── Credit accounting ──────────────────────────────────────────────
+
+    /// The window is the server's, and it is spent the moment a request goes
+    /// on the wire — not when the answer comes back. Sending more than the
+    /// server granted is a protocol violation it is entitled to punish, and
+    /// at least one NAS punishes it by going silent forever.
+    #[tokio::test]
+    async fn concurrent_requests_cannot_outspend_the_credit_window() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        // The server's entire window is four credits, and no response is ever
+        // queued, so nothing replenishes it.
+        conn.set_credits(4);
+
+        // Four concurrent requests charging two credits each: eight credits
+        // asked of a four-credit window.
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let c = conn.clone();
+            tasks.push(tokio::spawn(async move {
+                let body = crate::msg::echo::EchoRequest;
+                c.execute_with_credits(Command::Echo, &body, Some(TreeId(1)), CreditCharge(2))
+                    .await
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let sent = mock.sent_count();
+        for t in tasks {
+            t.abort();
+        }
+        assert!(
+            sent <= 2,
+            "over-spent the four-credit window: {sent} requests of charge 2 reached the wire"
+        );
+    }
+
+    /// The gate must not turn an over-spend hang into a starvation hang. A
+    /// server that goes quiet for any reason stops granting credits, and a
+    /// send parked on those credits has to give up and say so.
+    #[tokio::test]
+    async fn a_server_that_stops_granting_credits_errors_instead_of_hanging() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(2);
+        conn.set_credit_wait_timeout(std::time::Duration::from_millis(300));
+
+        // Takes the whole window and is never answered, so the server looks
+        // alive (the request is outstanding) but grants nothing.
+        let holder = conn.clone();
+        let held = tokio::spawn(async move {
+            let body = crate::msg::echo::EchoRequest;
+            holder
+                .execute_with_credits(Command::Echo, &body, Some(TreeId(1)), CreditCharge(2))
+                .await
+        });
+        while mock.sent_count() < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let body = crate::msg::echo::EchoRequest;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.execute_with_credits(Command::Echo, &body, Some(TreeId(1)), CreditCharge(2)),
+        )
+        .await
+        .expect("the send must give up on its own, not hang until the test times out");
+
+        held.abort();
+        assert!(
+            matches!(blocked, Err(Error::CreditStarvation { needed: 2, .. })),
+            "expected a typed starvation error, got {blocked:?}"
+        );
+        assert_eq!(
+            conn.metrics().credit_starvations,
+            1,
+            "starvation is counted so a consumer can see it without reading logs"
+        );
+        assert_eq!(
+            mock.sent_count(),
+            1,
+            "the starved request must not reach the wire"
+        );
+    }
+
+    /// With nothing outstanding, no grant can ever arrive — so there is
+    /// nothing to wait for and the deadline is the wrong answer.
+    #[tokio::test]
+    async fn a_charge_no_outstanding_request_can_fund_fails_immediately() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(1);
+        // Deliberately long: passing this test means the fast path fired, not
+        // that the deadline did.
+        conn.set_credit_wait_timeout(std::time::Duration::from_secs(60));
+
+        let body = crate::msg::echo::EchoRequest;
+        let started = std::time::Instant::now();
+        let result = conn
+            .execute_with_credits(Command::Echo, &body, Some(TreeId(1)), CreditCharge(4))
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::CreditStarvation {
+                    needed: 4,
+                    available: 1,
+                    ..
+                })
+            ),
+            "expected an immediate starvation error, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "waited {:?} for credits that could never arrive",
+            started.elapsed()
+        );
+    }
+
+    /// The other half of the gate: parking is temporary. A grant on a
+    /// response has to release the request waiting behind it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_grant_releases_a_send_parked_on_credits() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(2);
+
+        let holder = conn.clone();
+        let first = tokio::spawn(async move {
+            let body = crate::msg::echo::EchoRequest;
+            holder
+                .execute_with_credits(Command::Echo, &body, Some(TreeId(1)), CreditCharge(2))
+                .await
+        });
+        while mock.sent_count() < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let waiter = conn.clone();
+        let second = tokio::spawn(async move {
+            let body = crate::msg::echo::EchoRequest;
+            waiter
+                .execute_with_credits(Command::Echo, &body, Some(TreeId(1)), CreditCharge(2))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(mock.sent_count(), 1, "the second send is parked on credits");
+
+        // Answer the first request; its grant funds the parked one.
+        mock.queue_response(build_echo_response_with_msg_id(MessageId(0)));
+        first.await.unwrap().expect("first request completes");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mock.sent_count() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        second.abort();
+        assert_eq!(
+            mock.sent_count(),
+            2,
+            "the grant on the first response must release the parked send"
+        );
+        assert_eq!(conn.metrics().credit_waits, 1);
     }
 
     #[tokio::test]
@@ -3085,7 +3424,7 @@ mod tests {
     async fn dfs_flag_not_set_for_unregistered_tree() {
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
-        let mut conn = Connection::from_transport(
+        let conn = Connection::from_transport(
             Box::new(mock.clone()),
             Box::new(mock.clone()),
             "test-server",
@@ -3174,7 +3513,7 @@ mod tests {
         assert_eq!(cloned.server_name(), "test-server");
 
         // Mutate via the clone and verify the original observes it too.
-        cloned.inner.credits.store(7, Ordering::Release);
+        cloned.inner.credits.set_available(7);
         assert_eq!(original.credits(), 7);
 
         // Phase 3 A.3 removed the caller-local `pending_fifo`; there is no
@@ -3267,6 +3606,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_credits(512);
 
         // Spawn into a JoinSet so a timeout-side panic can introspect
         // which tasks haven't returned yet (`set.len()`). Plain
@@ -3378,6 +3718,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_credits(512);
 
         // Spawn 5 tasks. Each allocates its own MessageId in submission
         // order: 0, 1, 2, 3, 4. To make allocation deterministic on the
@@ -3473,6 +3814,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_credits(512);
 
         let c = conn.clone();
         let handle = tokio::spawn(async move {
@@ -3562,7 +3904,7 @@ mod tests {
     async fn connection_is_cloneable_clone_outlives_original() {
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
-        let mut original = Connection::from_transport(
+        let original = Connection::from_transport(
             Box::new(mock.clone()),
             Box::new(mock.clone()),
             "test-server",

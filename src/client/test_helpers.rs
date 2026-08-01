@@ -42,6 +42,12 @@ pub(crate) fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
         compression_supported: false,
     });
     conn.set_session_id(SessionId(0x1234));
+    // Stage a credit window the way a real connection would have one by this
+    // point: NEGOTIATE, SESSION_SETUP, and TREE_CONNECT have all come back
+    // with grants before any of these tests' operations run. Without it the
+    // pool holds the single pre-NEGOTIATE credit and any compound is
+    // unsendable.
+    conn.set_credits(512);
     conn
 }
 

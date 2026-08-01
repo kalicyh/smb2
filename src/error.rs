@@ -86,6 +86,34 @@ pub enum Error {
         /// The server's negotiated maximum bytes per READ (`MaxReadSize`).
         max_read: u32,
     },
+
+    /// The server stopped granting credits, so the request could not be sent.
+    ///
+    /// Every SMB2 request spends credits from a budget the server grants and
+    /// replenishes on each response. This crate never sends beyond that budget
+    /// (doing so is a protocol violation the server may answer by dropping the
+    /// connection, or — on some NAS firmware — by going silent). When the
+    /// budget runs dry the send waits for a grant; this error says the wait
+    /// ran out.
+    ///
+    /// In practice it means the server has stopped answering while the TCP
+    /// connection is still up, so treat it as a dead connection: reconnect.
+    /// Classifies as [`ErrorKind::TimedOut`] and reports as retryable.
+    ///
+    /// Tune the wait with
+    /// [`Connection::set_credit_wait_timeout`](crate::client::connection::Connection::set_credit_wait_timeout).
+    #[error(
+        "server stopped granting SMB credits: needed {needed}, {available} available \
+         after waiting {waited:?}"
+    )]
+    CreditStarvation {
+        /// Credits the request needed (its `CreditCharge`).
+        needed: u16,
+        /// Credits on hand when the wait was abandoned.
+        available: u16,
+        /// How long the send waited for a grant.
+        waited: std::time::Duration,
+    },
 }
 
 impl Error {
@@ -103,6 +131,7 @@ impl Error {
             self,
             Error::Timeout
                 | Error::Disconnected
+                | Error::CreditStarvation { .. }
                 | Error::Protocol {
                     status: NtStatus::INSUFFICIENT_RESOURCES,
                     ..
@@ -250,6 +279,9 @@ impl Error {
             Error::SessionExpired => ErrorKind::SessionExpired,
             Error::DfsReferralRequired { .. } => ErrorKind::DfsReferral,
             Error::FileTooLargeForSingleRead { .. } => ErrorKind::TooLarge,
+            // A connection whose credits never come back is a dead connection
+            // wearing a live socket; consumers already reconnect on TimedOut.
+            Error::CreditStarvation { .. } => ErrorKind::TimedOut,
             Error::Protocol { status, .. } => classify_status(*status),
         }
     }

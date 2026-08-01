@@ -1177,11 +1177,13 @@ impl FileWriter {
         Ok(())
     }
 
-    /// Check whether we have enough credits to send a chunk of this size.
-    fn can_send(&self, data: &[u8]) -> bool {
-        let credit_charge = (data.len() as u64).div_ceil(65536).max(1) as u16;
-        let credits_available = self.conn.credits() as usize / credit_charge.max(1) as usize;
-        credits_available > 0 && self.in_flight.len() < MAX_PIPELINE_WINDOW
+    /// Whether there is room in the pipeline window for another chunk.
+    ///
+    /// Deliberately not a credit check: `Connection` reserves credits per send
+    /// and parks a write that can't afford one, so second-guessing it here
+    /// could only stall a chunk that the connection would have sent.
+    fn can_send(&self, _data: &[u8]) -> bool {
+        self.in_flight.len() < MAX_PIPELINE_WINDOW
     }
 
     /// Try to send a wire chunk. If the window is full or credits are exhausted,
@@ -1198,7 +1200,7 @@ impl FileWriter {
             return Ok(true);
         }
 
-        // No credits — drain one response to reclaim credits and retry.
+        // Window still full — drain one response and retry.
         if !self.in_flight.is_empty() {
             self.drain_one().await?;
             if self.can_send(&data) {

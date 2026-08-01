@@ -7,6 +7,7 @@
 
 pub mod connection;
 pub mod copy;
+pub(crate) mod credits;
 pub(crate) mod dfs;
 pub mod diagnostics;
 pub mod pipeline;

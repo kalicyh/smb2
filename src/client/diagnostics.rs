@@ -161,7 +161,9 @@ pub struct NegotiatedSummary {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CreditInfo {
-    /// Credits currently available to spend on new requests.
+    /// Credits on hand: granted by the server and not reserved by a request
+    /// that is still in flight. This is what a new request can draw on, not
+    /// the size of the server's window.
     pub available: u16,
     /// Number of `MessageId`s currently waiting for a response (i.e.
     /// `waiters.len()`).
@@ -345,6 +347,17 @@ pub struct MetricsSnapshot {
     /// [`Self::responses_late_after_drop`], not here — a dropped future
     /// never polls to a return value.
     pub requests_returned_err: u64,
+
+    /// Sends that had to park because every credit the server granted was
+    /// already in flight. A trickle is normal on a saturated pipeline; a
+    /// flood means the server's window is small relative to the chunk size,
+    /// and throughput is bounded by credits rather than by the network.
+    pub credit_waits: u64,
+    /// Sends that gave up waiting for a grant and returned
+    /// [`Error::CreditStarvation`](crate::Error::CreditStarvation). Subset of
+    /// [`Self::credit_waits`]; don't sum. Non-zero means a server stopped
+    /// answering while its socket stayed open.
+    pub credit_starvations: u64,
 }
 
 /// Client-level counter snapshot. Lives on [`SmbClient`](crate::SmbClient)
@@ -464,6 +477,11 @@ fn fmt_connection_body(c: &ConnectionDiagnostics, f: &mut fmt::Formatter<'_>) ->
         m.malformed_frames,
         m.session_expired_events,
     )?;
+    writeln!(
+        f,
+        "  credit waits: {} parked · {} starved",
+        m.credit_waits, m.credit_starvations,
+    )?;
     if c.disconnected {
         writeln!(f, "  status: DISCONNECTED")?;
     }
@@ -566,6 +584,10 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        // Stage the credit window a real connection would hold after
+        // NEGOTIATE / SESSION_SETUP / TREE_CONNECT; a fresh pool holds the
+        // single pre-NEGOTIATE credit, which no compound can afford.
+        conn.set_credits(512);
         (conn, mock)
     }
 
@@ -1016,6 +1038,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_credits(512);
 
         // Op A: send, will succeed.
         let c1 = conn.clone();
