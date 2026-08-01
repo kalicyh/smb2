@@ -84,7 +84,8 @@ src/
 
   client/                 # High-level client API
     mod.rs                # SmbClient (entry point)
-    connection.rs         # Connection state, credit management, response demux
+    connection.rs         # Connection state, response demux, response deadline
+    credits.rs            # Connection-wide credit budget, send-side gate
     session.rs            # Session (authenticated context)
     tree.rs               # TreeConnect (share access)
     file.rs               # Single-file convenience methods
@@ -217,7 +218,9 @@ discover a new pitfall that involves 2+ modules, add it to this list.
     loop.
 12. **NTLM MIC** ✅ -- Computed when MsvAvTimestamp present, using retained raw bytes. See `auth/ntlm.rs`.
 13. **Server may split compound responses** ✅ -- MS-SMB2 3.3.4.1.3: the server SHOULD compound responses but MAY send them as separate frames (Samba/QNAP do this in some cases). Compound-using methods call `Connection::receive_compound_expected(n)`, which gathers additional frames transparently. See `connection.rs` + `tree.rs`.
-14. **Share-enum responses split two ways** ✅ -- A srvsvc `NetShareEnum` reply can arrive as multiple DCE/RPC fragments (MS-RPCE 2.2.2.6, `PFC_LAST_FRAG` only on the last) and/or as `STATUS_BUFFER_OVERFLOW` pipe reads (MS-SMB2 3.3.5.10) when it exceeds one read buffer. `client::shares::read_pipe_message` follows the overflow chain; `rpc_bind_and_request` loops `rpc::parse_response_fragment` until the last fragment, then NDR-decodes the joined stub. Treating either as a hard error (the old behavior) truncated or failed listings on servers that chunk large replies. Spans `rpc/` + `client/shares.rs`.
+14. **Credits are spent on send, not on receipt** ✅ -- `client/credits.rs` reserves a request's `CreditCharge` before its bytes reach the wire; only a `CreditResponse` grant puts credits back. Charging on the response instead leaves every in-flight request invisible, so concurrent pipelined streams over one connection each spend the same budget and blow past the server's window. MS-SMB2 § 3.3.1.1 lets a server drop such a client; a QNAP TS-464 instead stopped answering while TCP stayed `ESTABLISHED` (2026-07-31, reproduced twice). A short send parks on a bounded wait and surfaces `Error::CreditStarvation` rather than hanging. Spans `client/credits.rs` + `client/connection.rs` + the pipelined loops in `client/tree.rs` and `client/stream.rs`.
+15. **A silent server must not hang a caller** ✅ -- `Connection::await_response` gives up after 180 s without a sign of life. The clock measures silence, not elapsed time: interim `STATUS_PENDING` frames refresh `Waiter.last_activity` (MS-SMB2 § 3.2.5.1.5), and long-poll CHANGE_NOTIFY is exempt. See `client/CLAUDE.md` § Response deadline.
+16. **Share-enum responses split two ways** ✅ -- A srvsvc `NetShareEnum` reply can arrive as multiple DCE/RPC fragments (MS-RPCE 2.2.2.6, `PFC_LAST_FRAG` only on the last) and/or as `STATUS_BUFFER_OVERFLOW` pipe reads (MS-SMB2 3.3.5.10) when it exceeds one read buffer. `client::shares::read_pipe_message` follows the overflow chain; `rpc_bind_and_request` loops `rpc::parse_response_fragment` until the last fragment, then NDR-decodes the joined stub. Treating either as a hard error (the old behavior) truncated or failed listings on servers that chunk large replies. Spans `rpc/` + `client/shares.rs`.
 
 ## Testing
 
@@ -315,9 +318,9 @@ offline) so local clippy matches CI's always-latest stable, then runs `cargo fmt
 
 ## Diagnostics
 
-`SmbClient::diagnostics()` and `Connection::diagnostics()` return an in-process snapshot of the client's state plus 17
+`SmbClient::diagnostics()` and `Connection::diagnostics()` return an in-process snapshot of the client's state plus 20
 `AtomicU64` counters per connection (`requests_sent`, `wire_bytes_*`, the disjoint routing partition `responses_*`,
-`status_pending_loops`, `signature_failures`, etc.) and three client-level counters (`reconnects`,
+`status_pending_loops`, `signature_failures`, `credit_waits` / `credit_starvations` / `response_timeouts`, etc.) and three client-level counters (`reconnects`,
 `dfs_referrals_resolved`, `dfs_cache_hits`). Eventually consistent, survives connection teardown, per-connection
 counters reset on reconnect. `Display` impl for terminal output; optional `serde` feature for JSON.
 

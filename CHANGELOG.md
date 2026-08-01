@@ -7,6 +7,32 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-01
+
+### Fixed
+
+- **A transfer to a NAS could wedge forever because the client was over-spending the server's credit budget.** Every SMB2 request spends credits the server grants and replenishes on each response; sending more than you hold is a protocol violation MS-SMB2 § 3.3.1.1 lets the server punish. This crate charged credits when the **response** arrived rather than when the request was **sent**, so every in-flight request was invisible to the counter: `Connection::credits()` reported the server's whole window instead of the unspent part, and each of the four pipelined loops divided that same number by its own chunk charge. Several concurrent transfers over one connection therefore each filled a full window from a budget they were all sharing. Observed against a QNAP TS-464 (2026-07-31, reproduced twice): seven transfers all reached their final byte and never returned, 13 requests outstanding, **zero** SMB responses of any kind, while TCP stayed `ESTABLISHED` and other clients were served the same share instantly. Credits are now reserved before a request's bytes reach the wire, from a pool shared by every clone of a `Connection`, and a request that can't afford its charge waits for a grant instead of sending anyway.
+- **Two silent-truncation paths in the pipelined loops.** `read_file_pipelined`, its progress-reporting variant, and `write_file_pipelined` only launched the next chunk `if credits_available > 0`; skipping it drained the in-flight set to zero with chunks still unsent, ending the loop early and returning a partially-filled buffer as success. `write_file_streamed` could likewise strand a chunk it had stashed for lack of credits if the stash happened on the final response. Both were latent before this release (the inflated credit reading made the branch nearly unreachable) and would have become live once the reading was accurate. All four loops now bound only the queue depth and let the connection's gate do the throttling, which is the only place that can do it correctly.
+- **A server that stops answering no longer hangs the caller.** A request whose server goes silent while the TCP socket stays open now ends in `Error::Timeout` after 180 s rather than an `await` that never resolves. The deadline measures silence, not elapsed time: every interim `STATUS_PENDING` restarts it (MS-SMB2 § 3.2.5.1.5), so a slow operation the server has acknowledged — a multi-minute `FSCTL_SRV_COPYCHUNK`, say — is never cut short. CHANGE_NOTIFY, whose job is to wait for an event that may never come, is exempt at any setting.
+
+### Added
+
+- **`Error::CreditStarvation { needed, available, waited }`** — the typed answer when a send waits out its deadline for a credit grant that never comes. In practice it means the server has stopped answering while its socket is still up, so treat it as a dead connection and reconnect. Classifies as `ErrorKind::TimedOut` and reports `is_retryable() == true`, so existing retry logic keyed on either handles it without changes.
+- **`Connection::set_credit_wait_timeout(Duration)`** (default 30 s) — how long a send waits for a grant before giving up. A send only waits at all once the connection's whole budget is in flight, which on a healthy server clears in milliseconds. There is deliberately no "wait forever" setting: an unbounded wait is the failure this bound exists to prevent.
+- **`Connection::set_response_timeout(Option<Duration>)`** (default `Some(180 s)`) — the silence deadline described above. Pass `None` to restore the pre-0.14 wait-forever behavior if your application imposes its own.
+- **Three diagnostics counters**: `credit_waits` (sends that parked on credits — a trickle is normal on a saturated pipeline, a flood means the server's window is small relative to your chunk size), `credit_starvations`, and `response_timeouts`.
+
+### Changed
+
+- **Breaking: `Error` has a new variant.** `Error` is not `#[non_exhaustive]`, so an exhaustive `match` on it needs a new arm for `CreditStarvation`. Matching on `ErrorKind` (which is `#[non_exhaustive]`) needs no change — the new variant classifies as the existing `ErrorKind::TimedOut`.
+- **Behavior change: sends can now block, and requests can now time out.** Both are bounded and both replace a hang, but a `Connection` that previously always sent immediately may now park briefly under a saturated pipeline, and a request that previously waited indefinitely may now return `Error::Timeout`. Nothing needs to be re-tuned for a healthy server; the knobs above exist for the unusual ones.
+- **`Connection::credits()` means something different.** It now reports credits *on hand* — granted and not reserved by a request in flight — where it previously reported the server's window as of the last response. It is a gauge, not a gate: the connection reserves and waits internally, so callers should not pre-check it before issuing a request.
+- **The credit request on each message is derived rather than a flat 256.** Every request now asks for its own charge back plus enough to climb to a 512-credit target, so an idle connection asks for little and the window can't shrink under a steady load.
+
+### Notes
+
+- Validated against the full Docker Samba suite (84 tests), the consumer harness (16), and real hardware.
+
 ## [0.13.3] - 2026-08-01
 
 ### Fixed
