@@ -1235,9 +1235,9 @@ mod tests {
     #[test]
     fn embedded_files_count() {
         let files = embedded_files();
-        // 1 compose + 14 containers * (Dockerfile + smb.conf) = 29
-        // + 6 extra scripts = 35
-        assert_eq!(files.len(), 35, "expected 35 embedded files");
+        // 1 compose + 15 containers * (Dockerfile + smb.conf) = 31
+        // + 6 extra scripts = 37
+        assert_eq!(files.len(), 37, "expected 37 embedded files");
     }
 
     #[test]

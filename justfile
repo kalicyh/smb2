@@ -51,12 +51,16 @@ fmt-check:
 clippy:
     @echo "[*] Running clippy..."
     @cargo clippy --all-targets --quiet -- -D warnings
+    @echo "[*] Running clippy with all features..."
+    @cargo clippy --all-targets --all-features --quiet -- -D warnings
     @echo "[+] Clippy passed"
 
 # Run tests
 test:
     @echo "[*] Running tests..."
     @cargo test --quiet
+    @echo "[*] Running tests with all features..."
+    @cargo test --all-features --quiet
     @echo "[+] Tests passed"
 
 # Run integration tests against real SMB servers (requires NAS + Pi on LAN)

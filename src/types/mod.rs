@@ -130,6 +130,7 @@ impl fmt::Display for FileId {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, num_enum::TryFromPrimitive, num_enum::IntoPrimitive,
 )]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[repr(u16)]
 pub enum Command {
     /// Negotiate protocol version and capabilities.

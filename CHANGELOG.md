@@ -7,6 +7,17 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-08-01
+
+### Fixed
+
+- **0.13.2 failed to compile with the `serde` feature enabled, and is yanked.** `OutstandingRequest` (new in 0.13.2) derives `Serialize` under that feature and carries a `Command`, which did not implement `Serialize` — so any consumer building `smb2` with `features = ["serde"]` got a trait-bound error from inside the crate. `Command` now derives `Serialize` under the same feature. Consumers on default features were unaffected.
+
+### Changed
+
+- **The release gate builds every feature it ships.** `just check-all` ran clippy and the tests on default features only, which is exactly why the above shipped: nothing in the pre-release gate ever compiled the `serde` path. Both steps now run a second time under `--all-features`. That immediately caught a second, unrelated staleness: `testing::tests::embedded_files_count` still asserted 35 embedded fixtures after a 15th container brought the real count to 37, and had gone unchecked because the `testing` feature was never built either.
+
+
 ## [0.13.2] - 2026-08-01
 
 ### Added
