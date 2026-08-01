@@ -220,14 +220,14 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 12. **NTLM MIC** ✅ -- Computed when MsvAvTimestamp present, using retained raw bytes. See `auth/ntlm.rs`.
 13. **Server may split compound responses** ✅ -- MS-SMB2 3.3.4.1.3: the server SHOULD compound responses but MAY send them as separate frames (Samba/QNAP do this in some cases). Compound-using methods call `Connection::receive_compound_expected(n)`, which gathers additional frames transparently. See `connection.rs` + `tree.rs`.
 14. **Credits are spent on send, not on receipt** ✅ -- `client/credits.rs` reserves a request's `CreditCharge` before its bytes reach the wire; only a `CreditResponse` grant puts credits back. Charging on the response instead leaves every in-flight request invisible, so concurrent pipelined streams over one connection each spend the same budget and blow past the server's window. MS-SMB2 § 3.3.1.1 lets a server drop such a client; a QNAP TS-464 instead stopped answering while TCP stayed `ESTABLISHED` (2026-07-31, reproduced twice). A short send parks on a bounded wait and surfaces `Error::CreditStarvation` rather than hanging. Spans `client/credits.rs` + `client/connection.rs` + the pipelined loops in `client/tree.rs` and `client/stream.rs`.
-15. **A silent server must not hang a caller** ✅ -- `Connection::await_response` gives up after 180 s without a sign of life. The clock measures silence, not elapsed time: interim `STATUS_PENDING` frames refresh `Waiter.last_activity` (MS-SMB2 § 3.2.5.1.5), and long-poll CHANGE_NOTIFY is exempt. See `client/CLAUDE.md` § Response deadline.
+15. **A silent server must not hang a caller** ✅ -- `Connection::await_response` gives up after 30 s without a sign of life. The clock measures silence, not elapsed time: it starts when the frame reaches the wire (`mark_sent`) and interim `STATUS_PENDING` frames refresh `Waiter.last_activity` (MS-SMB2 § 3.2.5.1.5), so an acknowledged operation is never cut short however long it runs — that refresh is the whole reason the deadline can be this short. Long-poll CHANGE_NOTIFY is exempt. See `client/CLAUDE.md` § Response deadline.
 16. **Getting ONTO the wire is bounded, not just getting a reply** ✅ -- A dedicated writer task (`client/connection.rs`
     `writer_loop`) owns the transport's write half; callers hand over whole frames through an `mpsc` queue and never
     touch the socket. Every other deadline in this crate starts once the server has been asked, so a socket that stopped
     accepting writes while TCP stayed `ESTABLISHED` was invisible to all of them: a 2026-08-01 Cmdr wedge sat frozen 40
-    minutes with ~700 requests registered as in-flight and zero bytes sent, and neither the 180 s response deadline nor
-    the 30 s credit bound could fire because both live downstream of the send. The writer task times each frame out
-    (`Error::SendTimeout`, 60 s default) and tears the connection down, because a write abandoned partway leaves half a
+    minutes with ~700 requests registered as in-flight and zero bytes sent, and neither the response deadline nor the
+    credit bound could fire because both live downstream of the send. The writer task times each frame out
+    (`Error::SendTimeout`, 20 s default) and tears the connection down, because a write abandoned partway leaves half a
     frame on the wire. Handing over whole frames also removes a second hazard: a caller cancelled between
     `TcpTransport::send`'s length-header write and its body write used to desynchronize the stream permanently, and
     consumers cancel routinely. Spans `client/connection.rs` + `transport/tcp.rs`.

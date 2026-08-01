@@ -47,7 +47,7 @@ Full model, rationale, and the incident behind it: `credits.rs` module docs.
 `Connection` never lets a caller touch the socket. `send_and_count` hands a **whole frame** to an `mpsc` queue and waits
 for the writer task's ack; `writer_loop` owns the transport's write half and is the only thing that writes.
 
-- **Bounded.** Each frame gets `set_send_timeout` (60 s default) to reach the socket, then `Error::SendTimeout` and the
+- **Bounded.** Each frame gets `set_send_timeout` (20 s default) to reach the socket, then `Error::SendTimeout` and the
   connection is torn down. Nothing else in this crate bounds this: the response deadline and the credit deadline both
   start once the server has been asked, so a socket that stops accepting writes is invisible to them. That is exactly
   how a 2026-08-01 Cmdr wedge sat frozen for 40 minutes with ~700 requests "in flight" and zero bytes on the wire.
@@ -77,11 +77,13 @@ Before that, only the response deadline removed a waiter, which inflated the dia
 
 ## Response deadline
 
-`Connection::await_response` gives up with `Error::Timeout` after 180 s of silence, so a server that stops answering on a live socket can't hang a caller. Tune or disable with `set_response_timeout`.
+`Connection::await_response` gives up with `Error::Timeout` after 30 s of silence, so a server that stops answering on a live socket can't hang a caller. Tune or disable with `set_response_timeout`.
 
-- The clock measures **silence, not elapsed time**: `Waiter.last_activity` is refreshed on every interim `STATUS_PENDING`, so an acknowledged long operation is never cut short.
+- The clock measures **silence, not elapsed time**: `Waiter.last_activity` is refreshed on every interim `STATUS_PENDING` and by `mark_sent`, so an acknowledged long operation is never cut short and a frame that crawled onto a slow link still gets the full budget afterwards. ❌ Don't remove either refresh to "simplify" the deadline — both are what make 30 s safe, and each has a test that fails without it.
 - CHANGE_NOTIFY is exempt (`is_long_poll`) — it waits for an event that may never come. Add any new wait-for-an-event command there.
 - Timing out removes the waiter, so an abandoned request leaves no entry in the routing map.
+- **These are `Connection` setters, not `ClientConfig` fields**, like every other tunable here (credit wait, stale-request warning). `ClientConfig` has all-public fields and no `Default`, so adding one breaks every consumer's struct literal — a minor bump under this crate's pre-1.0 SemVer, spent to save a setter call.
+- **The four defaults are a set, not four independent numbers**: slow-send report (5 s) < send deadline (20 s) < response deadline (30 s), and the stale-request warning (15 s) plus one sweep (10 s) fits inside the response deadline so a wedge is always named in the log before its waiter disappears. `the_default_deadlines_are_layered` fails if a tuning pass breaks the ordering.
 
 ## Compound requests
 

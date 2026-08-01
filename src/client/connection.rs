@@ -117,8 +117,13 @@ impl Drop for WaiterGuard {
 
 /// How often the receiver task sweeps for requests that have gone unanswered,
 /// and how long a request may be outstanding before it is called out.
+///
+/// The threshold has to sit far enough below [`RESPONSE_TIMEOUT`] that at
+/// least one sweep lands between "this is taking a while" and "the caller gave
+/// up" — otherwise the only log line explaining a wedge arrives after the
+/// evidence is gone. `the_default_deadlines_are_layered` pins that.
 const STALE_WAITER_SWEEP: std::time::Duration = std::time::Duration::from_secs(10);
-const STALE_WAITER_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+const STALE_WAITER_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How often a send parked on credits rechecks whether anything is still
 /// outstanding. Short enough that "the last response landed while we waited"
@@ -128,22 +133,33 @@ const CREDIT_STARVATION_RECHECK: Duration = Duration::from_millis(250);
 /// How long a request may go without any sign of life from the server before
 /// the caller gives up with [`Error::Timeout`].
 ///
-/// Generous on purpose: a server that is merely loaded must never be mistaken
-/// for a dead one, and the clock restarts on every interim STATUS_PENDING, so
-/// this only ever fires on total silence. Long-poll commands are exempt
-/// entirely (see [`is_long_poll`]).
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+/// This is a **silence** budget, not a duration budget, which is what lets it
+/// be short: the clock restarts on every interim STATUS_PENDING (MS-SMB2
+/// § 3.2.5.1.5) and again the moment the frame reaches the wire, so an
+/// operation the server has acknowledged gets as long as it needs and only
+/// total silence ever trips it. Long-poll commands are exempt entirely (see
+/// [`is_long_poll`]).
+///
+/// 30 s is chosen to clear the slowest thing a healthy server does without
+/// saying anything: waking a spun-down NAS disk before it can answer the first
+/// CREATE, which runs 10–20 s on consumer hardware. Past that, waiting is no
+/// longer diagnosis, it is a frozen transfer nobody is watching recover.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long one frame may take to reach the socket before its caller gives up
 /// with [`Error::SendTimeout`].
 ///
-/// This bounds getting ONTO the wire, which nothing used to bound: every other
-/// deadline in the crate starts once the server has been asked. Generous
-/// enough that a slow link pushing a `MaxWriteSize` frame is never cut off (60
-/// s moves 1 MB on a link two orders of magnitude worse than Wi-Fi), tight
-/// enough that a socket which has stopped accepting writes surfaces as an
-/// error in a minute instead of hanging forever.
-const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// This bounds getting ONTO the wire, which no other deadline in the crate
+/// does: they all start once the server has been asked. Unlike the response
+/// deadline it has no refresh to lean on, so it has to cover a whole
+/// worst-case frame in one go: 20 s pushes a 1 MB `MaxWriteSize` frame at
+/// 50 KB/s, or an 8 MB one at 400 KB/s — links far worse than any Wi-Fi a
+/// transfer would be attempted over.
+///
+/// Kept below [`RESPONSE_TIMEOUT`] on purpose: a socket that has stopped
+/// accepting writes must surface as [`Error::SendTimeout`] and name the send
+/// side, not expire upstream and leave an innocent server holding the blame.
+const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A send slower than this is worth a line in the log even though it
 /// succeeded — it is the early warning for the state that used to wedge.
@@ -1989,8 +2005,12 @@ impl Connection {
     /// Set how long a request may go unanswered before the background sweeper
     /// logs a warning naming it, or `None` to stay silent.
     ///
-    /// Defaults to 30 s. Raise it for a server that is legitimately slow under
-    /// load, or disable it entirely if your application surfaces
+    /// Defaults to 15 s, which leaves at least one sweep between the warning
+    /// and the point where
+    /// [`set_response_timeout`](Self::set_response_timeout) gives up, so a
+    /// wedge is always named in the log before its evidence disappears. Raise
+    /// it for a server that is legitimately slow under load, or disable it
+    /// entirely if your application surfaces
     /// [`ConnectionDiagnostics::outstanding`](crate::client::diagnostics::ConnectionDiagnostics)
     /// itself and doesn't want the log line.
     pub fn set_stale_request_warning(&self, after: Option<std::time::Duration>) {
@@ -2069,10 +2089,12 @@ impl Connection {
     /// before its caller gives up with [`Error::Timeout`], or `None` to wait
     /// indefinitely.
     ///
-    /// Defaults to 180 s. The clock measures silence rather than elapsed time:
-    /// every interim `STATUS_PENDING` restarts it, so an operation the server
-    /// has acknowledged is never cut short. CHANGE_NOTIFY, whose job is to wait
-    /// for an event that may never come, is exempt at any setting.
+    /// Defaults to 30 s. The clock measures silence rather than elapsed time:
+    /// it starts when the frame reaches the wire and every interim
+    /// `STATUS_PENDING` restarts it, so an operation the server has
+    /// acknowledged is never cut short however long it runs. CHANGE_NOTIFY,
+    /// whose job is to wait for an event that may never come, is exempt at any
+    /// setting.
     ///
     /// This is what keeps a server that stops answering while its TCP socket
     /// stays open from hanging a caller forever. Pass `None` only if your
@@ -2084,7 +2106,7 @@ impl Connection {
     /// How long one frame may take to reach the socket before its caller
     /// gives up with [`Error::SendTimeout`], or `None` to wait indefinitely.
     ///
-    /// Defaults to 60 s. This bounds getting ONTO the wire, which
+    /// Defaults to 20 s. This bounds getting ONTO the wire, which
     /// [`set_response_timeout`](Self::set_response_timeout) does not: that
     /// clock only starts once the server has been asked. A socket that stops
     /// accepting writes while TCP stays `ESTABLISHED` is invisible to every
@@ -3096,6 +3118,117 @@ mod tests {
             "an acknowledged operation must not be timed out: {result:?}"
         );
         assert_eq!(conn.metrics().response_timeouts, 0);
+    }
+
+    /// A send half that takes `delay` to accept the first frame, the way a
+    /// full-size write crawls onto a slow link.
+    struct SlowFirstSend {
+        inner: Arc<MockTransport>,
+        delay: Duration,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TransportSend for SlowFirstSend {
+        async fn send(&self, data: &[u8]) -> Result<()> {
+            if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.inner.send(data).await
+        }
+    }
+
+    /// A frame that took a long time to reach the wire gets the FULL response
+    /// deadline afterwards.
+    ///
+    /// The clock measures the server's silence, and until `mark_sent` the
+    /// server has not been asked anything at all. Without that refresh a big
+    /// write that spent most of its send deadline crawling onto a slow link
+    /// would arrive at `await_response` with its budget already spent and be
+    /// declared unanswered by a server that never saw it — the exact
+    /// misdiagnosis the `registered_at` / `sent_at` split exists to prevent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_send_does_not_eat_the_response_deadline() {
+        let mock = Arc::new(MockTransport::new());
+        let deadline = Duration::from_millis(300);
+        let conn = Connection::from_transport(
+            Box::new(SlowFirstSend {
+                inner: Arc::clone(&mock),
+                // Twice the response deadline: measured from registration this
+                // request is long dead, measured from the send it is healthy.
+                delay: deadline * 2,
+                seen: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Box::new(Arc::clone(&mock)),
+            "test-server",
+        );
+        conn.set_credits(512);
+        conn.set_response_timeout(Some(deadline));
+        conn.set_send_timeout(None); // the send side is not what's under test
+
+        let c = conn.clone();
+        let call = tokio::spawn(async move {
+            let body = crate::msg::echo::EchoRequest;
+            c.execute(Command::Echo, &body, Some(TreeId(1))).await
+        });
+
+        // Answer promptly once the frame is actually on the wire.
+        while mock.sent_count() < 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(deadline / 3).await;
+        mock.queue_response(build_echo_response_with_msg_id(MessageId(0)));
+
+        let result = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the call must resolve, not hang")
+            .expect("task panicked");
+        assert!(
+            result.is_ok(),
+            "the server answered well inside the deadline it was given: {result:?}"
+        );
+        assert_eq!(
+            conn.metrics().response_timeouts,
+            0,
+            "time spent getting onto the wire is the send deadline's problem, not the server's"
+        );
+    }
+
+    /// The default deadlines only work as a set: each layer has to NAME a
+    /// problem before the layer above it gives up on it, or the log line that
+    /// explains a wedge is never written.
+    #[test]
+    fn the_default_deadlines_are_layered() {
+        assert!(
+            SLOW_SEND_REPORT < SEND_TIMEOUT,
+            "a slow send has to be reported before it is cut off"
+        );
+        assert!(
+            STALE_WAITER_AFTER < RESPONSE_TIMEOUT,
+            "an outstanding request has to be named before its caller abandons it; \
+             at or above the response deadline the sweeper can only ever warn about \
+             requests that are already gone"
+        );
+        assert!(
+            STALE_WAITER_AFTER + STALE_WAITER_SWEEP <= RESPONSE_TIMEOUT,
+            "the sweeper wakes only every STALE_WAITER_SWEEP, so leave room for at \
+             least one sweep to land between 'stale' and 'given up'"
+        );
+        assert!(
+            RESPONSE_TIMEOUT <= Duration::from_secs(45),
+            "the deadline is a recovery, not a formality: somebody watching a frozen \
+             transfer will not wait minutes for the client to notice"
+        );
+        assert!(
+            SEND_TIMEOUT <= Duration::from_secs(30),
+            "same on the send side, and it must stay under the response deadline so a \
+             wedged socket is blamed on the send rather than on the server"
+        );
+        assert!(
+            SEND_TIMEOUT < RESPONSE_TIMEOUT,
+            "a stuck socket has to surface as SendTimeout, not as an innocent server \
+             timing out"
+        );
     }
 
     /// CHANGE_NOTIFY waits for an event that may never come. Applying a

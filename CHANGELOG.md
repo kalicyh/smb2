@@ -7,6 +7,14 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **A wedged connection now recovers in half a minute instead of three.** The deadlines added in 0.14.0 and 0.15.0 were correct but far too patient to be a recovery: a stuck transfer sat there for minutes before anything fired, which for anyone watching a progress bar is indistinguishable from the hang they were meant to fix. The response deadline (`Connection::set_response_timeout`) drops from **180 s to 30 s** and the send deadline (`Connection::set_send_timeout`) from **60 s to 20 s**. Worst case for a dead socket goes from 4 minutes to 50 s.
+  - **Nothing legitimately slow gets cut off, and the shorter number doesn't change that.** The response deadline measures *silence*, never elapsed time. Its clock starts when the frame reaches the wire, and every interim `STATUS_PENDING` restarts it (MS-SMB2 § 3.2.5.1.5), so a `FSCTL_SRV_COPYCHUNK` that runs for 10 minutes or a multi-megabyte write to a busy NAS is never touched — the server keeps saying "still working" and the budget keeps resetting. 30 s is the amount of *total silence* tolerated, sized to clear the slowest thing a healthy server does without a word: spinning a parked NAS disk back up (10–20 s) before answering the first CREATE. CHANGE_NOTIFY remains exempt at any setting.
+  - **The send deadline has no such refresh**, so 20 s is sized to cover a whole worst-case frame in one go: a 1 MB `MaxWriteSize` frame at 50 KB/s, or an 8 MB one at 400 KB/s. If you support a link slower than that, raise it.
+  - If you'd already tuned either setter, nothing changes for you — only the defaults moved.
+- **The stale-request warning now fires at 15 s** (`Connection::set_stale_request_warning`, was 30 s). At 30 s it would have coincided with the new response deadline, meaning the log line that names a wedged request would only ever have been written after that request was already abandoned. Expect the warning a little earlier and on connections that never used to produce it; that's the point of it.
+
 ## [0.15.0] - 2026-08-01
 
 ### Fixed
