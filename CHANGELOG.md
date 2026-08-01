@@ -72,7 +72,7 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- **0.13.2 doesn't compile with the `serde` feature enabled. Skip it: take 0.13.3 or later.** `OutstandingRequest` (new in 0.13.2) derives `Serialize` under that feature and carries a `Command`, which did not implement `Serialize`, so any consumer building `smb2` with `features = ["serde"]` got a trait-bound error from inside the crate. `Command` now derives `Serialize` under the same feature. Consumers on default features were unaffected. **0.13.2 was not withdrawn** and still resolves from crates.io, so pin `>=0.13.3` if you enable `serde`.
+- **0.13.2 doesn't compile with the `serde` feature enabled. Skip it: take 0.13.3 or later.** `OutstandingRequest` (new in 0.13.2) derives `Serialize` under that feature and carries a `Command`, which did not implement `Serialize`, so any consumer building `smb2` with `features = ["serde"]` got a trait-bound error from inside the crate. `Command` now derives `Serialize` under the same feature. Consumers on default features were unaffected. **0.13.2 has been yanked**, but a yank only stops *new* resolutions: an existing `Cargo.lock` pinning 0.13.2 still resolves it, so pin `>=0.13.3` if you enable `serde`.
 
 ### Changed
 
