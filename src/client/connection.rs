@@ -30,6 +30,11 @@ struct Waiter {
     tx: oneshot::Sender<Result<Frame>>,
     command: Command,
     dispatched_at: std::time::Instant,
+    /// Last sign of life for this request: registration, then every interim
+    /// STATUS_PENDING the server sends. Separate from `dispatched_at` because
+    /// the stale-request warning wants "how long since we asked" while the
+    /// response deadline wants "how long since the server last said anything".
+    last_activity: std::time::Instant,
 }
 
 /// How often the receiver task sweeps for requests that have gone unanswered,
@@ -41,6 +46,23 @@ const STALE_WAITER_AFTER: std::time::Duration = std::time::Duration::from_secs(3
 /// outstanding. Short enough that "the last response landed while we waited"
 /// surfaces quickly, long enough to cost nothing.
 const CREDIT_STARVATION_RECHECK: Duration = Duration::from_millis(250);
+
+/// How long a request may go without any sign of life from the server before
+/// the caller gives up with [`Error::Timeout`].
+///
+/// Generous on purpose: a server that is merely loaded must never be mistaken
+/// for a dead one, and the clock restarts on every interim STATUS_PENDING, so
+/// this only ever fires on total silence. Long-poll commands are exempt
+/// entirely (see [`is_long_poll`]).
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Commands whose whole job is to wait for something that may never happen.
+///
+/// CHANGE_NOTIFY sits open until the watched directory changes — hours is
+/// normal, and timing it out would break the watcher rather than protect it.
+fn is_long_poll(command: Command) -> bool {
+    matches!(command, Command::ChangeNotify)
+}
 
 /// Periodically report requests that have gone unanswered, for as long as the
 /// connection lives.
@@ -269,6 +291,9 @@ struct Inner {
     /// to stay silent. Consumers with a legitimately slow server tune or disable
     /// it; see `Connection::set_stale_request_warning`.
     stale_request_after: StdMutex<Option<std::time::Duration>>,
+    /// How long a request may go unanswered before its caller gives up, or
+    /// `None` to wait indefinitely. See `Connection::set_response_timeout`.
+    response_timeout: StdMutex<Option<std::time::Duration>>,
     /// The server's credit budget. Every send reserves its `CreditCharge`
     /// here before the bytes go out; the receiver task banks the grant off
     /// every frame (orphans included). See `credits.rs`.
@@ -320,6 +345,7 @@ impl Inner {
         Self {
             waiters: StdMutex::new(HashMap::new()),
             stale_request_after: StdMutex::new(Some(STALE_WAITER_AFTER)),
+            response_timeout: StdMutex::new(Some(RESPONSE_TIMEOUT)),
             credits: CreditPool::new(),
             next_message_id: AtomicU64::new(0),
             crypto: StdMutex::new(CryptoState::new()),
@@ -424,6 +450,17 @@ impl Inner {
         }
     }
 
+    /// How long `msg_id` has gone without a sign of life, or `None` if it is
+    /// no longer outstanding (its response has been routed).
+    fn waiter_idle_for(&self, msg_id: MessageId) -> Option<Duration> {
+        let now = std::time::Instant::now();
+        self.waiters
+            .lock()
+            .unwrap()
+            .get(&msg_id)
+            .map(|w| now.saturating_duration_since(w.last_activity))
+    }
+
     fn starvation(&self, charge: u16, waited: Duration) -> Error {
         Error::CreditStarvation {
             needed: charge,
@@ -483,6 +520,9 @@ pub(crate) struct Metrics {
     /// Sends that gave up waiting for a grant. Non-zero means a server went
     /// silent while its socket stayed open.
     pub credit_starvations: AtomicU64,
+    /// Requests abandoned because the server went silent for longer than the
+    /// response timeout.
+    pub response_timeouts: AtomicU64,
 
     // Caller-observed outcomes
     pub requests_returned_err: AtomicU64,
@@ -512,6 +552,7 @@ impl Metrics {
             session_expired_events: self.session_expired_events.load(Relaxed),
             credit_waits: self.credit_waits.load(Relaxed),
             credit_starvations: self.credit_starvations.load(Relaxed),
+            response_timeouts: self.response_timeouts.load(Relaxed),
             requests_returned_err: self.requests_returned_err.load(Relaxed),
         }
     }
@@ -1025,7 +1066,7 @@ impl Connection {
             "execute_cap: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}",
             command, msg_id.0, charge, tree_id, should_sign, should_encrypt
         );
-        let frame = await_frame(rx).await?;
+        let frame = self.await_response(rx, msg_id, command).await?;
         Ok((frame, captured))
     }
 
@@ -1143,7 +1184,7 @@ impl Connection {
                                 command, msg_id.0, charge, tree_id, should_sign,
                                 msg_bytes.len(), framed.len()
                             );
-                            return await_frame(rx).await;
+                            return self.await_response(rx, msg_id, command).await;
                         }
                         Err(e) => {
                             self.remove_waiter(msg_id);
@@ -1165,7 +1206,7 @@ impl Connection {
             "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}, len={}",
             command, msg_id.0, charge, tree_id, should_sign, should_encrypt, wire_bytes.len()
         );
-        await_frame(rx).await
+        self.await_response(rx, msg_id, command).await
     }
 
     /// Send a request and return its response receiver without awaiting it.
@@ -1482,8 +1523,11 @@ impl Connection {
         // waiter, so we can await them sequentially without blocking any
         // of them (they may already all be resolved by the time we loop).
         let mut results: Vec<Result<Frame>> = Vec::with_capacity(receivers.len());
-        for rx in receivers {
-            results.push(await_frame(rx).await);
+        for (idx, rx) in receivers.into_iter().enumerate() {
+            results.push(
+                self.await_response(rx, message_ids[idx], ops[idx].command)
+                    .await,
+            );
         }
         Ok(results)
     }
@@ -1644,6 +1688,7 @@ impl Connection {
                 tx,
                 command,
                 dispatched_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
             },
         );
         trace!("register_waiter: msg_id={}", msg_id.0);
@@ -1681,6 +1726,71 @@ impl Connection {
             .collect();
         out.sort_by_key(|r| std::cmp::Reverse(r.age));
         out
+    }
+
+    /// Await a response, giving up if the server goes silent.
+    ///
+    /// The deadline measures silence, not elapsed time: every interim
+    /// STATUS_PENDING restarts it, so an operation the server has acknowledged
+    /// gets as long as it needs. Long-poll commands are exempt, and
+    /// [`set_response_timeout(None)`](Self::set_response_timeout) waits
+    /// forever the way the crate used to.
+    async fn await_response(
+        &self,
+        rx: oneshot::Receiver<Result<Frame>>,
+        msg_id: MessageId,
+        command: Command,
+    ) -> Result<Frame> {
+        let timeout = *self.inner.response_timeout.lock().unwrap();
+        let Some(timeout) = timeout.filter(|_| !is_long_poll(command)) else {
+            return await_frame(rx).await;
+        };
+
+        // Check often enough that a short timeout is honored promptly, rarely
+        // enough that the default costs one wakeup a second per request.
+        let tick = (timeout / 4).clamp(Duration::from_millis(25), Duration::from_secs(1));
+        let mut receiving = Box::pin(await_frame(rx));
+        loop {
+            let idle_check = Box::pin(tokio::time::sleep(tick));
+            match select(receiving, idle_check).await {
+                Either::Left((frame, _)) => return frame,
+                Either::Right((_, still_receiving)) => {
+                    receiving = still_receiving;
+                    // `None` means the response has been routed and the next
+                    // poll will produce it — never a timeout.
+                    if let Some(idle) = self.inner.waiter_idle_for(msg_id) {
+                        if idle >= timeout {
+                            self.remove_waiter(msg_id);
+                            self.inner
+                                .metrics
+                                .response_timeouts
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                "no response: cmd={:?}, msg_id={}, silent for {:?}; giving up",
+                                command, msg_id.0, idle
+                            );
+                            return Err(Error::Timeout);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// How long a request may go without any sign of life from the server
+    /// before its caller gives up with [`Error::Timeout`], or `None` to wait
+    /// indefinitely.
+    ///
+    /// Defaults to 180 s. The clock measures silence rather than elapsed time:
+    /// every interim `STATUS_PENDING` restarts it, so an operation the server
+    /// has acknowledged is never cut short. CHANGE_NOTIFY, whose job is to wait
+    /// for an event that may never come, is exempt at any setting.
+    ///
+    /// This is what keeps a server that stops answering while its TCP socket
+    /// stays open from hanging a caller forever. Pass `None` only if your
+    /// application imposes its own deadline.
+    pub fn set_response_timeout(&self, after: Option<Duration>) {
+        *self.inner.response_timeout.lock().unwrap() = after;
     }
 
     /// Remove a waiter from the map (used on send error).
@@ -2100,6 +2210,12 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
             .metrics
             .status_pending_loops
             .fetch_add(1, Ordering::Relaxed);
+        // "Still working on it" is a sign of life: restart the caller's
+        // response deadline (MS-SMB2 § 3.2.5.1.5). Without this, a legitimately
+        // slow operation the server has acknowledged would be timed out.
+        if let Some(waiter) = inner.waiters.lock().unwrap().get_mut(&header.message_id) {
+            waiter.last_activity = std::time::Instant::now();
+        }
         debug!(
             "recv: STATUS_PENDING (interim), cmd={:?}, msg_id={}",
             header.command, header.message_id.0
@@ -2580,6 +2696,123 @@ mod tests {
             1,
             "the starved request must not reach the wire"
         );
+    }
+
+    // ── Response deadline ──────────────────────────────────────────────
+
+    /// The failure that started all this: a server that accepts a request and
+    /// then says nothing while its TCP socket stays open. Correct credit
+    /// accounting removes the cause; this removes the symptom whatever the
+    /// cause turns out to be.
+    #[tokio::test]
+    async fn a_silent_server_cannot_hang_a_caller_forever() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(512);
+        conn.set_response_timeout(Some(std::time::Duration::from_millis(200)));
+
+        let body = crate::msg::echo::EchoRequest;
+        // No response is ever queued.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.execute(Command::Echo, &body, Some(TreeId(1))),
+        )
+        .await
+        .expect("the caller must give up on its own, not hang until the test times out");
+
+        assert!(
+            matches!(result, Err(Error::Timeout)),
+            "expected a timeout, got {result:?}"
+        );
+        assert_eq!(conn.metrics().response_timeouts, 1);
+        assert!(
+            conn.outstanding_requests().is_empty(),
+            "the abandoned request must not leak a waiter"
+        );
+    }
+
+    /// A server that answers STATUS_PENDING is working, not dead. Timing it
+    /// out would break every legitimately slow operation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_interim_pending_response_restarts_the_deadline() {
+        let mock = Arc::new(MockTransport::new());
+        // Plain mode: auto-rewrite pairs one queued response per sent request,
+        // and this test queues five responses for a single request.
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(512);
+        conn.set_response_timeout(Some(std::time::Duration::from_millis(300)));
+
+        let c = conn.clone();
+        let call = tokio::spawn(async move {
+            let body = crate::msg::echo::EchoRequest;
+            c.execute(Command::Echo, &body, Some(TreeId(1))).await
+        });
+        while mock.sent_count() < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Keep saying "still working" for well past the deadline.
+        for _ in 0..4 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let mut h = Header::new_request(Command::Echo);
+            h.flags.set_response();
+            h.credits = 1;
+            h.status = NtStatus::PENDING;
+            h.message_id = MessageId(0);
+            mock.queue_response(pack_message(&h, &crate::msg::echo::EchoResponse));
+        }
+
+        mock.queue_response(build_echo_response_with_msg_id(MessageId(0)));
+        let result = call.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "an acknowledged operation must not be timed out: {result:?}"
+        );
+        assert_eq!(conn.metrics().response_timeouts, 0);
+    }
+
+    /// CHANGE_NOTIFY waits for an event that may never come. Applying a
+    /// deadline to it would break the watcher rather than protect it.
+    #[tokio::test]
+    async fn a_long_poll_command_is_exempt_from_the_deadline() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(512);
+        conn.set_response_timeout(Some(std::time::Duration::from_millis(100)));
+
+        let req = crate::msg::change_notify::ChangeNotifyRequest {
+            flags: 0,
+            output_buffer_length: 4096,
+            file_id: crate::types::FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            completion_filter: 0xFF,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(600),
+            conn.execute(Command::ChangeNotify, &req, Some(TreeId(1))),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "CHANGE_NOTIFY must keep waiting, not time out"
+        );
+        assert_eq!(conn.metrics().response_timeouts, 0);
     }
 
     /// With nothing outstanding, no grant can ever arrive — so there is

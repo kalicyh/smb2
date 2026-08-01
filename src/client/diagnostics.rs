@@ -358,6 +358,11 @@ pub struct MetricsSnapshot {
     /// [`Self::credit_waits`]; don't sum. Non-zero means a server stopped
     /// answering while its socket stayed open.
     pub credit_starvations: u64,
+    /// Requests abandoned because the server went silent for longer than
+    /// [`Connection::set_response_timeout`](crate::client::connection::Connection::set_response_timeout).
+    /// The clock restarts on every interim `STATUS_PENDING`, so this counts
+    /// total silence, not slowness.
+    pub response_timeouts: u64,
 }
 
 /// Client-level counter snapshot. Lives on [`SmbClient`](crate::SmbClient)
@@ -479,8 +484,8 @@ fn fmt_connection_body(c: &ConnectionDiagnostics, f: &mut fmt::Formatter<'_>) ->
     )?;
     writeln!(
         f,
-        "  credit waits: {} parked · {} starved",
-        m.credit_waits, m.credit_starvations,
+        "  credit waits: {} parked · {} starved · {} response timeouts",
+        m.credit_waits, m.credit_starvations, m.response_timeouts,
     )?;
     if c.disconnected {
         writeln!(f, "  status: DISCONNECTED")?;
