@@ -7,6 +7,33 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-01
+
+### Fixed
+
+- **A transfer could wedge forever because nothing bounded getting a request ONTO the wire.** 0.14.0 bounded the wait for a *response*; this bounds the wait to *ask*. Every caller used to lock the transport's write half for the duration of its own `write_all`, so one send that never completed silently parked every later request behind it — with no deadline, no error, and no log line. Caught live on 2026-08-01: a Cmdr copy to a QNAP TS-464 sat frozen for **40 minutes** with ~700 requests registered as in-flight and **zero bytes** in either direction on two `ESTABLISHED` sockets, while a fresh connection wrote to the very same directory at 84 MiB/s. Neither the 180 s response deadline nor the 30 s credit deadline could fire: both live downstream of the send, and the server had never been asked. A dedicated writer task now owns the write half; callers hand it whole frames through a bounded queue, each frame gets `Connection::set_send_timeout` (60 s default) to reach the socket, and a breach surfaces as `Error::SendTimeout` and tears the connection down.
+- **A cancelled caller could desynchronize the connection permanently.** `TcpTransport::send` writes a 4-byte length header and then the body. A future dropped between the two left a header with no body on the wire, and every subsequent frame landed inside the length the server was still waiting to fill. Consumers cancel routinely — a user aborting a copy — so this was reachable in normal use. Frames are now queued as one unit, which makes a partial write impossible from cancellation.
+- **Aborted requests leaked their in-flight entry for the life of the connection.** Only the response deadline ever removed a waiter, so the usual `tokio::spawn` + `abort()` shape left one behind every time. Two things broke: `Connection::outstanding_requests()` accumulated long-dead requests (observed climbing to 219 and never draining under 1-in-3 cancellation), and `reserve_credits`' "is anything outstanding that could bring a grant back?" check could never again be false, so genuine starvation waited out the full deadline instead of failing immediately. `register_waiter` now returns a guard that deregisters on drop.
+- **`Watcher` leaked its pre-issued CHANGE_NOTIFY** on every drop, for the same reason. A long-lived watcher's abandoned requests showed up as unanswered for hours.
+
+### Added
+
+- **`Error::SendTimeout { command, bytes, waited }`** — a request could not be handed to the network in time. Distinct from `Error::Timeout` on purpose: `Timeout` means the server was asked and said nothing, `SendTimeout` means it was never asked, so nothing about the server follows from it. Classifies as `ErrorKind::TimedOut` and reports `is_retryable() == true`.
+- **`Connection::set_send_timeout(Option<Duration>)`** (default `Some(60 s)`) — how long one frame may take to reach the socket. Generous enough that a `MaxWriteSize` frame on a very slow link is never cut off; `None` restores the pre-0.15 unbounded behavior.
+- **`OutstandingRequest::sent_age: Option<Duration>`** — how long ago the frame reached the transport, or `None` while it is still queued. **Read this before concluding anything about a server.** "In flight" starts at registration, which is before the bytes go out; reading a large `age` as server silence is precisely the mistake that misdirected this investigation three times. The stale-request warning now says which case it is, and reports the send-queue depth when a request isn't on the wire yet.
+- **`Connection::send_queue_depth()` and `CreditInfo::send_queue_depth`** — frames handed to the writer task and not yet written. Persistently non-zero while `wire_bytes_sent` stands still is the signature of a stuck send side.
+- **`MetricsSnapshot::send_failures`** — frames the transport refused to write. Non-zero means the wedge was on the client's side of the wire.
+
+### Changed
+
+- **Breaking: `Error` and `CreditInfo` gained members, and both are now `#[non_exhaustive]`.** An exhaustive `match` on `Error` needs a `_` arm, and `CreditInfo` can no longer be built with a struct literal. Both were already breaking through the new members, so they are marked now to stop the next addition from breaking anyone. Matching on `ErrorKind` needs no change: `SendTimeout` classifies as the existing `ErrorKind::TimedOut`.
+- **Behavior change: a failed or timed-out send now tears the connection down.** It previously returned an error and left the connection up, which is not safe once bytes may already be on the wire — the stream can't be resynced past a partial frame. A frame rejected before any byte went out (oversized) still leaves the connection alive.
+- **`wire_bytes_sent` counts bytes actually written**, not bytes handed to the transport, so a frame that never made it no longer inflates the one counter that says whether we are talking to the server at all.
+
+### Notes
+
+- Samba 4.9.5 crashes on `write_file_compound` (`PANIC: Bad talloc magic value`, 8/8 reproductions at concurrency 1 with a 4 KB body). Samba 4.20.6 and QNAP QTS are immune, so this is a server bug rather than a malformed frame from us, but it means small-file copies kill the connection on older Samba builds. Written up in `docs/notes/samba-4.9-compound-write-crash.md`; not fixed here.
+
 ## [0.14.0] - 2026-08-01
 
 ### Fixed

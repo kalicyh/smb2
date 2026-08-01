@@ -5,7 +5,13 @@ use crate::types::Command;
 use thiserror::Error;
 
 /// Top-level error type for SMB2 operations.
+///
+/// `#[non_exhaustive]`: new variants appear as the crate learns to tell more
+/// failures apart, so `match` on it with a `_` arm, or branch on
+/// [`Error::kind`] instead. Adding a variant is not treated as a breaking
+/// change.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The data is malformed or does not match the expected format.
     #[error("Invalid data: {message}")]
@@ -114,6 +120,36 @@ pub enum Error {
         /// How long the send waited for a grant.
         waited: std::time::Duration,
     },
+
+    /// A request could not be handed to the network in time.
+    ///
+    /// This is the *send* side, not the response side: the bytes never
+    /// reached the socket. A socket that stops accepting writes while TCP
+    /// stays `ESTABLISHED` produces this, and so does a queue behind one
+    /// such write.
+    ///
+    /// The distinction from [`Error::Timeout`] matters when reading logs. A
+    /// `Timeout` means the server was asked and said nothing; a `SendTimeout`
+    /// means the server was never asked, so nothing about the server can be
+    /// inferred from it. A 2026-08-01 wedge was misread as server silence for
+    /// exactly this reason: ~700 requests sat registered as in-flight with
+    /// zero bytes on the wire.
+    ///
+    /// The connection is torn down when this fires: a write abandoned partway
+    /// leaves half a frame on the wire, so the stream can't be trusted again.
+    /// Classifies as [`ErrorKind::TimedOut`] and reports as retryable.
+    ///
+    /// Tune with
+    /// [`Connection::set_send_timeout`](crate::client::connection::Connection::set_send_timeout).
+    #[error("could not put a {bytes}-byte {command:?} request on the wire within {waited:?}")]
+    SendTimeout {
+        /// The command that was being sent (the first sub-op of a compound).
+        command: crate::types::Command,
+        /// Size of the frame that could not be written.
+        bytes: usize,
+        /// How long the send waited, queue time included.
+        waited: std::time::Duration,
+    },
 }
 
 impl Error {
@@ -132,6 +168,7 @@ impl Error {
             Error::Timeout
                 | Error::Disconnected
                 | Error::CreditStarvation { .. }
+                | Error::SendTimeout { .. }
                 | Error::Protocol {
                     status: NtStatus::INSUFFICIENT_RESOURCES,
                     ..
@@ -282,6 +319,7 @@ impl Error {
             // A connection whose credits never come back is a dead connection
             // wearing a live socket; consumers already reconnect on TimedOut.
             Error::CreditStarvation { .. } => ErrorKind::TimedOut,
+            Error::SendTimeout { .. } => ErrorKind::TimedOut,
             Error::Protocol { status, .. } => classify_status(*status),
         }
     }

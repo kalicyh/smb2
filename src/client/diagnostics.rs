@@ -156,8 +156,9 @@ pub struct NegotiatedSummary {
 
 /// Credit gauge for the connection.
 ///
-/// All three fields are sampled independently — `available + in_flight` is
-/// **not** invariant. See the module-level eventual-consistency note.
+/// The fields are sampled independently — `available + in_flight` is **not**
+/// invariant. See the module-level eventual-consistency note.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CreditInfo {
@@ -170,15 +171,28 @@ pub struct CreditInfo {
     pub in_flight: usize,
     /// The `MessageId` that will be assigned to the next request.
     pub next_message_id: u64,
+    /// Frames handed to the writer task and not yet written.
+    ///
+    /// Steadily non-zero while `wire_bytes_sent` stands still means the
+    /// send side is stuck, not the server.
+    pub send_queue_depth: usize,
 }
 
-/// One request that has been sent and not yet answered.
+/// One request that is in flight: registered for a response, and not yet
+/// answered.
 ///
 /// Surfaced so a consumer can see WHICH request a connection is waiting on, not
 /// just how many. A connection that keeps serving small requests while one large
 /// write hangs looks healthy by every other measure in this snapshot: credits
 /// recover, counters advance, `disconnected` stays `false`. This is the field
 /// that tells them apart.
+///
+/// **Read [`sent_age`](Self::sent_age) before concluding anything about the
+/// server.** "In flight" starts at registration, which is BEFORE the bytes
+/// reach the transport, so an entry here does not by itself mean the server
+/// was asked and stayed quiet. A 2026-08-01 wedge was read that way for
+/// weeks: hundreds of requests looked unanswered for half an hour while the
+/// truth was that not one byte had left the socket.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -187,8 +201,18 @@ pub struct OutstandingRequest {
     pub command: Command,
     /// Its `MessageId`, matching the `dispatch:` log line.
     pub message_id: u64,
-    /// How long it has been waiting for a response.
+    /// How long ago the request was registered as in flight.
+    ///
+    /// Measured from registration, so it includes any time spent queued for
+    /// the transport.
     pub age: Duration,
+    /// How long ago the frame reached the transport, or `None` if it is still
+    /// queued to be sent.
+    ///
+    /// `None` with a large `age` is the signature of a send-side wedge: the
+    /// server cannot answer a question it was never asked. `Some(d)` with a
+    /// large `d` is the genuine "server went quiet" case.
+    pub sent_age: Option<Duration>,
 }
 
 /// Signing state.
@@ -363,6 +387,12 @@ pub struct MetricsSnapshot {
     /// The clock restarts on every interim `STATUS_PENDING`, so this counts
     /// total silence, not slowness.
     pub response_timeouts: u64,
+    /// Frames the transport refused to write: a send that timed out
+    /// ([`Error::SendTimeout`](crate::Error::SendTimeout)) or errored.
+    ///
+    /// Non-zero means the wedge was on OUR side of the wire — the request
+    /// never reached the server, so nothing about the server follows from it.
+    pub send_failures: u64,
 }
 
 /// Client-level counter snapshot. Lives on [`SmbClient`](crate::SmbClient)
@@ -484,8 +514,8 @@ fn fmt_connection_body(c: &ConnectionDiagnostics, f: &mut fmt::Formatter<'_>) ->
     )?;
     writeln!(
         f,
-        "  credit waits: {} parked · {} starved · {} response timeouts",
-        m.credit_waits, m.credit_starvations, m.response_timeouts,
+        "  credit waits: {} parked · {} starved · {} response timeouts · {} send failures",
+        m.credit_waits, m.credit_starvations, m.response_timeouts, m.send_failures,
     )?;
     if c.disconnected {
         writeln!(f, "  status: DISCONNECTED")?;
@@ -881,11 +911,11 @@ mod tests {
             tokio::spawn(async move { c.dispatch(Command::Echo, &EchoRequest, None).await });
 
         wait_for_sent(&mock, 1).await;
-        let rx = handle.await.unwrap().unwrap();
+        let mut rx = handle.await.unwrap().unwrap();
         mock.queue_response(echo_ok(MessageId(0)));
         // Drive the response so the receiver processes it (and the awaiter
         // sees the result).
-        let _ = rx.await.unwrap().unwrap();
+        let _ = rx.recv().await.unwrap();
 
         let m = conn.metrics();
         assert_eq!(m.requests_sent, 1, "dispatch funnel-counts via allocate");

@@ -7,7 +7,7 @@
 
 use log::debug;
 
-use crate::client::connection::{await_frame, Connection, Frame};
+use crate::client::connection::{Connection, WaiterGuard};
 use crate::client::tree::Tree;
 use crate::error::Result;
 use crate::msg::change_notify::{
@@ -19,7 +19,6 @@ use crate::pack::{ReadCursor, Unpack};
 use crate::types::status::NtStatus;
 use crate::types::{Command, FileId};
 use crate::Error;
-use tokio::sync::oneshot;
 
 /// Default completion filter: watch for most common changes.
 const DEFAULT_COMPLETION_FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
@@ -125,11 +124,17 @@ pub struct Watcher {
     conn: Connection,
     file_id: FileId,
     recursive: bool,
-    /// In-flight CHANGE_NOTIFY response receiver. Populated lazily on the
-    /// first `next_events()` call and re-populated before awaiting each
-    /// response, so there is always exactly one outstanding request on
-    /// the wire from that point on.
-    pending: Option<oneshot::Receiver<Result<Frame>>>,
+    /// The in-flight CHANGE_NOTIFY. Populated lazily on the first
+    /// `next_events()` call and re-populated before awaiting each response,
+    /// so there is always exactly one outstanding request on the wire from
+    /// that point on.
+    ///
+    /// It is a `WaiterGuard`, not a bare receiver, so a watcher that stops
+    /// being polled (a pane closes, the consumer drops it) deregisters its
+    /// pre-issued request instead of leaving it in the connection's in-flight
+    /// table forever. Before that, a long-lived watcher's abandoned
+    /// CHANGE_NOTIFYs showed up as requests "unanswered" for hours.
+    pending: Option<WaiterGuard>,
 }
 
 impl Watcher {
@@ -180,11 +185,11 @@ impl Watcher {
         // when it returns, the next CHANGE_NOTIFY is on the wire and the
         // server has somewhere to put new events even while we process
         // the response for the previous one.
-        let in_flight = self.pending.take().expect("pending populated above");
+        let mut in_flight = self.pending.take().expect("pending populated above");
         let next_rx = self.dispatch_next().await?;
         self.pending = Some(next_rx);
 
-        let frame = await_frame(in_flight).await?;
+        let frame = in_flight.recv().await?;
 
         if frame.header.status == NtStatus::NOTIFY_ENUM_DIR {
             return Err(Error::Protocol {
@@ -213,7 +218,7 @@ impl Watcher {
     /// awaits only up to and including `transport.send()`, so when this
     /// returns the request is on the wire — the caller can rely on the
     /// "outstanding on the wire" invariant for whatever comes next.
-    async fn dispatch_next(&self) -> Result<oneshot::Receiver<Result<Frame>>> {
+    async fn dispatch_next(&self) -> Result<WaiterGuard> {
         let flags = if self.recursive { SMB2_WATCH_TREE } else { 0 };
         let req = ChangeNotifyRequest {
             flags,
@@ -228,13 +233,12 @@ impl Watcher {
 
     /// Close the directory handle.
     ///
-    /// Drops the pre-issued CHANGE_NOTIFY receiver (the `Connection`
-    /// receiver task discards the late response silently when it
-    /// arrives — same contract `Connection::execute` already documents),
-    /// then issues a CLOSE on the file handle. If `close` is not called
-    /// explicitly, the `Drop` impl drops the pre-issued receiver but the
-    /// server-side handle leaks until the session ends (there is no
-    /// async drop in Rust).
+    /// Drops the pre-issued CHANGE_NOTIFY, which deregisters its waiter (the
+    /// `Connection` receiver task discards the late response silently when it
+    /// arrives — same contract `Connection::execute` already documents), then
+    /// issues a CLOSE on the file handle. If `close` is not called explicitly,
+    /// the `Drop` impl still deregisters, but the server-side handle leaks
+    /// until the session ends (there is no async drop in Rust).
     pub async fn close(mut self) -> Result<()> {
         self.pending.take();
         self.tree.close_handle(&mut self.conn, self.file_id).await
@@ -524,10 +528,10 @@ mod loss_window_tests {
             }
         }
 
-        /// Block until at least one CHANGE_NOTIFY request is outstanding.
-        async fn wait_outstanding(&self) {
+        /// Block until at least `n` CHANGE_NOTIFY requests are outstanding.
+        async fn wait_outstanding_at_least(&self, n: usize) {
             loop {
-                if !self.outstanding.lock().unwrap().is_empty() {
+                if self.outstanding.lock().unwrap().len() >= n {
                     return;
                 }
                 if self.closed.load(Ordering::Acquire) {
@@ -535,6 +539,10 @@ mod loss_window_tests {
                 }
                 self.send_notify.notified().await;
             }
+        }
+
+        fn outstanding_count(&self) -> usize {
+            self.outstanding.lock().unwrap().len()
         }
 
         /// Push an event. If a CHANGE_NOTIFY request is outstanding, buffer
@@ -690,6 +698,42 @@ mod loss_window_tests {
     ///
     /// On `main`: `dropped_count() > 0`, `delivered.len() < expected`.
     /// On the fix: `dropped_count() == 0`, all events delivered.
+    /// `dispatch` must not return until the bytes are on the wire.
+    ///
+    /// This is the guarantee the pipelined watcher rests on, and the reason
+    /// `dispatch` exists at all rather than `tokio::spawn(conn.execute(..))`:
+    /// a spawned send may not run until the spawning task yields, leaving the
+    /// window the watcher is supposed to close wide open. Asserted with no
+    /// await between the dispatch resolving and the check, so no scheduler
+    /// order can make a deferred send look eager.
+    #[tokio::test]
+    async fn dispatch_returns_only_once_the_request_is_on_the_wire() {
+        let sim = Arc::new(LossySim::new());
+        let conn = setup_connection(&sim);
+        let tree = test_tree();
+
+        let req = ChangeNotifyRequest {
+            flags: SMB2_WATCH_TREE,
+            output_buffer_length: OUTPUT_BUFFER_LENGTH,
+            file_id: crate::types::FileId {
+                persistent: 0x1111,
+                volatile: 0x2222,
+            },
+            completion_filter: DEFAULT_COMPLETION_FILTER,
+        };
+        let _guard = conn
+            .dispatch(Command::ChangeNotify, &req, Some(tree.tree_id))
+            .await
+            .expect("dispatch failed");
+
+        assert_eq!(
+            sim.outstanding_count(),
+            1,
+            "the server must already hold the request when dispatch resolves"
+        );
+        sim.close();
+    }
+
     #[tokio::test]
     async fn watcher_does_not_lose_events_between_consecutive_requests() {
         let _ = env_logger::try_init();
@@ -704,7 +748,15 @@ mod loss_window_tests {
         let scenario = tokio::spawn(async move {
             let sim = scenario_sim;
             for round in 0..N_CYCLES {
-                sim.wait_outstanding().await;
+                // Wait for the watcher to be pipelined (previous request
+                // plus its pre-issued successor) before consuming one. That
+                // is the invariant under test: delivering a response must
+                // never leave the wire unarmed. Waiting on a bare
+                // "at least one outstanding" instead would race the
+                // watcher's re-arm and measure scheduler order, not the
+                // guarantee — `dispatch` yields once now that a writer task
+                // owns the socket, and a real `transport.send` yields too.
+                sim.wait_outstanding_at_least(2).await;
                 sim.push_event(&format!("a_{round:02}"));
                 sim.deliver_pending();
                 // Inline push (no .await) — outstanding queue was just
@@ -725,7 +777,7 @@ mod loss_window_tests {
             }
             // Flush: drive one more cycle to push any buffered gap events
             // out the door for the fix path.
-            sim.wait_outstanding().await;
+            sim.wait_outstanding_at_least(2).await;
             sim.push_event("flush_marker");
             sim.deliver_pending();
             // Brief grace period for the watcher to drain the response,

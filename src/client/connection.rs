@@ -10,14 +10,14 @@
 //!
 //! See `docs/specs/connection-actor.md` for the full design (Phase 2).
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
-use log::{debug, info, trace, warn};
-use tokio::sync::oneshot;
+use log::{debug, error, info, trace, warn};
+use tokio::sync::{mpsc, oneshot};
 
 /// One in-flight request: who is waiting, what they asked for, and since when.
 ///
@@ -29,12 +29,90 @@ use tokio::sync::oneshot;
 struct Waiter {
     tx: oneshot::Sender<Result<Frame>>,
     command: Command,
-    dispatched_at: std::time::Instant,
-    /// Last sign of life for this request: registration, then every interim
-    /// STATUS_PENDING the server sends. Separate from `dispatched_at` because
-    /// the stale-request warning wants "how long since we asked" while the
-    /// response deadline wants "how long since the server last said anything".
+    /// When the waiter was inserted, which is BEFORE the bytes reach the
+    /// transport. A request can sit here having never been sent.
+    registered_at: std::time::Instant,
+    /// When the transport accepted the frame, or `None` while it is still
+    /// queued for the writer task.
+    ///
+    /// The whole point of the split: "registered 20 minutes ago, never sent"
+    /// and "sent 20 minutes ago, unanswered" are opposite diagnoses, and
+    /// collapsing them into one timestamp is what sent three investigations
+    /// after an innocent server.
+    sent_at: Option<std::time::Instant>,
+    /// Last sign of life for this request: the send, then every interim
+    /// STATUS_PENDING the server sends. Separate from the timestamps above
+    /// because the response deadline wants "how long since the server last
+    /// said anything", and a request still in the send queue has not asked
+    /// it anything yet.
     last_activity: std::time::Instant,
+}
+
+/// A registered waiter that deregisters itself if its caller goes away.
+///
+/// Consumers abort in-flight requests as a matter of course (a user cancels a
+/// copy; a `select!` arm loses). Before this was RAII, only the response
+/// deadline ever removed a waiter, so every abandoned request stayed in the
+/// map for the life of the connection. Two things broke: `outstanding_requests`
+/// reported long-dead requests as in flight, and `reserve_credits`' "is
+/// anything outstanding that could bring a grant back?" check could never
+/// again be false, so genuine starvation waited out the full deadline instead
+/// of failing fast.
+pub(crate) struct WaiterGuard {
+    inner: Arc<Inner>,
+    msg_id: MessageId,
+    /// Taken when the response is claimed; `None` afterwards so `Drop` knows
+    /// there is nothing left to clean up.
+    rx: Option<oneshot::Receiver<Result<Frame>>>,
+}
+
+impl WaiterGuard {
+    /// The id this guard is holding a slot for.
+    pub(crate) fn msg_id(&self) -> MessageId {
+        self.msg_id
+    }
+
+    /// Await this request's response.
+    ///
+    /// Takes `&mut self` on purpose: the guard, not the future, owns the map
+    /// entry, so a caller whose future is dropped mid-await still deregisters.
+    pub(crate) async fn recv(&mut self) -> Result<Frame> {
+        let Some(rx) = self.rx.as_mut() else {
+            return Err(Error::Disconnected);
+        };
+        match rx.await {
+            Ok(Ok(frame)) => Ok(frame),
+            Ok(Err(e)) => Err(e),
+            Err(_canceled) => Err(Error::Disconnected),
+        }
+    }
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        // Routing removes the entry when the response lands, and the response
+        // deadline removes it when it gives up, so this is usually a no-op.
+        // It is idempotent by design: MessageIds are never reused, so a late
+        // removal can't evict somebody else's waiter.
+        if self
+            .inner
+            .waiters
+            .lock()
+            .unwrap()
+            .remove(&self.msg_id)
+            .is_some()
+        {
+            let mut abandoned = self.inner.abandoned.lock().unwrap();
+            if abandoned.len() >= ABANDONED_ID_MEMORY {
+                abandoned.pop_front();
+            }
+            abandoned.push_back(self.msg_id);
+            trace!(
+                "waiter deregistered without a response: msg_id={}",
+                self.msg_id.0
+            );
+        }
+    }
 }
 
 /// How often the receiver task sweeps for requests that have gone unanswered,
@@ -55,6 +133,134 @@ const CREDIT_STARVATION_RECHECK: Duration = Duration::from_millis(250);
 /// this only ever fires on total silence. Long-poll commands are exempt
 /// entirely (see [`is_long_poll`]).
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long one frame may take to reach the socket before its caller gives up
+/// with [`Error::SendTimeout`].
+///
+/// This bounds getting ONTO the wire, which nothing used to bound: every other
+/// deadline in the crate starts once the server has been asked. Generous
+/// enough that a slow link pushing a `MaxWriteSize` frame is never cut off (60
+/// s moves 1 MB on a link two orders of magnitude worse than Wi-Fi), tight
+/// enough that a socket which has stopped accepting writes surfaces as an
+/// error in a minute instead of hanging forever.
+const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A send slower than this is worth a line in the log even though it
+/// succeeded — it is the early warning for the state that used to wedge.
+const SLOW_SEND_REPORT: Duration = Duration::from_secs(5);
+
+/// How many frames may be queued for the writer task before callers block.
+///
+/// Backpressure, not a buffer: the pipelined loops already cap themselves at
+/// `MAX_PIPELINE_WINDOW` per stream, so this only bites when many streams
+/// pile on at once, and blocking there is better than growing an unbounded
+/// queue of `MaxWriteSize` frames.
+const WRITE_QUEUE_DEPTH: usize = 256;
+
+/// How many abandoned MessageIds to remember for response classification.
+///
+/// Only needs to span one round trip (a response already in flight when its
+/// caller gave up), so this is generous.
+const ABANDONED_ID_MEMORY: usize = 512;
+
+/// One frame waiting for the socket.
+struct WriteJob {
+    bytes: Vec<u8>,
+    /// For the log line and the [`Error::SendTimeout`]; the first sub-op's
+    /// command for a compound.
+    command: Command,
+    queued_at: std::time::Instant,
+    done: oneshot::Sender<Result<()>>,
+}
+
+/// The only task that touches the transport's write half.
+///
+/// Callers hand over whole frames and wait for an ack, which buys three
+/// things the old "every caller locks the socket" shape could not give:
+///
+/// 1. **A dropped caller cannot desynchronize the stream.** `TcpTransport::send`
+///    writes a 4-byte length header and then the body; a caller cancelled
+///    between the two used to leave a header with no body on the wire, and
+///    every later frame landed inside it. A frame handed to this task is sent
+///    whole or not at all, and consumers abort these futures routinely (a user
+///    cancelling a copy).
+/// 2. **A stuck write is bounded and named.** It is this task's own deadline,
+///    not an invisible queue behind a lock.
+/// 3. **The backlog is observable** (`send_queue_depth`), so a wedge reports
+///    itself instead of looking like server silence.
+///
+/// A write that times out or errors tears the connection down: bytes may have
+/// reached the socket, so the stream can no longer be trusted. A frame
+/// rejected before any byte was written (oversized) is the caller's problem
+/// alone and leaves the connection alive.
+async fn writer_loop(
+    sender: Arc<dyn TransportSend>,
+    mut rx: mpsc::Receiver<WriteJob>,
+    inner: Weak<Inner>,
+) {
+    while let Some(job) = rx.recv().await {
+        let Some(strong) = inner.upgrade() else {
+            return; // last Connection clone dropped
+        };
+        let deadline = *strong.send_timeout.lock().unwrap();
+        let len = job.bytes.len();
+        let started = std::time::Instant::now();
+
+        let result = match deadline {
+            Some(d) => match tokio::time::timeout(d, sender.send(&job.bytes)).await {
+                Ok(r) => r,
+                Err(_) => Err(Error::SendTimeout {
+                    command: job.command,
+                    bytes: len,
+                    waited: job.queued_at.elapsed(),
+                }),
+            },
+            None => sender.send(&job.bytes).await,
+        };
+
+        let wrote_in = started.elapsed();
+        let queued_for = started.saturating_duration_since(job.queued_at);
+        if wrote_in >= SLOW_SEND_REPORT || queued_for >= SLOW_SEND_REPORT {
+            // Splitting the two is the whole diagnostic: time in the queue
+            // means an earlier frame is stuck, time in the write means this
+            // socket is.
+            warn!(
+                "send is slow: cmd={:?}, {} bytes, {:?} queued + {:?} writing, {} frame(s) outstanding",
+                job.command,
+                len,
+                queued_for,
+                wrote_in,
+                strong.send_queue_depth.load(Ordering::Relaxed)
+            );
+        } else {
+            trace!(
+                "send: cmd={:?}, {} bytes, {:?} queued + {:?} writing",
+                job.command,
+                len,
+                queued_for,
+                wrote_in
+            );
+        }
+
+        let fatal = matches!(result, Err(Error::SendTimeout { .. }) | Err(Error::Io(_)));
+        if let Err(ref e) = result {
+            if fatal {
+                strong.metrics.send_failures.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    "send failed after {:?}: cmd={:?}, {} bytes: {e}; tearing the connection down \
+                     because a partly-written frame leaves the stream out of sync",
+                    wrote_in, job.command, len
+                );
+            }
+        }
+        let _ = job.done.send(result);
+
+        if fatal {
+            fan_error_to_waiters(&strong, &Error::Disconnected);
+            return;
+        }
+    }
+}
 
 /// Commands whose whole job is to wait for something that may never happen.
 ///
@@ -98,21 +304,39 @@ fn warn_on_stale_waiters(inner: &Inner) {
         return; // consumer turned the warning off
     };
     let now = std::time::Instant::now();
-    let stale: Vec<(MessageId, Command, std::time::Duration)> = inner
+    let stale: Vec<(
+        MessageId,
+        Command,
+        std::time::Duration,
+        Option<std::time::Duration>,
+    )> = inner
         .waiters
         .lock()
         .unwrap()
         .iter()
         .filter_map(|(id, w)| {
-            let age = now.saturating_duration_since(w.dispatched_at);
-            (age >= threshold).then_some((*id, w.command, age))
+            let age = now.saturating_duration_since(w.registered_at);
+            let sent_age = w.sent_at.map(|t| now.saturating_duration_since(t));
+            (age >= threshold).then_some((*id, w.command, age, sent_age))
         })
         .collect();
-    for (msg_id, command, age) in stale {
-        warn!(
-            "outstanding request: cmd={:?}, msg_id={}, no response for {:?}",
-            command, msg_id.0, age
-        );
+    for (msg_id, command, age, sent_age) in stale {
+        match sent_age {
+            Some(sent) => warn!(
+                "outstanding request: cmd={:?}, msg_id={}, sent {:?} ago, no response",
+                command, msg_id.0, sent
+            ),
+            // The line that names the send-side wedge instead of blaming the
+            // server: nothing was asked, so nothing can be expected back.
+            None => warn!(
+                "outstanding request: cmd={:?}, msg_id={}, registered {:?} ago and NOT YET ON THE WIRE \
+                 (waiting on the send queue, {} frame(s) ahead of it)",
+                command,
+                msg_id.0,
+                age,
+                inner.send_queue_depth.load(Ordering::Relaxed)
+            ),
+        }
     }
 }
 
@@ -308,10 +532,34 @@ struct Inner {
     /// into a dead map.
     disconnected: AtomicBool,
 
-    /// Shared transport send handle. `TransportSend::send` takes `&self` so
-    /// this can be called from any clone without a wrapping mutex — the
-    /// transport's implementation already serializes writes internally.
-    sender: Arc<dyn TransportSend>,
+    /// Queue into the writer task. Callers hand over a WHOLE frame and wait
+    /// for an ack; they never touch the socket themselves.
+    ///
+    /// Two things fall out of that. A caller dropped mid-send can no longer
+    /// leave half a frame on the wire (the frame is one message, sent or
+    /// not), and a stuck write is the writer task's problem to time out
+    /// rather than a lock every other caller silently queues behind.
+    write_tx: mpsc::Sender<WriteJob>,
+    /// MessageIds whose caller went away before the response landed, newest
+    /// last, capped at [`ABANDONED_ID_MEMORY`].
+    ///
+    /// Deregistering on drop (which is what stops waiters leaking) would
+    /// otherwise make a cancelled request's late response indistinguishable
+    /// from a frame we never asked for. Consumers cancel constantly — a user
+    /// aborting a copy — so `responses_stray` would fill with routine noise
+    /// and stop meaning "protocol anomaly". A late response arrives within one
+    /// round trip of the cancellation, so a small ring covers it.
+    abandoned: StdMutex<VecDeque<MessageId>>,
+    /// Frames handed to the writer task and not yet acked. A gauge for
+    /// diagnostics and for the stale-waiter warning, which reports it so a
+    /// backlog names itself.
+    send_queue_depth: AtomicUsize,
+    /// How long one frame may take to reach the socket before its caller
+    /// gives up with [`Error::SendTimeout`], or `None` to wait forever.
+    send_timeout: StdMutex<Option<Duration>>,
+    /// Handle for the writer task, aborted with the receiver task when the
+    /// last `Connection` clone drops.
+    writer_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     /// Handle for the background receiver task. Aborted when the last clone
     /// of `Connection` drops (via `Inner`'s `Drop`). The transport's read
     /// half's EOF also stops the task; the abort is a safety net.
@@ -341,7 +589,7 @@ struct Inner {
 }
 
 impl Inner {
-    fn new(sender: Arc<dyn TransportSend>, server_name: String) -> Self {
+    fn new(write_tx: mpsc::Sender<WriteJob>, server_name: String) -> Self {
         Self {
             waiters: StdMutex::new(HashMap::new()),
             stale_request_after: StdMutex::new(Some(STALE_WAITER_AFTER)),
@@ -350,7 +598,11 @@ impl Inner {
             next_message_id: AtomicU64::new(0),
             crypto: StdMutex::new(CryptoState::new()),
             disconnected: AtomicBool::new(false),
-            sender,
+            write_tx,
+            abandoned: StdMutex::new(VecDeque::new()),
+            send_queue_depth: AtomicUsize::new(0),
+            send_timeout: StdMutex::new(Some(SEND_TIMEOUT)),
+            writer_task: StdMutex::new(None),
             receiver_task: StdMutex::new(None),
             server_name,
             params: OnceLock::new(),
@@ -367,11 +619,63 @@ impl Inner {
     /// `wire_bytes_sent` counter. The single funnel for every outbound
     /// frame — keeps `wire_bytes_sent` from drifting as new send sites
     /// are added.
-    async fn send_and_count(&self, bytes: &[u8]) -> Result<()> {
-        self.metrics
-            .wire_bytes_sent
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        self.sender.send(bytes).await
+    async fn send_and_count(&self, bytes: &[u8], command: Command) -> Result<()> {
+        let len = bytes.len();
+        let (done_tx, done_rx) = oneshot::channel();
+        let job = WriteJob {
+            bytes: bytes.to_vec(),
+            command,
+            queued_at: std::time::Instant::now(),
+            done: done_tx,
+        };
+        let queued_at = job.queued_at;
+
+        self.send_queue_depth.fetch_add(1, Ordering::Relaxed);
+        let enqueued = self.write_tx.send(job).await;
+        if enqueued.is_err() {
+            // The writer task is gone, so the connection is dead.
+            self.send_queue_depth.fetch_sub(1, Ordering::Relaxed);
+            return Err(Error::Disconnected);
+        }
+
+        let outcome = done_rx.await;
+        self.send_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        let waited = queued_at.elapsed();
+
+        match outcome {
+            // The writer task counts the bytes it actually wrote, so a frame
+            // that never made it doesn't inflate `wire_bytes_sent` — the one
+            // counter that says whether we are talking to the server at all.
+            Ok(Ok(())) => {
+                self.metrics
+                    .wire_bytes_sent
+                    .fetch_add(len as u64, Ordering::Relaxed);
+                if waited >= SLOW_SEND_REPORT {
+                    warn!(
+                        "slow send: cmd={command:?}, {len} bytes took {waited:?} to reach the socket"
+                    );
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            // Writer task died between accepting the job and answering.
+            Err(_) => Err(Error::Disconnected),
+        }
+    }
+
+    /// Note that `msg_id`'s bytes have reached the transport.
+    ///
+    /// Also restarts the response deadline: the clock measures the server's
+    /// silence, and the server has only now been asked.
+    fn mark_sent(&self, msg_ids: &[MessageId]) {
+        let now = std::time::Instant::now();
+        let mut waiters = self.waiters.lock().unwrap();
+        for id in msg_ids {
+            if let Some(w) = waiters.get_mut(id) {
+                w.sent_at = Some(now);
+                w.last_activity = now;
+            }
+        }
     }
 
     /// Reserve `charge` credits for a request that is about to be sent.
@@ -523,6 +827,9 @@ pub(crate) struct Metrics {
     /// Requests abandoned because the server went silent for longer than the
     /// response timeout.
     pub response_timeouts: AtomicU64,
+    /// Frames the transport could not write: a send that timed out or errored.
+    /// Non-zero means a wedge on OUR side of the wire, not the server's.
+    pub send_failures: AtomicU64,
 
     // Caller-observed outcomes
     pub requests_returned_err: AtomicU64,
@@ -553,6 +860,7 @@ impl Metrics {
             credit_waits: self.credit_waits.load(Relaxed),
             credit_starvations: self.credit_starvations.load(Relaxed),
             response_timeouts: self.response_timeouts.load(Relaxed),
+            send_failures: self.send_failures.load(Relaxed),
             requests_returned_err: self.requests_returned_err.load(Relaxed),
         }
     }
@@ -560,8 +868,13 @@ impl Metrics {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Last `Arc<Inner>` dropping: abort the receiver task if still alive.
+        // Last `Arc<Inner>` dropping: abort both background tasks if still
+        // alive. The writer would also stop on its own once `write_tx` drops,
+        // but not while it is parked inside a send.
         if let Some(handle) = self.receiver_task.lock().unwrap().take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.writer_task.lock().unwrap().take() {
             handle.abort();
         }
     }
@@ -597,7 +910,17 @@ impl Connection {
         server_name: impl Into<String>,
     ) -> Self {
         let sender: Arc<dyn TransportSend> = Arc::from(sender);
-        let inner = Arc::new(Inner::new(sender, server_name.into()));
+        let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_DEPTH);
+        let inner = Arc::new(Inner::new(write_tx, server_name.into()));
+
+        // The writer task holds a `Weak`, so it can't keep the connection
+        // alive; dropping the last clone closes `write_tx` and ends its loop.
+        let weak = Arc::downgrade(&inner);
+        let writer = tokio::spawn(async move {
+            writer_loop(sender, write_rx, weak).await;
+        });
+        *inner.writer_task.lock().unwrap() = Some(writer);
+
         let inner_for_task = Arc::clone(&inner);
         let handle = tokio::spawn(async move {
             receiver_loop(receiver, inner_for_task).await;
@@ -674,16 +997,16 @@ impl Connection {
         // Update preauth hash with request bytes.
         self.inner.preauth_hasher.lock().unwrap().update(&req_bytes);
 
-        let rx = self.register_waiter(msg_id, Command::Negotiate)?;
+        let mut guard = self.register_waiter(msg_id, Command::Negotiate)?;
 
         let rtt_start = std::time::Instant::now();
-        if let Err(e) = self.inner.send_and_count(&req_bytes).await {
-            self.remove_waiter(msg_id);
-            return Err(e);
-        }
+        self.inner
+            .send_and_count(&req_bytes, Command::Negotiate)
+            .await?;
         reservation.commit();
+        self.inner.mark_sent(&[msg_id]);
 
-        let frame = await_frame(rx).await?;
+        let frame = guard.recv().await?;
         *self.inner.estimated_rtt.lock().unwrap() = Some(rtt_start.elapsed());
 
         // Preauth hash update with response bytes.
@@ -1028,15 +1351,12 @@ impl Connection {
         let mut msg_bytes = pack_message(&header, body);
         let captured = msg_bytes.clone();
 
-        let rx = self.register_waiter(msg_id, command)?;
+        let guard = self.register_waiter(msg_id, command)?;
 
         let wire_bytes = if should_encrypt {
             match self.encrypt_bytes(&msg_bytes) {
                 Ok(enc) => enc,
-                Err(e) => {
-                    self.remove_waiter(msg_id);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         } else {
             if should_sign {
@@ -1046,7 +1366,6 @@ impl Connection {
                         signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)
                     {
                         drop(c);
-                        self.remove_waiter(msg_id);
                         return Err(e);
                     }
                 }
@@ -1054,11 +1373,9 @@ impl Connection {
             msg_bytes
         };
 
-        if let Err(e) = self.inner.send_and_count(&wire_bytes).await {
-            self.remove_waiter(msg_id);
-            return Err(e);
-        }
+        self.inner.send_and_count(&wire_bytes, command).await?;
         reservation.commit();
+        self.inner.mark_sent(&[msg_id]);
         // TRACE, not DEBUG: per-request frame plumbing. Fires for every request, so at
         // DEBUG it floods a consumer during high-throughput ops (e.g. a recursive
         // directory scan). Lifecycle/errors stay at DEBUG. See AGENTS.md § Logging.
@@ -1066,7 +1383,7 @@ impl Connection {
             "execute_cap: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}",
             command, msg_id.0, charge, tree_id, should_sign, should_encrypt
         );
-        let frame = self.await_response(rx, msg_id, command).await?;
+        let frame = self.await_response(guard, command).await?;
         Ok((frame, captured))
     }
 
@@ -1148,16 +1465,13 @@ impl Connection {
         // teardown between the early fast-path check above and this
         // insertion returns `Err(Disconnected)` instead of leaving a
         // ghost Sender that never gets routed.
-        let rx = self.register_waiter(msg_id, command)?;
+        let guard = self.register_waiter(msg_id, command)?;
 
         // Build the wire bytes with encryption / signing / compression.
         let wire_bytes = if should_encrypt {
             match self.encrypt_bytes(&msg_bytes) {
                 Ok(enc) => enc,
-                Err(e) => {
-                    self.remove_waiter(msg_id);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         } else {
             if should_sign {
@@ -1167,7 +1481,6 @@ impl Connection {
                         signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)
                     {
                         drop(c);
-                        self.remove_waiter(msg_id);
                         return Err(e);
                     }
                 }
@@ -1175,16 +1488,17 @@ impl Connection {
             if self.compression_enabled() && msg_bytes.len() > Header::SIZE {
                 if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
                     let framed = build_compressed_frame(&compressed);
-                    match self.inner.send_and_count(&framed).await {
+                    match self.inner.send_and_count(&framed, command).await {
                         Ok(()) => {
                             reservation.commit();
+                            self.inner.mark_sent(&[msg_id]);
                             // TRACE: per-request frame plumbing (see execute_cap above).
                             trace!(
                                 "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
                                 command, msg_id.0, charge, tree_id, should_sign,
                                 msg_bytes.len(), framed.len()
                             );
-                            return self.await_response(rx, msg_id, command).await;
+                            return self.await_response(guard, command).await;
                         }
                         Err(e) => {
                             self.remove_waiter(msg_id);
@@ -1196,17 +1510,18 @@ impl Connection {
             msg_bytes
         };
 
-        if let Err(e) = self.inner.send_and_count(&wire_bytes).await {
+        if let Err(e) = self.inner.send_and_count(&wire_bytes, command).await {
             self.remove_waiter(msg_id);
             return Err(e);
         }
         reservation.commit();
+        self.inner.mark_sent(&[msg_id]);
         // TRACE: per-request frame plumbing (see execute_cap above).
         trace!(
             "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}, len={}",
             command, msg_id.0, charge, tree_id, should_sign, should_encrypt, wire_bytes.len()
         );
-        self.await_response(rx, msg_id, command).await
+        self.await_response(guard, command).await
     }
 
     /// Send a request and return its response receiver without awaiting it.
@@ -1237,7 +1552,7 @@ impl Connection {
         command: Command,
         body: &dyn Pack,
         tree_id: Option<TreeId>,
-    ) -> Result<oneshot::Receiver<Result<Frame>>> {
+    ) -> Result<WaiterGuard> {
         self.dispatch_with_credits(command, body, tree_id, CreditCharge(1))
             .await
     }
@@ -1249,7 +1564,7 @@ impl Connection {
         body: &dyn Pack,
         tree_id: Option<TreeId>,
         credit_charge: CreditCharge,
-    ) -> Result<oneshot::Receiver<Result<Frame>>> {
+    ) -> Result<WaiterGuard> {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
         }
@@ -1280,15 +1595,12 @@ impl Connection {
 
         let mut msg_bytes = pack_message(&header, body);
 
-        let rx = self.register_waiter(msg_id, command)?;
+        let guard = self.register_waiter(msg_id, command)?;
 
         let wire_bytes = if should_encrypt {
             match self.encrypt_bytes(&msg_bytes) {
                 Ok(enc) => enc,
-                Err(e) => {
-                    self.remove_waiter(msg_id);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         } else {
             if should_sign {
@@ -1298,7 +1610,6 @@ impl Connection {
                         signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)
                     {
                         drop(c);
-                        self.remove_waiter(msg_id);
                         return Err(e);
                     }
                 }
@@ -1306,7 +1617,7 @@ impl Connection {
             if self.compression_enabled() && msg_bytes.len() > Header::SIZE {
                 if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
                     let framed = build_compressed_frame(&compressed);
-                    match self.inner.send_and_count(&framed).await {
+                    match self.inner.send_and_count(&framed, command).await {
                         Ok(()) => {
                             reservation.commit();
                             debug!(
@@ -1314,28 +1625,24 @@ impl Connection {
                                 command, msg_id.0, charge, tree_id, should_sign,
                                 msg_bytes.len(), framed.len()
                             );
-                            return Ok(rx);
+                            self.inner.mark_sent(&[msg_id]);
+                            return Ok(guard);
                         }
-                        Err(e) => {
-                            self.remove_waiter(msg_id);
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     }
                 }
             }
             msg_bytes
         };
 
-        if let Err(e) = self.inner.send_and_count(&wire_bytes).await {
-            self.remove_waiter(msg_id);
-            return Err(e);
-        }
+        self.inner.send_and_count(&wire_bytes, command).await?;
         reservation.commit();
+        self.inner.mark_sent(&[msg_id]);
         debug!(
             "dispatch: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}, len={}",
             command, msg_id.0, charge, tree_id, should_sign, should_encrypt, wire_bytes.len()
         );
-        Ok(rx)
+        Ok(guard)
     }
 
     /// Send a compound SMB2 request (multiple operations in one transport
@@ -1461,22 +1768,11 @@ impl Connection {
         // Register one oneshot::Receiver per sub-op BEFORE the send,
         // collected in the same order as `ops` / `message_ids`. On any
         // registration error, unregister the ones we already inserted.
-        let mut receivers: Vec<oneshot::Receiver<Result<Frame>>> =
-            Vec::with_capacity(message_ids.len());
-        let mut registered: Vec<MessageId> = Vec::with_capacity(message_ids.len());
+        // The guards deregister on drop, so an error anywhere below unwinds
+        // every sub-op's map entry without a manual rollback list.
+        let mut guards: Vec<WaiterGuard> = Vec::with_capacity(message_ids.len());
         for (idx, id) in message_ids.iter().enumerate() {
-            match self.register_waiter(*id, ops[idx].command) {
-                Ok(rx) => {
-                    receivers.push(rx);
-                    registered.push(*id);
-                }
-                Err(e) => {
-                    for done in &registered {
-                        self.remove_waiter(*done);
-                    }
-                    return Err(e);
-                }
-            }
+            guards.push(self.register_waiter(*id, ops[idx].command)?);
         }
 
         let total_len: usize = sub_requests.iter().map(|r| r.len()).sum();
@@ -1487,25 +1783,17 @@ impl Connection {
 
         let send_result = if should_encrypt {
             match self.encrypt_bytes(&compound_buf) {
-                Ok(enc) => self.inner.send_and_count(&enc).await,
-                Err(e) => {
-                    for id in &registered {
-                        self.remove_waiter(*id);
-                    }
-                    return Err(e);
-                }
+                Ok(enc) => self.inner.send_and_count(&enc, ops[0].command).await,
+                Err(e) => return Err(e),
             }
         } else {
-            self.inner.send_and_count(&compound_buf).await
+            self.inner
+                .send_and_count(&compound_buf, ops[0].command)
+                .await
         };
-
-        if let Err(e) = send_result {
-            for id in &registered {
-                self.remove_waiter(*id);
-            }
-            return Err(e);
-        }
+        send_result?;
         reservation.commit();
+        self.inner.mark_sent(&message_ids);
 
         // TRACE: per-request frame plumbing (see execute_cap above).
         trace!(
@@ -1522,12 +1810,9 @@ impl Connection {
         // frame by `NextCommand` and routes each sub-response to its own
         // waiter, so we can await them sequentially without blocking any
         // of them (they may already all be resolved by the time we loop).
-        let mut results: Vec<Result<Frame>> = Vec::with_capacity(receivers.len());
-        for (idx, rx) in receivers.into_iter().enumerate() {
-            results.push(
-                self.await_response(rx, message_ids[idx], ops[idx].command)
-                    .await,
-            );
+        let mut results: Vec<Result<Frame>> = Vec::with_capacity(guards.len());
+        for (idx, guard) in guards.into_iter().enumerate() {
+            results.push(self.await_response(guard, ops[idx].command).await);
         }
         Ok(results)
     }
@@ -1571,7 +1856,9 @@ impl Connection {
 
         if should_encrypt {
             let encrypted = self.encrypt_bytes(&msg_bytes)?;
-            self.inner.send_and_count(&encrypted).await?;
+            self.inner
+                .send_and_count(&encrypted, Command::Cancel)
+                .await?;
             debug!(
                 "send_cancel: msg_id={}, async_id={:?}, encrypted",
                 original_msg_id.0, async_id
@@ -1583,7 +1870,9 @@ impl Connection {
                     signing::sign_message(&mut msg_bytes, key, *algo, original_msg_id.0, false)?;
                 }
             }
-            self.inner.send_and_count(&msg_bytes).await?;
+            self.inner
+                .send_and_count(&msg_bytes, Command::Cancel)
+                .await?;
             debug!(
                 "send_cancel: msg_id={}, async_id={:?}, signed={}",
                 original_msg_id.0, async_id, should_sign
@@ -1672,27 +1961,29 @@ impl Connection {
     ///
     /// `fan_error_to_waiters` sets `disconnected = true` under the
     /// same lock, making the two paths strictly ordered.
-    fn register_waiter(
-        &self,
-        msg_id: MessageId,
-        command: Command,
-    ) -> Result<oneshot::Receiver<Result<Frame>>> {
+    fn register_waiter(&self, msg_id: MessageId, command: Command) -> Result<WaiterGuard> {
         let mut waiters = self.inner.waiters.lock().unwrap();
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
         }
         let (tx, rx) = oneshot::channel();
+        let now = std::time::Instant::now();
         waiters.insert(
             msg_id,
             Waiter {
                 tx,
                 command,
-                dispatched_at: std::time::Instant::now(),
-                last_activity: std::time::Instant::now(),
+                registered_at: now,
+                sent_at: None,
+                last_activity: now,
             },
         );
         trace!("register_waiter: msg_id={}", msg_id.0);
-        Ok(rx)
+        Ok(WaiterGuard {
+            inner: Arc::clone(&self.inner),
+            msg_id,
+            rx: Some(rx),
+        })
     }
 
     /// Set how long a request may go unanswered before the background sweeper
@@ -1721,7 +2012,8 @@ impl Connection {
             .map(|(id, w)| crate::client::diagnostics::OutstandingRequest {
                 command: w.command,
                 message_id: id.0,
-                age: now.saturating_duration_since(w.dispatched_at),
+                age: now.saturating_duration_since(w.registered_at),
+                sent_age: w.sent_at.map(|t| now.saturating_duration_since(t)),
             })
             .collect();
         out.sort_by_key(|r| std::cmp::Reverse(r.age));
@@ -1735,21 +2027,17 @@ impl Connection {
     /// gets as long as it needs. Long-poll commands are exempt, and
     /// [`set_response_timeout(None)`](Self::set_response_timeout) waits
     /// forever the way the crate used to.
-    async fn await_response(
-        &self,
-        rx: oneshot::Receiver<Result<Frame>>,
-        msg_id: MessageId,
-        command: Command,
-    ) -> Result<Frame> {
+    async fn await_response(&self, mut guard: WaiterGuard, command: Command) -> Result<Frame> {
+        let msg_id = guard.msg_id();
         let timeout = *self.inner.response_timeout.lock().unwrap();
         let Some(timeout) = timeout.filter(|_| !is_long_poll(command)) else {
-            return await_frame(rx).await;
+            return guard.recv().await;
         };
 
         // Check often enough that a short timeout is honored promptly, rarely
         // enough that the default costs one wakeup a second per request.
         let tick = (timeout / 4).clamp(Duration::from_millis(25), Duration::from_secs(1));
-        let mut receiving = Box::pin(await_frame(rx));
+        let mut receiving = Box::pin(guard.recv());
         loop {
             let idle_check = Box::pin(tokio::time::sleep(tick));
             match select(receiving, idle_check).await {
@@ -1791,6 +2079,36 @@ impl Connection {
     /// application imposes its own deadline.
     pub fn set_response_timeout(&self, after: Option<Duration>) {
         *self.inner.response_timeout.lock().unwrap() = after;
+    }
+
+    /// How long one frame may take to reach the socket before its caller
+    /// gives up with [`Error::SendTimeout`], or `None` to wait indefinitely.
+    ///
+    /// Defaults to 60 s. This bounds getting ONTO the wire, which
+    /// [`set_response_timeout`](Self::set_response_timeout) does not: that
+    /// clock only starts once the server has been asked. A socket that stops
+    /// accepting writes while TCP stays `ESTABLISHED` is invisible to every
+    /// other deadline in the crate, and produced a permanent, silent wedge
+    /// before this existed.
+    ///
+    /// Raise it for a link so slow that a `MaxWriteSize` frame legitimately
+    /// takes longer. ❌ Don't set it below the time a full-size write needs on
+    /// the slowest link you support, or healthy transfers will be cut off.
+    ///
+    /// When it fires, the connection is torn down: a write abandoned partway
+    /// leaves a partial frame on the wire, so the stream can't be resynced.
+    /// `None` restores the old unbounded behavior.
+    pub fn set_send_timeout(&self, after: Option<Duration>) {
+        *self.inner.send_timeout.lock().unwrap() = after;
+    }
+
+    /// Frames handed to the writer task and not yet written.
+    ///
+    /// A gauge, not a gate. Persistently non-zero while
+    /// [`MetricsSnapshot::wire_bytes_sent`](crate::client::diagnostics::MetricsSnapshot::wire_bytes_sent)
+    /// stands still means the send side is stuck.
+    pub fn send_queue_depth(&self) -> usize {
+        self.inner.send_queue_depth.load(Ordering::Relaxed)
     }
 
     /// Remove a waiter from the map (used on send error).
@@ -1880,6 +2198,7 @@ impl Connection {
             available: self.inner.credits.available(),
             in_flight,
             next_message_id: self.inner.next_message_id.load(Ordering::Acquire),
+            send_queue_depth: self.inner.send_queue_depth.load(Ordering::Relaxed),
         };
         let disconnected = self.inner.disconnected.load(Ordering::Acquire);
         let compression = CompressionInfo {
@@ -2120,22 +2439,38 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                     }
                 }
                 None => {
-                    // True orphan: msg_id never registered (server sent
-                    // something for an id we didn't allocate, or a
-                    // send-error cleanup raced with arrival).
-                    inner
-                        .metrics
-                        .responses_stray
-                        .fetch_add(1, Ordering::Relaxed);
-                    match &result {
-                        Ok(frame) => debug!(
-                            "recv: orphan dropped, msg_id={}, status={:?}, cmd={:?}",
-                            msg_id.0, frame.header.status, frame.header.command
-                        ),
-                        Err(e) => debug!(
-                            "recv: orphan dropped (error) msg_id={}, err={}",
-                            msg_id.0, e
-                        ),
+                    // No waiter. Two very different situations, and the
+                    // partition only stays meaningful if they're told apart:
+                    // a request whose caller gave up (routine — consumers
+                    // cancel), versus a frame for an id we never had
+                    // outstanding (a protocol anomaly worth looking at).
+                    let was_abandoned = inner
+                        .abandoned
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|id| *id == msg_id);
+                    if was_abandoned {
+                        inner
+                            .metrics
+                            .responses_late_after_drop
+                            .fetch_add(1, Ordering::Relaxed);
+                        trace!("recv: late arrival for dropped waiter, msg_id={}", msg_id.0);
+                    } else {
+                        inner
+                            .metrics
+                            .responses_stray
+                            .fetch_add(1, Ordering::Relaxed);
+                        match &result {
+                            Ok(frame) => debug!(
+                                "recv: orphan dropped, msg_id={}, status={:?}, cmd={:?}",
+                                msg_id.0, frame.header.status, frame.header.command
+                            ),
+                            Err(e) => debug!(
+                                "recv: orphan dropped (error) msg_id={}, err={}",
+                                msg_id.0, e
+                            ),
+                        }
                     }
                 }
             }
@@ -2390,23 +2725,6 @@ pub(crate) fn split_compound(data: &[u8]) -> Result<Vec<Vec<u8>>> {
 /// Await a per-request `oneshot::Receiver` and translate the three
 /// outcomes into a `Result<Frame>`:
 ///
-/// - `Ok(Ok(frame))` — the receiver task routed a successful response.
-/// - `Ok(Err(e))` — the receiver task delivered a targeted error for
-///   this `MessageId` (signature-verify failure, session expired, etc.).
-/// - `Err(_)` on the outer await means the `oneshot::Sender` was dropped
-///   without sending, which happens on connection teardown (see
-///   `fan_error_to_waiters` — it calls `send(Err(Disconnected))` for
-///   every pending waiter, so we only see a raw canceled channel if
-///   the whole map was dropped without that call, i.e. Arc teardown).
-///   Map it to `Error::Disconnected`.
-pub(crate) async fn await_frame(rx: oneshot::Receiver<Result<Frame>>) -> Result<Frame> {
-    match rx.await {
-        Ok(Ok(frame)) => Ok(frame),
-        Ok(Err(e)) => Err(e),
-        Err(_canceled) => Err(Error::Disconnected),
-    }
-}
-
 /// Pack a header + body into raw SMB2 message bytes.
 pub(crate) fn pack_message(header: &Header, body: &dyn Pack) -> Vec<u8> {
     let mut cursor = WriteCursor::new();
@@ -3408,7 +3726,7 @@ mod tests {
 
         // Register a waiter manually so we can inject a bad frame without
         // racing with a real send.
-        let rx = conn.register_waiter(MessageId(4), Command::Read).unwrap();
+        let mut rx = conn.register_waiter(MessageId(4), Command::Read).unwrap();
 
         // Build a frame that starts with TRANSFORM_PROTOCOL_ID so the
         // receiver task takes the decrypt path, but whose ciphertext
@@ -3433,7 +3751,7 @@ mod tests {
         // waiter resolves with Err(Disconnected) quickly. Without the
         // fix, the receiver task `log+continue`s, the waiter hangs, and
         // the timeout fires (test fails).
-        let result = tokio::time::timeout(Duration::from_secs(2), await_frame(rx)).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
 
         assert!(
             result.is_ok(),
@@ -4152,16 +4470,289 @@ mod tests {
         assert_eq!(cloned.credits(), 9);
         assert_eq!(cloned.server_name(), "test-server");
 
-        // Send should still work: the transport's send half lives on Inner.
-        // We won't register a waiter (no response queued), just verify the
-        // send path doesn't panic on a dead-task-map.
-        // (Easier: send_cancel has no waiter registration.)
+        // Send should still work: the writer task lives on Inner, so it
+        // outlives the original handle along with everything else.
         cloned
             .inner
-            .sender
-            .send(b"\x00\x00\x00\x10ignore-me")
+            .send_and_count(b"\x00\x00\x00\x10ignore-me", Command::Echo)
             .await
             .unwrap();
         assert_eq!(mock.sent_count(), 1);
+    }
+}
+
+// ── The wedge: getting onto the wire must be bounded ─────────────────────
+//
+// A 2026-08-01 Cmdr wedge sat frozen for 40 minutes with ~700 requests
+// registered as waiters and ZERO bytes on the socket: one send held the
+// transport's write half forever and every later request queued behind it.
+// Nothing fired, because every deadline the crate had bounds the wait for a
+// RESPONSE, and these requests never reached the wire to be answered.
+#[cfg(test)]
+mod send_path_liveness_tests {
+    use super::*;
+    use crate::msg::echo::EchoRequest;
+    use crate::transport::mock::MockTransport;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A send half that accepts the first `stall_after` frames and then parks
+    /// forever, exactly like the wedged socket: no error, no EOF, no progress.
+    struct StallingSend {
+        inner: Arc<MockTransport>,
+        stall_after: usize,
+        seen: AtomicUsize,
+    }
+
+    impl StallingSend {
+        fn new(inner: Arc<MockTransport>, stall_after: usize) -> Self {
+            Self {
+                inner,
+                stall_after,
+                seen: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TransportSend for StallingSend {
+        async fn send(&self, data: &[u8]) -> Result<()> {
+            if self.seen.fetch_add(1, Ordering::SeqCst) >= self.stall_after {
+                std::future::pending::<()>().await;
+            }
+            self.inner.send(data).await
+        }
+    }
+
+    /// A caller must not park forever because the wire is stuck. Without a
+    /// bound on the send this test hangs — which is the production bug.
+    #[tokio::test]
+    async fn a_send_that_never_completes_fails_the_caller_instead_of_hanging() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(StallingSend::new(Arc::clone(&mock), 0)),
+            Box::new(Arc::clone(&mock)),
+            "test-server",
+        );
+        conn.set_credits(64);
+        conn.set_send_timeout(Some(Duration::from_millis(150)));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.execute(Command::Echo, &EchoRequest, None),
+        )
+        .await
+        .expect("the caller must give up on its own, not wait out the test");
+
+        assert!(
+            matches!(result, Err(Error::SendTimeout { .. })),
+            "expected SendTimeout, got {result:?}"
+        );
+    }
+
+    /// The wedge's actual shape: one stuck frame, then unrelated traffic
+    /// piling up behind it. Every queued caller has to come back with an
+    /// error rather than joining the pile.
+    #[tokio::test]
+    async fn requests_queued_behind_a_stuck_send_all_come_back() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(StallingSend::new(Arc::clone(&mock), 1)),
+            Box::new(Arc::clone(&mock)),
+            "test-server",
+        );
+        conn.set_credits(512);
+        conn.set_send_timeout(Some(Duration::from_millis(150)));
+
+        // One send gets through and parks the wire; nine queue behind it.
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let c = conn.clone();
+            tasks.push(tokio::spawn(async move {
+                c.execute(Command::Echo, &EchoRequest, None).await
+            }));
+        }
+
+        for task in tasks {
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("no caller may outlive the send deadline")
+                .expect("task panicked");
+            assert!(
+                result.is_err(),
+                "a request behind a dead wire cannot report success"
+            );
+        }
+
+        assert!(
+            conn.outstanding_requests().is_empty(),
+            "a connection torn down by a send timeout leaves no waiters behind"
+        );
+    }
+
+    /// `outstanding_requests()` has to say which side of the wire a request is
+    /// on. Reporting a never-sent request as "sent and unanswered" is what
+    /// pointed three investigations at the server.
+    #[tokio::test]
+    async fn a_request_still_queued_is_not_reported_as_sent() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(StallingSend::new(Arc::clone(&mock), 0)),
+            Box::new(Arc::clone(&mock)),
+            "test-server",
+        );
+        conn.set_credits(64);
+        conn.set_send_timeout(None); // park; we want to observe the state
+
+        let c = conn.clone();
+        let task = tokio::spawn(async move { c.execute(Command::Echo, &EchoRequest, None).await });
+
+        let outstanding = wait_for(|| {
+            let o = conn.outstanding_requests();
+            (!o.is_empty()).then_some(o)
+        })
+        .await;
+
+        assert_eq!(outstanding.len(), 1);
+        assert!(
+            outstanding[0].sent_age.is_none(),
+            "a request the transport has not accepted yet is not on the wire"
+        );
+        task.abort();
+    }
+
+    /// An aborted caller must deregister. Left behind, its waiter inflates the
+    /// diagnostic AND makes `reserve_credits`' "is anything outstanding?"
+    /// starvation check permanently true.
+    #[tokio::test]
+    async fn aborted_callers_do_not_leak_waiters() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(Arc::clone(&mock)),
+            Box::new(Arc::clone(&mock)),
+            "test-server",
+        );
+        conn.set_credits(512);
+
+        // Nothing is ever queued as a response, so every one of these is
+        // outstanding until its caller goes away.
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let c = conn.clone();
+            tasks.push(tokio::spawn(async move {
+                c.execute(Command::Echo, &EchoRequest, None).await
+            }));
+        }
+        wait_for(|| (conn.outstanding_requests().len() == 12).then_some(())).await;
+
+        for task in &tasks {
+            task.abort();
+        }
+
+        wait_for(|| conn.outstanding_requests().is_empty().then_some(())).await;
+    }
+
+    /// Same for a compound: every sub-op registers a waiter, so every sub-op
+    /// has to deregister when the caller goes away.
+    #[tokio::test]
+    async fn an_aborted_compound_deregisters_every_sub_op() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(Arc::clone(&mock)),
+            Box::new(Arc::clone(&mock)),
+            "test-server",
+        );
+        conn.set_credits(512);
+
+        let c = conn.clone();
+        let task = tokio::spawn(async move {
+            c.execute_compound(&[
+                CompoundOp::new(Command::Create, &EchoRequest, None),
+                CompoundOp::new(Command::Close, &EchoRequest, None),
+                CompoundOp::new(Command::Echo, &EchoRequest, None),
+            ])
+            .await
+        });
+        wait_for(|| (conn.outstanding_requests().len() == 3).then_some(())).await;
+
+        task.abort();
+        wait_for(|| conn.outstanding_requests().is_empty().then_some(())).await;
+    }
+
+    /// A link that stalls and recovers must NOT be cut off.
+    ///
+    /// The send bound exists to catch a socket that has stopped accepting
+    /// writes for good. A lossy link that pauses and resumes is the far more
+    /// common condition, and turning that into a failed transfer would trade
+    /// a rare wedge for frequent spurious errors — the same trap the response
+    /// deadline was designed around.
+    #[tokio::test]
+    async fn a_link_that_stalls_and_recovers_does_not_fail_the_transfer() {
+        let mock = Arc::new(MockTransport::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let conn = Connection::from_transport(
+            Box::new(GatedSend {
+                inner: Arc::clone(&mock),
+                gate: Arc::clone(&gate),
+                stall_first: AtomicUsize::new(1),
+            }),
+            Box::new(Arc::clone(&mock)),
+            "test-server",
+        );
+        conn.set_credits(64);
+        conn.set_send_timeout(Some(Duration::from_secs(30)));
+
+        let c = conn.clone();
+        let task = tokio::spawn(async move { c.execute(Command::Echo, &EchoRequest, None).await });
+
+        // The first send is parked. Let it through after a pause well short
+        // of the deadline, the way a recovering link would.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        gate.notify_waiters();
+
+        wait_for(|| (mock.sent_count() == 1).then_some(())).await;
+        assert!(
+            !task.is_finished(),
+            "a send that resumed inside its deadline must not have failed"
+        );
+        task.abort();
+    }
+
+    /// A send half that parks the first `stall_first` frames until released.
+    struct GatedSend {
+        inner: Arc<MockTransport>,
+        gate: Arc<tokio::sync::Notify>,
+        stall_first: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TransportSend for GatedSend {
+        async fn send(&self, data: &[u8]) -> Result<()> {
+            if self
+                .stall_first
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    n.checked_sub(1)
+                })
+                .is_ok()
+            {
+                self.gate.notified().await;
+            }
+            self.inner.send(data).await
+        }
+    }
+
+    /// Poll `f` until it yields a value, panicking rather than hanging if it
+    /// never does. (House rule: no bare sleeps or open-ended poll loops.)
+    async fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "condition never became true within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }

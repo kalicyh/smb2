@@ -51,3 +51,15 @@ Phase 2 changed `receive()` from "return `Err(Disconnected)` immediately when th
 - **16 MB max frame**: Reject frames larger than 16 MB to prevent OOM from malicious servers.
 - **Frame may contain multiple messages**: Compound responses arrive in a single frame. The Connection's receiver task splits them by `NextCommand` offsets and routes each sub-response by `MessageId` independently.
 - **`MockTransport::close()` wake-loss**: `notify_waiters()` alone only wakes already-parked waiters; if `close()` fires between `receive()`'s `closed.load()` check and its `notified().await`, the signal is lost. `close()` therefore also calls `notify_one()` to store a permit — next `.notified().await` returns immediately and the loop re-observes `closed=true`. Noticed via code review after Phase 2.
+
+## One writer, above this layer
+
+`TcpTransport::send` holds an internal mutex across `write_all` + `flush`, but nothing above it relies on that for
+serialization any more: `client::connection`'s writer task is the only caller, and it sends one frame at a time. Two
+consequences worth knowing before changing either side:
+
+- **`send` is not cancel-safe and must not be cancelled.** It writes a 4-byte length header and then the body; dropping
+  the future between them leaves a header with no body on the wire and permanently desynchronizes the stream. The
+  writer task is what guarantees no caller can cancel it — it does cancel on its own send deadline, and tears the
+  connection down when it does, for exactly this reason.
+- ❌ **Don't call `TransportSend::send` from anywhere else in the client.** Go through `Inner::send_and_count`.

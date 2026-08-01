@@ -42,6 +42,39 @@ Full model, rationale, and the incident behind it: `credits.rs` module docs.
 - Every request asks for its own charge back plus enough to reach a 512-credit target. ❌ Don't flatten this to a constant: asking for less than the charge lets the window shrink to nothing and serializes every transfer.
 - `STATUS_PENDING` interim responses carry credits but the request isn't done -- keep waiting.
 
+## The send path: a writer task, and why
+
+`Connection` never lets a caller touch the socket. `send_and_count` hands a **whole frame** to an `mpsc` queue and waits
+for the writer task's ack; `writer_loop` owns the transport's write half and is the only thing that writes.
+
+- **Bounded.** Each frame gets `set_send_timeout` (60 s default) to reach the socket, then `Error::SendTimeout` and the
+  connection is torn down. Nothing else in this crate bounds this: the response deadline and the credit deadline both
+  start once the server has been asked, so a socket that stops accepting writes is invisible to them. That is exactly
+  how a 2026-08-01 Cmdr wedge sat frozen for 40 minutes with ~700 requests "in flight" and zero bytes on the wire.
+- **Torn down, not retried, on failure.** A write abandoned partway has already put bytes on the wire, so the stream
+  can't be resynced. A frame rejected *before* any byte went out (oversized) is the caller's problem alone and leaves
+  the connection alive.
+- **Whole frames only.** `TcpTransport::send` writes a 4-byte length header and then the body. A caller cancelled
+  between the two used to leave a header with no body on the wire and every later frame landed inside it — and
+  consumers cancel constantly (a user aborting a copy). Queuing the frame as one message makes that unreachable.
+- ❌ **Don't add a second writer, or let a caller call `TransportSend::send` directly.** Frames would interleave.
+- The queue is bounded (`WRITE_QUEUE_DEPTH`); `send_queue_depth()` is the gauge. Persistently non-zero while
+  `wire_bytes_sent` stands still means the send side is stuck, not the server.
+
+## In-flight bookkeeping: registered vs sent
+
+`register_waiter` returns a `WaiterGuard` that removes its map entry on `Drop`, so an aborted caller can't leak one.
+Before that, only the response deadline removed a waiter, which inflated the diagnostic and made `reserve_credits`'
+"is anything outstanding?" starvation check permanently true.
+
+- `Waiter` carries `registered_at` **and** `sent_at`. `OutstandingRequest::sent_age` is `None` while a request is still
+  queued for the transport. ❌ Never read a large `age` as "the server didn't answer" without checking `sent_age`
+  first — that conflation is what sent three investigations after an innocent server.
+- The stale-request warning says which case it is, and reports the send-queue depth when a request isn't on the wire.
+- Dropping a guard records the id in a bounded ring so a late response still counts as `responses_late_after_drop`
+  rather than `responses_stray`; without it, routine cancellation would drown the "we got a frame we never asked for"
+  signal.
+
 ## Response deadline
 
 `Connection::await_response` gives up with `Error::Timeout` after 180 s of silence, so a server that stops answering on a live socket can't hang a caller. Tune or disable with `set_response_timeout`.

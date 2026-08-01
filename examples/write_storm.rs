@@ -175,12 +175,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             p.dialect, p.max_write_size, p.max_read_size, p.max_transact_size
         );
     }
-    client.connection_mut().set_response_timeout(cfg.resp_timeout);
+    client
+        .connection_mut()
+        .set_response_timeout(cfg.resp_timeout);
     client
         .connection_mut()
         .set_stale_request_warning(Some(Duration::from_secs(10)));
 
-    let mut tree = client.connect_share(&cfg.share).await?;
+    let tree = client.connect_share(&cfg.share).await?;
     // Fresh destination dir. Ignore "already exists".
     let _ = tree
         .create_directory(client.connection_mut(), &cfg.dir)
@@ -229,8 +231,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // dropped task: the `write_chunk` future is dropped wherever
                     // it happens to be, including inside `TcpTransport::send`.
                     let handle = tokio::spawn({
-                        let (tree, conn, path, body) =
-                            (Arc::clone(&tree), conn.clone(), path.clone(), Arc::clone(&body));
+                        let (tree, conn, path, body) = (
+                            Arc::clone(&tree),
+                            conn.clone(),
+                            path.clone(),
+                            Arc::clone(&body),
+                        );
                         async move { copy_one(tree, conn, &path, &body, max_write, push).await }
                     });
                     tokio::time::sleep(cancel_after).await;
@@ -358,8 +364,7 @@ fn spawn_monitor(
             for r in &outstanding {
                 *by_cmd.entry(format!("{:?}", r.command)).or_default() += 1;
             }
-            let mut summary: Vec<String> =
-                by_cmd.iter().map(|(k, v)| format!("{k}x{v}")).collect();
+            let mut summary: Vec<String> = by_cmd.iter().map(|(k, v)| format!("{k}x{v}")).collect();
             summary.sort();
             println!(
                 "[{:>6.1?}] files={} MiB={:.1} idle={:.1?} outstanding={} [{}] oldest={:.1?} credits={} next_msg_id={} sent={} waits={} starv={} timeouts={} tx_bytes={} rx_bytes={}",
@@ -383,7 +388,10 @@ fn spawn_monitor(
                 progress.wedged.store(true, Ordering::Relaxed);
                 println!("\n=== WEDGE DETECTED (no file completed for {idle:.1?}) ===");
                 for r in outstanding.iter().take(40) {
-                    println!("  outstanding: {:?} msg_id={} age={:.1?}", r.command, r.message_id, r.age);
+                    println!(
+                        "  outstanding: {:?} msg_id={} age={:.1?}",
+                        r.command, r.message_id, r.age
+                    );
                 }
                 println!("{m:#?}");
             }

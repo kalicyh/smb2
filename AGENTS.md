@@ -110,6 +110,7 @@ examples/
   list_directory.rs       # List files in a directory
   read_file.rs            # Read a file from a share
   write_file.rs           # Write a file to a share
+  write_storm.rs          # Concurrent bulk-copy stress/diagnostic driver (see its header for the knobs)
 
 fuzz/
   Cargo.toml              # Separate crate (nightly + libfuzzer-sys)
@@ -220,7 +221,23 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 13. **Server may split compound responses** ✅ -- MS-SMB2 3.3.4.1.3: the server SHOULD compound responses but MAY send them as separate frames (Samba/QNAP do this in some cases). Compound-using methods call `Connection::receive_compound_expected(n)`, which gathers additional frames transparently. See `connection.rs` + `tree.rs`.
 14. **Credits are spent on send, not on receipt** ✅ -- `client/credits.rs` reserves a request's `CreditCharge` before its bytes reach the wire; only a `CreditResponse` grant puts credits back. Charging on the response instead leaves every in-flight request invisible, so concurrent pipelined streams over one connection each spend the same budget and blow past the server's window. MS-SMB2 § 3.3.1.1 lets a server drop such a client; a QNAP TS-464 instead stopped answering while TCP stayed `ESTABLISHED` (2026-07-31, reproduced twice). A short send parks on a bounded wait and surfaces `Error::CreditStarvation` rather than hanging. Spans `client/credits.rs` + `client/connection.rs` + the pipelined loops in `client/tree.rs` and `client/stream.rs`.
 15. **A silent server must not hang a caller** ✅ -- `Connection::await_response` gives up after 180 s without a sign of life. The clock measures silence, not elapsed time: interim `STATUS_PENDING` frames refresh `Waiter.last_activity` (MS-SMB2 § 3.2.5.1.5), and long-poll CHANGE_NOTIFY is exempt. See `client/CLAUDE.md` § Response deadline.
-16. **Share-enum responses split two ways** ✅ -- A srvsvc `NetShareEnum` reply can arrive as multiple DCE/RPC fragments (MS-RPCE 2.2.2.6, `PFC_LAST_FRAG` only on the last) and/or as `STATUS_BUFFER_OVERFLOW` pipe reads (MS-SMB2 3.3.5.10) when it exceeds one read buffer. `client::shares::read_pipe_message` follows the overflow chain; `rpc_bind_and_request` loops `rpc::parse_response_fragment` until the last fragment, then NDR-decodes the joined stub. Treating either as a hard error (the old behavior) truncated or failed listings on servers that chunk large replies. Spans `rpc/` + `client/shares.rs`.
+16. **Getting ONTO the wire is bounded, not just getting a reply** ✅ -- A dedicated writer task (`client/connection.rs`
+    `writer_loop`) owns the transport's write half; callers hand over whole frames through an `mpsc` queue and never
+    touch the socket. Every other deadline in this crate starts once the server has been asked, so a socket that stopped
+    accepting writes while TCP stayed `ESTABLISHED` was invisible to all of them: a 2026-08-01 Cmdr wedge sat frozen 40
+    minutes with ~700 requests registered as in-flight and zero bytes sent, and neither the 180 s response deadline nor
+    the 30 s credit bound could fire because both live downstream of the send. The writer task times each frame out
+    (`Error::SendTimeout`, 60 s default) and tears the connection down, because a write abandoned partway leaves half a
+    frame on the wire. Handing over whole frames also removes a second hazard: a caller cancelled between
+    `TcpTransport::send`'s length-header write and its body write used to desynchronize the stream permanently, and
+    consumers cancel routinely. Spans `client/connection.rs` + `transport/tcp.rs`.
+17. **Waiters deregister on drop** ✅ -- `register_waiter` returns a `WaiterGuard` whose `Drop` removes the map entry, so
+    an aborted caller (the common `tokio::spawn` + `abort()` shape) leaves nothing behind. Previously only the response
+    deadline ever removed a waiter, which inflated `outstanding_requests()` with long-dead requests and made
+    `reserve_credits`' "is anything outstanding that could bring a grant back?" check permanently true, so real
+    starvation waited out the full deadline instead of failing fast. A bounded ring of abandoned MessageIds keeps
+    `responses_late_after_drop` distinguishable from `responses_stray`. See `client/connection.rs`.
+18. **Share-enum responses split two ways** ✅ -- A srvsvc `NetShareEnum` reply can arrive as multiple DCE/RPC fragments (MS-RPCE 2.2.2.6, `PFC_LAST_FRAG` only on the last) and/or as `STATUS_BUFFER_OVERFLOW` pipe reads (MS-SMB2 3.3.5.10) when it exceeds one read buffer. `client::shares::read_pipe_message` follows the overflow chain; `rpc_bind_and_request` loops `rpc::parse_response_fragment` until the last fragment, then NDR-decodes the joined stub. Treating either as a hard error (the old behavior) truncated or failed listings on servers that chunk large replies. Spans `rpc/` + `client/shares.rs`.
 
 ## Testing
 
@@ -280,7 +297,8 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 Integration tests (`tests/integration.rs`) run against real hardware:
 
 - QNAP TS-464 NAS (SMB 3.1.1, NTLM auth, AES-GMAC signing)
-- Raspberry Pi 4 Model B (SMB 3.1.1, guest access)
+- Raspberry Pi 4 Model B (SMB 3.1.1, guest access). ⚠️ Its Samba 4.9.5 crashes on compound writes; that is a server bug,
+  not ours. See `docs/notes/samba-4.9-compound-write-crash.md` before diagnosing a dead connection against it.
 
 ## Module docs (CLAUDE.md files)
 
@@ -322,7 +340,8 @@ offline) so local clippy matches CI's always-latest stable, then runs `cargo fmt
 `AtomicU64` counters per connection (`requests_sent`, `wire_bytes_*`, the disjoint routing partition `responses_*`,
 `status_pending_loops`, `signature_failures`, `credit_waits` / `credit_starvations` / `response_timeouts`, etc.) and three client-level counters (`reconnects`,
 `dfs_referrals_resolved`, `dfs_cache_hits`). Eventually consistent, survives connection teardown, per-connection
-counters reset on reconnect. `Display` impl for terminal output; optional `serde` feature for JSON.
+counters reset on reconnect. `OutstandingRequest::sent_age` says which side of the wire a request is on: `None` means
+it is still queued for the transport, so the server has not been asked and nothing about the server follows from it. `Display` impl for terminal output; optional `serde` feature for JSON.
 
 Spec: [`docs/specs/diagnostics-plan.md`](docs/specs/diagnostics-plan.md). Quick smoke test:
 
