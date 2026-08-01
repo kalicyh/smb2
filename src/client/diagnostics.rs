@@ -50,7 +50,7 @@ use crate::crypto::encryption::Cipher;
 use crate::crypto::signing::SigningAlgorithm;
 use crate::pack::Guid;
 use crate::types::flags::Capabilities;
-use crate::types::{Dialect, SessionId, TreeId};
+use crate::types::{Command, Dialect, SessionId, TreeId};
 
 /// Top-level diagnostics tree, captured by [`SmbClient::diagnostics`](crate::SmbClient::diagnostics).
 #[non_exhaustive]
@@ -116,6 +116,11 @@ pub struct ConnectionDiagnostics {
     pub session: Option<SessionDiagnostics>,
     /// Per-connection counters.
     pub metrics: MetricsSnapshot,
+    /// Requests sent and not yet answered, oldest first.
+    ///
+    /// Empty on a healthy idle connection. A long-lived entry here is the
+    /// signature of a hung request; see [`OutstandingRequest`].
+    pub outstanding: Vec<OutstandingRequest>,
 }
 
 /// Snapshot of [`NegotiatedParams`](crate::client::NegotiatedParams) for
@@ -163,6 +168,25 @@ pub struct CreditInfo {
     pub in_flight: usize,
     /// The `MessageId` that will be assigned to the next request.
     pub next_message_id: u64,
+}
+
+/// One request that has been sent and not yet answered.
+///
+/// Surfaced so a consumer can see WHICH request a connection is waiting on, not
+/// just how many. A connection that keeps serving small requests while one large
+/// write hangs looks healthy by every other measure in this snapshot: credits
+/// recover, counters advance, `disconnected` stays `false`. This is the field
+/// that tells them apart.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct OutstandingRequest {
+    /// The SMB2 command that was sent.
+    pub command: Command,
+    /// Its `MessageId`, matching the `dispatch:` log line.
+    pub message_id: u64,
+    /// How long it has been waiting for a response.
+    pub age: Duration,
 }
 
 /// Signing state.

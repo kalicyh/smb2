@@ -66,6 +66,9 @@ fn spawn_stale_waiter_sweeper(inner: &Arc<Inner>) {
 /// requests while a large write hangs looks healthy by every other measure, so
 /// the repetition is the signal.
 fn warn_on_stale_waiters(inner: &Inner) {
+    let Some(threshold) = *inner.stale_request_after.lock().unwrap() else {
+        return; // consumer turned the warning off
+    };
     let now = std::time::Instant::now();
     let stale: Vec<(MessageId, Command, std::time::Duration)> = inner
         .waiters
@@ -74,7 +77,7 @@ fn warn_on_stale_waiters(inner: &Inner) {
         .iter()
         .filter_map(|(id, w)| {
             let age = now.saturating_duration_since(w.dispatched_at);
-            (age >= STALE_WAITER_AFTER).then_some((*id, w.command, age))
+            (age >= threshold).then_some((*id, w.command, age))
         })
         .collect();
     for (msg_id, command, age) in stale {
@@ -255,6 +258,10 @@ impl CryptoState {
 struct Inner {
     /// Per-request routing: msg_id → oneshot sender waiting for its response.
     waiters: StdMutex<HashMap<MessageId, Waiter>>,
+    /// How long a request may go unanswered before the sweeper warns, or `None`
+    /// to stay silent. Consumers with a legitimately slow server tune or disable
+    /// it; see `Connection::set_stale_request_warning`.
+    stale_request_after: StdMutex<Option<std::time::Duration>>,
     /// Credits available to the caller. Updated by the receiver task on every
     /// frame (orphans included), read by the caller thread for pre-send checks.
     credits: AtomicU32,
@@ -304,6 +311,7 @@ impl Inner {
     fn new(sender: Arc<dyn TransportSend>, server_name: String) -> Self {
         Self {
             waiters: StdMutex::new(HashMap::new()),
+            stale_request_after: StdMutex::new(Some(STALE_WAITER_AFTER)),
             credits: AtomicU32::new(1),
             next_message_id: AtomicU64::new(0),
             crypto: StdMutex::new(CryptoState::new()),
@@ -1488,6 +1496,39 @@ impl Connection {
         Ok(rx)
     }
 
+    /// Set how long a request may go unanswered before the background sweeper
+    /// logs a warning naming it, or `None` to stay silent.
+    ///
+    /// Defaults to 30 s. Raise it for a server that is legitimately slow under
+    /// load, or disable it entirely if your application surfaces
+    /// [`ConnectionDiagnostics::outstanding`](crate::client::diagnostics::ConnectionDiagnostics)
+    /// itself and doesn't want the log line.
+    pub fn set_stale_request_warning(&self, after: Option<std::time::Duration>) {
+        *self.inner.stale_request_after.lock().unwrap() = after;
+    }
+
+    /// Requests sent and not yet answered, oldest first.
+    ///
+    /// The same data the sweeper warns from, for consumers that would rather
+    /// render it than read logs.
+    pub fn outstanding_requests(&self) -> Vec<crate::client::diagnostics::OutstandingRequest> {
+        let now = std::time::Instant::now();
+        let mut out: Vec<_> = self
+            .inner
+            .waiters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, w)| crate::client::diagnostics::OutstandingRequest {
+                command: w.command,
+                message_id: id.0,
+                age: now.saturating_duration_since(w.dispatched_at),
+            })
+            .collect();
+        out.sort_by_key(|r| std::cmp::Reverse(r.age));
+        out
+    }
+
     /// Remove a waiter from the map (used on send error).
     fn remove_waiter(&self, msg_id: MessageId) {
         self.inner.waiters.lock().unwrap().remove(&msg_id);
@@ -1607,6 +1648,7 @@ impl Connection {
             dfs_trees,
             session: None, // populated by SmbClient when assembling the full tree
             metrics: self.metrics(),
+            outstanding: self.outstanding_requests(),
         }
     }
 }
@@ -2724,6 +2766,53 @@ mod tests {
     // the waiter doesn't resolve within 2 seconds, it's hung (bug
     // present, test fails). Post-P3.4 fix, the waiter resolves with
     // an error before the timeout.
+
+    /// A consumer must be able to SEE which request is hung, not just read a
+    /// log line about it: a connection still serving small requests while one
+    /// large write hangs looks healthy by every other diagnostic.
+    #[tokio::test]
+    async fn outstanding_requests_names_the_unanswered_request() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        assert!(conn.outstanding_requests().is_empty(), "idle connection");
+
+        let _rx = conn.register_waiter(MessageId(7), Command::Write).unwrap();
+        let outstanding = conn.outstanding_requests();
+
+        assert_eq!(outstanding.len(), 1);
+        assert_eq!(outstanding[0].command, Command::Write);
+        assert_eq!(outstanding[0].message_id, 7);
+    }
+
+    /// The warning is the crate's opinion about the consumer's server, so the
+    /// consumer has to be able to retune or silence it.
+    #[tokio::test]
+    async fn the_stale_request_warning_can_be_retuned_and_silenced() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        let _rx = conn.register_waiter(MessageId(1), Command::Read).unwrap();
+
+        // Silenced: the sweeper must not consider anything stale.
+        conn.set_stale_request_warning(None);
+        assert!(conn.inner.stale_request_after.lock().unwrap().is_none());
+
+        // Retuned: a zero threshold means everything outstanding is stale, which
+        // is the boundary a consumer with a fast server would pick.
+        conn.set_stale_request_warning(Some(Duration::from_millis(0)));
+        assert_eq!(
+            *conn.inner.stale_request_after.lock().unwrap(),
+            Some(Duration::from_millis(0))
+        );
+        warn_on_stale_waiters(&conn.inner); // must not panic, and must consider it
+    }
 
     #[tokio::test]
     async fn phase3_decrypt_failure_errors_waiter_not_hangs() {

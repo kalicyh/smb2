@@ -7,6 +7,18 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-08-01
+
+### Added
+
+- **A hung request can now be identified, instead of only being counted.** `ConnectionDiagnostics::outstanding` lists every request that has been sent and not yet answered — command, `MessageId`, and age, oldest first — and `Connection::outstanding_requests()` returns the same data directly. Previously a connection waiting forever on one request was indistinguishable from a healthy one: credits recover, counters advance, `disconnected` stays `false`, and `CreditInfo::in_flight` gives a bare number with no way to tell WHICH request is stuck or for how long. This is the case where a client keeps serving small requests normally while one large write never comes back. `ConnectionDiagnostics` is `#[non_exhaustive]`, so the new field is additive.
+- **A background sweeper logs a warning naming any request outstanding past a threshold** (default 30 s), re-reporting every 10 s while it stays stuck, since a single line is easy to miss in a long session. It runs as its own task rather than inside the receive loop: that loop is parked in `transport_recv.receive()` exactly when a wedged connection most needs reporting, and racing that read against a timer would mean dropping a read that isn't necessarily cancel-safe. It holds a `Weak` and exits when the last `Connection` clone drops.
+- **`Connection::set_stale_request_warning(Option<Duration>)`** to retune that threshold or silence it entirely. The default is a guess about someone else's server, so it has to be tunable: raise it for a server that's legitimately slow under load, or pass `None` if your application renders `outstanding` itself and doesn't want the log line.
+
+### Notes
+
+- No breaking changes; `Waiter` bookkeeping is internal, and the new diagnostics field lands on a `#[non_exhaustive]` struct. Existing code needs no edits, and consumers that want none of this get one background task per connection whose only cost is a 10 s timer.
+
 ## [0.13.1] - 2026-07-15
 
 ### Fixed
