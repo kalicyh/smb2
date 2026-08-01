@@ -4729,9 +4729,7 @@ mod send_path_liveness_tests {
         async fn send(&self, data: &[u8]) -> Result<()> {
             if self
                 .stall_first
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    n.checked_sub(1)
-                })
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 self.gate.notified().await;

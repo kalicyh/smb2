@@ -22,7 +22,8 @@ cargo test --test integration -- --ignored --nocapture
 
 **Requirements:**
 - QNAP NAS at 192.168.1.111 (NTLM auth, SMB 3.1.1, AES-GMAC signing)
-- Raspberry Pi at 192.168.1.150 (guest access, SMB 3.1.1)
+- Raspberry Pi at 192.168.1.156 (guest access, SMB 3.1.1). ⚠️ Its Samba 4.9.5 panics on repeated compound writes:
+  `docs/notes/samba-4.9-compound-write-crash.md`.
 - `SMB2_TEST_NAS_PASSWORD` env var (from `.env` file or shell). See `.env.example`.
 
 **What they cover:** Connect, negotiate, auth (NTLM + guest), tree connect, list directory, read/write/delete file, stat, create/delete directory, compound read/write, pipelined I/O, streaming download/upload with progress, reconnect, share enumeration, file watching, disk space, rename. Also a micro-benchmark comparing smb2 vs native macOS SMB.

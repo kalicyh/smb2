@@ -13,7 +13,7 @@ everything for later distillation into README and blog posts.
 
 ### Second server (Raspberry Pi)
 
-- Pi at 192.168.1.150, Samba on HDD, guest access
+- Pi at 192.168.1.156, Samba on HDD, guest access
 - Also negotiates SMB 3.1.1 (recent Samba)
 - MaxReadSize=8 MB, MaxWriteSize=1 MB (same as QNAP, Samba defaults)
 - Pi was offline during the main benchmark runs, tested separately via integration tests (directory listing works, 13

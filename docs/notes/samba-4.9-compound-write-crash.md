@@ -20,12 +20,16 @@ A use-after-free on a `tevent_req`, with a core dump each time.
 
 ## Reproducing it (2026-08-01)
 
-Raspberry Pi 4, Debian buster, `samba 2:4.9.5+dfsg-5+deb10u1+rpi1` (armhf), guest share, `smb2 max write = 1048576`.
-Driven by `examples/write_storm`:
+Raspberry Pi 4 (192.168.1.156), Debian buster, `samba 2:4.9.5+dfsg-5+deb10u1+rpi1` (armhf), guest share. Driven by
+`examples/write_storm`:
 
 - **8/8 runs crashed it.** Fastest kill: 126 ms into a run.
+- **The server's config doesn't matter.** The first eight runs were against `smb2 max write = 1048576` (set to mimic
+  the QNAP); re-confirmed afterwards against the Pi's stock `smb2 max write = 8388608`, same panic, same core.
 - **Concurrency is not the trigger.** `WS_CONC=1` crashes after 2 files.
 - **Size is not the trigger.** A 4 KB body crashes it (`WS_SMALL=4096`), as does 520 KB.
+- **One compound write is not enough.** It takes ~2, which is why the single-write
+  `compound_read_and_write_on_raspberry_pi` integration test passes against the same box.
 - **Streamed writes are innocent.** `WS_LARGE_EVERY=1 WS_CONC=8` (pure `FileWriter`, 1 MB wire writes, no compound)
   ran 8/8 files clean, repeatedly. Only the compound path kills it.
 

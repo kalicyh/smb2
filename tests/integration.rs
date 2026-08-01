@@ -101,8 +101,8 @@ async fn connect_and_list_directory_on_real_nas() {
 async fn connect_and_list_directory_on_raspberry_pi() {
     let _ = env_logger::try_init();
 
-    // Connect to 192.168.1.150 (Raspberry Pi).
-    let mut conn = Connection::connect("192.168.1.150:445", Duration::from_secs(5))
+    // Connect to 192.168.1.156 (Raspberry Pi).
+    let mut conn = Connection::connect("192.168.1.156:445", Duration::from_secs(5))
         .await
         .expect("failed to connect to Raspberry Pi");
 
@@ -409,7 +409,7 @@ async fn list_shares_on_nas() {
 async fn list_shares_on_raspberry_pi() {
     let _ = env_logger::try_init();
 
-    let mut conn = Connection::connect("192.168.1.150:445", Duration::from_secs(5))
+    let mut conn = Connection::connect("192.168.1.156:445", Duration::from_secs(5))
         .await
         .expect("failed to connect to Raspberry Pi");
 
@@ -1111,7 +1111,7 @@ async fn micro_benchmark_smb2_vs_native() {
 async fn compound_read_and_write_on_raspberry_pi() {
     let _ = env_logger::try_init();
 
-    let mut conn = Connection::connect("192.168.1.150:445", Duration::from_secs(5))
+    let mut conn = Connection::connect("192.168.1.156:445", Duration::from_secs(5))
         .await
         .expect("failed to connect to Pi");
     conn.negotiate().await.expect("negotiate failed");
@@ -1294,7 +1294,7 @@ async fn streaming_upload_small_file_uses_compound() {
 /// Helper: create an SmbClient connected to the Raspberry Pi.
 async fn connect_client_to_pi() -> SmbClient {
     SmbClient::connect(ClientConfig {
-        addr: "192.168.1.150:445".to_string(),
+        addr: "192.168.1.156:445".to_string(),
         timeout: Duration::from_secs(5),
         username: String::new(),
         password: String::new(),
