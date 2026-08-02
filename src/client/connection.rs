@@ -2040,7 +2040,20 @@ impl Connection {
             Ok(guard) => guard,
             Err(e) => {
                 debug!("keepalive: could not send an ECHO probe: {e}");
-                return ProbeOutcome::Broken;
+                // Only stop probing if the connection is genuinely gone. A
+                // send that failed for any other reason (a crypto error, say)
+                // is a round we learned nothing from, and a keepalive that
+                // quietly retires on a live connection is worse than no
+                // keepalive, because nothing says it stopped.
+                return if self.inner.disconnected.load(Ordering::Acquire) {
+                    ProbeOutcome::Broken
+                } else {
+                    self.inner
+                        .metrics
+                        .keepalive_probes_skipped
+                        .fetch_add(1, Ordering::Relaxed);
+                    ProbeOutcome::Skipped
+                };
             }
         };
         self.inner
@@ -2049,7 +2062,20 @@ impl Connection {
             .fetch_add(1, Ordering::Relaxed);
         match tokio::time::timeout(budget, guard.recv()).await {
             Ok(Ok(_frame)) => ProbeOutcome::Alive,
-            Ok(Err(_)) => ProbeOutcome::Broken,
+            // The connection died under us; whoever noticed is tearing it down.
+            Ok(Err(Error::Disconnected)) | Ok(Err(Error::ServerUnresponsive { .. })) => {
+                ProbeOutcome::Broken
+            }
+            // Any other error came out of a frame the server actually sent —
+            // STATUS_NETWORK_SESSION_EXPIRED is the realistic one. It is a bad
+            // answer, but it is an answer, and that is the only question this
+            // probe asks. ❌ Don't read it as death: a consumer re-running
+            // `Session::setup` on this connection would otherwise be left with
+            // a keepalive that had silently retired.
+            Ok(Err(e)) => {
+                debug!("keepalive: the server answered the probe with an error, which still proves it is processing requests: {e}");
+                ProbeOutcome::Alive
+            }
             Err(_elapsed) => {
                 self.inner
                     .metrics

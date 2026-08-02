@@ -67,6 +67,13 @@ enum Answer {
     /// mid-write looks exactly like this, and killing it is the failure mode
     /// an aggressive deadline buys you if it cannot tell slow from dead.
     EchoOnly,
+    /// Answer ECHO with `STATUS_NETWORK_SESSION_EXPIRED` and nothing else.
+    ///
+    /// A bad answer is still an answer: the server put a frame on the wire, so
+    /// it is unmistakably processing requests, which is the only question the
+    /// probe asks. A consumer re-running `Session::setup` on this connection
+    /// must not be left with a keepalive that quietly retired.
+    EchoExpired,
     /// Answer nothing at all, while the socket keeps accepting writes.
     ///
     /// Covers every cause at once — NAS reboot, share offline, disk stall,
@@ -184,7 +191,7 @@ impl TransportSend for ScriptedServer {
         }
         let will_answer = match answer {
             Answer::Everything => true,
-            Answer::EchoOnly => is_echo,
+            Answer::EchoOnly | Answer::EchoExpired => is_echo,
             Answer::Nothing => false,
         };
         self.seen
@@ -192,7 +199,12 @@ impl TransportSend for ScriptedServer {
             .unwrap()
             .push((header.command, header.message_id, will_answer));
         if will_answer {
-            if let Some(frame) = build_response(header.command, header.message_id) {
+            let frame = if answer == Answer::EchoExpired && is_echo {
+                Some(build_expired_response(header.message_id))
+            } else {
+                build_response(header.command, header.message_id)
+            };
+            if let Some(frame) = frame {
                 self.push(frame);
             }
         }
@@ -238,6 +250,22 @@ fn build_response(command: Command, msg_id: MessageId) -> Option<Vec<u8>> {
         )),
         _ => None,
     }
+}
+
+/// An ECHO answered with `STATUS_NETWORK_SESSION_EXPIRED`.
+fn build_expired_response(msg_id: MessageId) -> Vec<u8> {
+    let mut h = Header::new_request(Command::Echo);
+    h.flags.set_response();
+    h.message_id = msg_id;
+    h.credits = 8;
+    h.status = NtStatus::NETWORK_SESSION_EXPIRED;
+    pack_message(
+        &h,
+        &crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        },
+    )
 }
 
 // ── Harness ────────────────────────────────────────────────────────────────
@@ -656,4 +684,44 @@ async fn a_long_poll_waiting_on_a_dead_server_is_told_instead_of_waiting_forever
         "the verdict has to rest on probes, saw {}",
         server.echo_count()
     );
+}
+
+/// A probe answered with an error is still a probe answered.
+///
+/// `STATUS_NETWORK_SESSION_EXPIRED` is the realistic case: the session needs
+/// re-establishing, but the server unmistakably put a frame on the wire, which
+/// is the only question the probe asks. Reading it as death would retire the
+/// keepalive for the life of a connection a consumer is about to re-authenticate
+/// on — and silently, since nothing announces a keepalive that stopped.
+#[tokio::test]
+async fn a_probe_the_server_answers_with_an_error_still_counts_as_alive() {
+    let server = ScriptedServer::new(Answer::EchoExpired);
+    let conn = connect(&server);
+    conn.set_response_timeout(None); // the deadline is not what is under test
+
+    let write = spawn_write(&conn);
+    server.wait_for_request(Command::Write).await;
+
+    // Well past the point where two unanswered probes would have declared the
+    // session dead.
+    let metrics = conn.clone();
+    wait_until("several probe rounds to go by", || {
+        metrics.metrics().keepalive_probes_sent >= 4
+    })
+    .await;
+
+    assert_eq!(
+        conn.metrics().keepalive_failures,
+        0,
+        "an answered probe is an answered probe, whatever status it carried"
+    );
+    assert!(
+        !conn.diagnostics().disconnected,
+        "the session was torn down over a server that was demonstrably talking"
+    );
+    assert!(
+        !write.is_finished(),
+        "the write should still be outstanding"
+    );
+    write.abort();
 }
