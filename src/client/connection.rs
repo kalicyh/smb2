@@ -12,8 +12,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::{Duration, Instant};
 
 use futures_util::future::{select, Either};
 use log::{debug, error, info, trace, warn};
@@ -343,7 +343,7 @@ fn is_long_poll(command: Command) -> bool {
 /// `Connection` clone drops.
 fn spawn_stale_waiter_sweeper(inner: &Arc<Inner>) {
     let weak = Arc::downgrade(inner);
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(STALE_WAITER_SWEEP).await;
             let Some(inner) = weak.upgrade() else {
@@ -355,6 +355,9 @@ fn spawn_stale_waiter_sweeper(inner: &Arc<Inner>) {
             warn_on_stale_waiters(&inner);
         }
     });
+    if let Some(old) = inner.sweeper_task.lock().unwrap().replace(handle) {
+        old.abort();
+    }
 }
 
 /// What one probe round learned about the server.
@@ -390,7 +393,47 @@ enum ProbeOutcome {
 fn spawn_keepalive(inner: &Arc<Inner>) {
     let weak = Arc::downgrade(inner);
     let handle = tokio::spawn(async move { keepalive_loop(weak).await });
-    *inner.keepalive_task.lock().unwrap() = Some(handle);
+    if let Some(old) = inner.keepalive_task.lock().unwrap().replace(handle) {
+        old.abort();
+    }
+}
+
+/// Spawn the four background tasks a live connection needs, retiring any
+/// previous generation's.
+///
+/// Shared by construction and revival so the two can never drift: a revived
+/// connection has to end up with exactly the plumbing a fresh one has, and
+/// three of these four tasks exit for good when `disconnected` flips — so a
+/// revival that only replaced the transport would come back with no keepalive
+/// and no stale-request warning, silently.
+fn spawn_plumbing(
+    inner: &Arc<Inner>,
+    sender: Box<dyn TransportSend>,
+    receiver: Box<dyn TransportReceive>,
+    write_rx: mpsc::Receiver<WriteJob>,
+) {
+    let sender: Arc<dyn TransportSend> = Arc::from(sender);
+
+    // The writer task holds a `Weak`, so it can't keep the connection
+    // alive; dropping the last clone closes `write_tx` and ends its loop.
+    let weak = Arc::downgrade(inner);
+    let writer = tokio::spawn(async move {
+        writer_loop(sender, write_rx, weak).await;
+    });
+    if let Some(old) = inner.writer_task.lock().unwrap().replace(writer) {
+        old.abort();
+    }
+
+    let inner_for_task = Arc::clone(inner);
+    let handle = tokio::spawn(async move {
+        receiver_loop(receiver, inner_for_task).await;
+    });
+    if let Some(old) = inner.receiver_task.lock().unwrap().replace(handle) {
+        old.abort();
+    }
+
+    spawn_stale_waiter_sweeper(inner);
+    spawn_keepalive(inner);
 }
 
 async fn keepalive_loop(weak: Weak<Inner>) {
@@ -551,6 +594,138 @@ use crate::transport::{TcpTransport, TransportReceive, TransportSend};
 use crate::types::flags::{Capabilities, HeaderFlags, SecurityMode};
 use crate::types::status::NtStatus;
 use crate::types::{Command, CreditCharge, Dialect, MessageId, SessionId, TreeId};
+
+// ── Reconnect ──────────────────────────────────────────────────────────────
+
+/// How to bring a dead connection back on a fresh socket.
+///
+/// The crate can detect a dead session on its own ([`Error::ServerUnresponsive`],
+/// [`Error::Disconnected`]) but it cannot re-establish one: negotiate is its
+/// job, authentication needs credentials it deliberately does not keep, and
+/// dialing needs an address. A consumer supplies all three by installing a
+/// reviver with [`Connection::set_reviver`]; [`SmbClient`](crate::SmbClient)
+/// installs one for you when [`ClientConfig::auto_reconnect`](crate::ClientConfig::auto_reconnect)
+/// is set.
+///
+/// Both methods are called with the revival lock held, so exactly one runs at
+/// a time per connection and neither needs to be reentrant. Neither is given
+/// its own deadline: the whole revival, dial and authentication together, runs
+/// under one [`ReconnectPolicy::total_budget`] timeout, so an implementation
+/// that parks forever is still bounded.
+#[async_trait::async_trait]
+pub trait SessionReviver: Send + Sync {
+    /// Open a fresh transport to the server.
+    ///
+    /// Return the two halves of a brand-new connection. ❌ Never hand back the
+    /// halves of the connection being revived: it is being torn down around
+    /// you.
+    async fn dial(&self) -> Result<(Box<dyn TransportSend>, Box<dyn TransportReceive>)>;
+
+    /// Re-run NEGOTIATE and SESSION_SETUP on the revived connection.
+    ///
+    /// Called after the new transport is installed and every scrap of the dead
+    /// session's state has been cleared, so this sees a connection in exactly
+    /// the state a freshly constructed one is in. Tree connects are the
+    /// consumer's business: the tree ids of the old session are gone, and only
+    /// the consumer knows which shares still matter.
+    async fn reauthenticate(&self, conn: &mut Connection) -> Result<()>;
+}
+
+/// Bounds on bringing a connection back.
+///
+/// The entire point of this machinery is killing a transfer that hangs
+/// forever, so a reconnect loop that can spin forever would reintroduce the
+/// bug in a new costume. Every field here exists to make that unreachable:
+/// attempts are counted, backoff is capped, and the whole thing runs under one
+/// wall-clock timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    /// Dial attempts per revival, including the first. `0` disables reviving.
+    pub max_attempts: u32,
+    /// Pause before the second attempt. Doubles each round, capped at
+    /// [`max_backoff`](Self::max_backoff).
+    pub initial_backoff: Duration,
+    /// Ceiling on the backoff, so a server that is refusing connections is not
+    /// hammered and the wait between attempts stays legible.
+    pub max_backoff: Duration,
+    /// Hard wall-clock ceiling on one revival, dial and authentication and
+    /// every backoff included.
+    ///
+    /// This is the bound that matters: the whole revival runs inside a single
+    /// timeout of this length, so no attempt, however wedged, can outlive it.
+    pub total_budget: Duration,
+    /// How long a failed revival's verdict stands before another caller is
+    /// allowed to try again.
+    ///
+    /// Without it, each of a deep pipeline's callers pays the full
+    /// [`total_budget`](Self::total_budget) in turn against a server that is
+    /// plainly gone.
+    pub failure_cooldown: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    /// The shipping bounds.
+    ///
+    /// Sized for the failures that actually recover — a Wi-Fi roam (1–5 s), a
+    /// share flapping, a switch relearning a port — and deliberately NOT for a
+    /// full NAS reboot (30–90 s). Sitting on a frozen transfer for minutes on
+    /// the chance the box comes back is the behavior this whole effort exists
+    /// to delete; surfacing a typed error at a minute lets the consumer retry
+    /// the file, ask the user, or give up, all of which beat a silent stall.
+    ///
+    /// Four attempts at 0.5 s → 1 s → 2 s of backoff leave the budget almost
+    /// entirely to the dials themselves.
+    fn default() -> Self {
+        Self {
+            max_attempts: 4,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(8),
+            total_budget: Duration::from_secs(60),
+            failure_cooldown: Duration::from_secs(10),
+        }
+    }
+}
+
+/// A consumer's hook for [`ReconnectEvent`]s. See
+/// [`Connection::on_reconnect`].
+pub type ReconnectObserver = Arc<dyn Fn(ReconnectEvent) + Send + Sync>;
+
+/// Something worth telling the consumer about a reconnect, as it happens.
+///
+/// A counter says how flaky a link has been to whoever polls it later; a log
+/// line is for a human reading a bug report. Neither can put "reconnected to
+/// the NAS, resuming" in front of someone watching a progress dialog, which is
+/// why this is pushed. See [`Connection::on_reconnect`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReconnectEvent {
+    /// A revival attempt is about to dial.
+    Started {
+        /// 1-based attempt number within this revival.
+        attempt: u32,
+        /// The ceiling from [`ReconnectPolicy::max_attempts`].
+        of: u32,
+    },
+    /// The connection is live and authenticated again.
+    ///
+    /// Handles, tree connects, and file ids from the old session are gone; the
+    /// consumer re-establishes what it still needs.
+    Succeeded {
+        /// How many attempts it took.
+        attempts: u32,
+        /// Wall clock from the first dial to the new session being ready.
+        took: Duration,
+    },
+    /// The revival gave up. The connection is dead and stays dead.
+    Failed {
+        /// How many attempts were made.
+        attempts: u32,
+        /// Wall clock spent before giving up.
+        took: Duration,
+        /// What the last attempt failed with, for a human.
+        reason: String,
+    },
+}
 
 /// Parameters established during negotiate.
 #[derive(Debug, Clone)]
@@ -745,7 +920,12 @@ struct Inner {
     /// leave half a frame on the wire (the frame is one message, sent or
     /// not), and a stuck write is the writer task's problem to time out
     /// rather than a lock every other caller silently queues behind.
-    write_tx: mpsc::Sender<WriteJob>,
+    ///
+    /// Swapped wholesale when the connection is revived, together with the
+    /// writer task that drains it. That is what makes a frame built for the
+    /// dead session unable to reach the new socket: its queue no longer has a
+    /// reader, so the send fails instead of landing on a stranger.
+    write_tx: StdMutex<mpsc::Sender<WriteJob>>,
     /// MessageIds whose caller went away before the response landed, newest
     /// last, capped at [`ABANDONED_ID_MEMORY`].
     ///
@@ -773,12 +953,47 @@ struct Inner {
     /// of `Connection` drops (via `Inner`'s `Drop`). The transport's read
     /// half's EOF also stops the task; the abort is a safety net.
     receiver_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Handle for the stale-request sweeper. Held so a revival can retire the
+    /// old one instead of accumulating a sweeper per generation — the sweeper
+    /// exits on `disconnected`, and a revival clears that flag.
+    sweeper_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+
+    /// How to dial a fresh socket and re-authenticate on it, or `None` when
+    /// the consumer has not armed auto-reconnect. See [`SessionReviver`].
+    reviver: StdMutex<Option<Arc<dyn SessionReviver>>>,
+    /// Serializes revival attempts, so a pipeline of 32 callers that all
+    /// discover the same dead session dials once rather than 32 times.
+    revive_lock: tokio::sync::Mutex<()>,
+    /// Bounds on a revival: attempts, backoff, and the total wall clock it may
+    /// consume. See [`ReconnectPolicy`].
+    reconnect_policy: StdMutex<ReconnectPolicy>,
+    /// Successful revivals. Doubles as the "did somebody else already fix
+    /// this while I queued for the lock" check, which is why it is bumped only
+    /// on success.
+    revivals: AtomicU64,
+    /// When the last revival gave up, and why.
+    ///
+    /// Without this, every one of a deep pipeline's callers would serially pay
+    /// the full reconnect budget against a server that is plainly not coming
+    /// back — 32 × 60 s of stall, which is the unbounded hang again wearing a
+    /// different hat. Inside the cooldown the stored verdict is returned at
+    /// once. See [`ReconnectPolicy::failure_cooldown`].
+    last_revive_failure: StdMutex<Option<(Instant, Error)>>,
+    /// Called on every reconnect lifecycle event, if a consumer asked to be
+    /// told. See [`Connection::on_reconnect`].
+    reconnect_observer: StdMutex<Option<ReconnectObserver>>,
 
     /// Server name (hostname or IP) used for UNC paths. Set at construction
     /// and never mutated.
     server_name: String,
-    /// Negotiated parameters, populated once by `negotiate`.
-    params: OnceLock<NegotiatedParams>,
+    /// Negotiated parameters, populated by `negotiate` and re-established by
+    /// every revival.
+    ///
+    /// ❌ Not a `OnceLock`: a connection revived on a fresh socket renegotiates
+    /// from scratch, and a rebooted server may come back with a smaller
+    /// `MaxWriteSize` or a different dialect. Keeping the first negotiation's
+    /// numbers would size every chunk against a server that no longer exists.
+    params: StdMutex<Option<NegotiatedParams>>,
     /// Estimated round-trip time measured during negotiate.
     estimated_rtt: StdMutex<Option<Duration>>,
     /// Whether compression is active on this connection (negotiated).
@@ -809,15 +1024,22 @@ impl Inner {
             next_message_id: AtomicU64::new(0),
             crypto: StdMutex::new(CryptoState::new()),
             disconnected: AtomicBool::new(false),
-            write_tx,
+            write_tx: StdMutex::new(write_tx),
             abandoned: StdMutex::new(VecDeque::new()),
             send_queue_depth: AtomicUsize::new(0),
             send_timeout: StdMutex::new(Some(SEND_TIMEOUT)),
             writer_task: StdMutex::new(None),
             keepalive_task: StdMutex::new(None),
             receiver_task: StdMutex::new(None),
+            sweeper_task: StdMutex::new(None),
+            reviver: StdMutex::new(None),
+            revive_lock: tokio::sync::Mutex::new(()),
+            reconnect_policy: StdMutex::new(ReconnectPolicy::default()),
+            revivals: AtomicU64::new(0),
+            last_revive_failure: StdMutex::new(None),
+            reconnect_observer: StdMutex::new(None),
             server_name,
-            params: OnceLock::new(),
+            params: StdMutex::new(None),
             estimated_rtt: StdMutex::new(None),
             compression_enabled: AtomicBool::new(false),
             compression_requested: AtomicBool::new(true),
@@ -842,8 +1064,13 @@ impl Inner {
         };
         let queued_at = job.queued_at;
 
+        // Snapshot the queue rather than holding the lock across the await: a
+        // revival may swap it underneath us, and enqueuing into the retired
+        // queue is exactly right — that frame belongs to the dead session and
+        // must not reach the new socket.
+        let write_tx = self.write_tx.lock().unwrap().clone();
         self.send_queue_depth.fetch_add(1, Ordering::Relaxed);
-        let enqueued = self.write_tx.send(job).await;
+        let enqueued = write_tx.send(job).await;
         if enqueued.is_err() {
             // The writer task is gone, so the connection is dead.
             self.send_queue_depth.fetch_sub(1, Ordering::Relaxed);
@@ -1147,6 +1374,22 @@ pub(crate) struct Metrics {
     /// operation that the deadline alone would have killed.
     pub response_deadline_extensions: AtomicU64,
 
+    // Reconnect
+    /// Dials made trying to bring this connection back, across all revivals.
+    /// Divided by `reconnects_succeeded + reconnects_failed` it says how hard
+    /// each revival had to work.
+    pub reconnect_attempts: AtomicU64,
+    /// Revivals that ended with a live, authenticated session.
+    ///
+    /// The counter that answers "is this link quietly flaky?" — a transfer
+    /// that completes with a non-zero value here survived something, and a
+    /// consumer that wants to say so has the evidence without subscribing to
+    /// anything.
+    pub reconnects_succeeded: AtomicU64,
+    /// Revivals that gave up. Each one surfaced as
+    /// [`Error::ReconnectFailed`](crate::Error::ReconnectFailed) to its caller.
+    pub reconnects_failed: AtomicU64,
+
     // Caller-observed outcomes
     pub requests_returned_err: AtomicU64,
 }
@@ -1181,6 +1424,9 @@ impl Metrics {
             keepalive_probes_skipped: self.keepalive_probes_skipped.load(Relaxed),
             keepalive_failures: self.keepalive_failures.load(Relaxed),
             response_deadline_extensions: self.response_deadline_extensions.load(Relaxed),
+            reconnect_attempts: self.reconnect_attempts.load(Relaxed),
+            reconnects_succeeded: self.reconnects_succeeded.load(Relaxed),
+            reconnects_failed: self.reconnects_failed.load(Relaxed),
             requests_returned_err: self.requests_returned_err.load(Relaxed),
         }
     }
@@ -1198,6 +1444,9 @@ impl Drop for Inner {
             handle.abort();
         }
         if let Some(handle) = self.keepalive_task.lock().unwrap().take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.sweeper_task.lock().unwrap().take() {
             handle.abort();
         }
     }
@@ -1232,25 +1481,9 @@ impl Connection {
         receiver: Box<dyn TransportReceive>,
         server_name: impl Into<String>,
     ) -> Self {
-        let sender: Arc<dyn TransportSend> = Arc::from(sender);
         let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_DEPTH);
         let inner = Arc::new(Inner::new(write_tx, server_name.into()));
-
-        // The writer task holds a `Weak`, so it can't keep the connection
-        // alive; dropping the last clone closes `write_tx` and ends its loop.
-        let weak = Arc::downgrade(&inner);
-        let writer = tokio::spawn(async move {
-            writer_loop(sender, write_rx, weak).await;
-        });
-        *inner.writer_task.lock().unwrap() = Some(writer);
-
-        let inner_for_task = Arc::clone(&inner);
-        let handle = tokio::spawn(async move {
-            receiver_loop(receiver, inner_for_task).await;
-        });
-        *inner.receiver_task.lock().unwrap() = Some(handle);
-        spawn_stale_waiter_sweeper(&inner);
-        spawn_keepalive(&inner);
+        spawn_plumbing(&inner, sender, receiver, write_rx);
         Self { inner }
     }
 
@@ -1415,10 +1648,10 @@ impl Connection {
             .compression_enabled
             .store(compression_enabled, Ordering::Release);
 
-        // OnceLock: set is idempotent-first-writer-wins. Re-negotiation isn't
-        // a supported flow; if this ever fails it means negotiate was called
-        // twice on the same connection.
-        let _ = self.inner.params.set(NegotiatedParams {
+        // Overwrites: a revived connection renegotiates from scratch on a
+        // fresh socket, and the numbers it comes back with are the only ones
+        // that describe the server we are now talking to.
+        *self.inner.params.lock().unwrap() = Some(NegotiatedParams {
             dialect: resp.dialect_revision,
             max_read_size: resp.max_read_size,
             max_write_size: resp.max_write_size,
@@ -1449,9 +1682,13 @@ impl Connection {
         *self.inner.estimated_rtt.lock().unwrap()
     }
 
-    /// Get the negotiated parameters.
-    pub fn params(&self) -> Option<&NegotiatedParams> {
-        self.inner.params.get()
+    /// Get the negotiated parameters, or `None` before NEGOTIATE has run.
+    ///
+    /// Returns an owned copy rather than a borrow because the parameters are
+    /// replaced whenever the connection is revived on a fresh socket; every
+    /// field is a plain scalar, so the copy costs nothing.
+    pub fn params(&self) -> Option<NegotiatedParams> {
+        self.inner.params.lock().unwrap().clone()
     }
 
     /// Get a clone of the preauth hasher's current state.
@@ -2630,6 +2867,331 @@ impl Connection {
         self.inner.send_queue_depth.load(Ordering::Relaxed)
     }
 
+    // ── Reconnect ─────────────────────────────────────────────────────
+
+    /// Arm auto-reconnect by supplying the two things this crate deliberately
+    /// does not keep: an address to dial and credentials to authenticate with.
+    ///
+    /// Without a reviver a dead connection stays dead and
+    /// [`reconnect_if_needed`](Self::reconnect_if_needed) is a no-op that
+    /// reports [`Error::Disconnected`].
+    pub fn set_reviver(&self, reviver: Option<Arc<dyn SessionReviver>>) {
+        *self.inner.reviver.lock().unwrap() = reviver;
+    }
+
+    /// Whether a reviver is installed.
+    pub fn can_reconnect(&self) -> bool {
+        self.inner.reviver.lock().unwrap().is_some()
+    }
+
+    /// Replace the bounds on a revival. See [`ReconnectPolicy`].
+    pub fn set_reconnect_policy(&self, policy: ReconnectPolicy) {
+        *self.inner.reconnect_policy.lock().unwrap() = policy;
+    }
+
+    /// The bounds currently in force.
+    pub fn reconnect_policy(&self) -> ReconnectPolicy {
+        *self.inner.reconnect_policy.lock().unwrap()
+    }
+
+    /// Be told about every reconnect as it happens.
+    ///
+    /// The observer runs on the task driving the revival. It must not block
+    /// and must not call back into this connection: sending from inside it
+    /// deadlocks against the revival lock. Forward to a channel and return.
+    pub fn on_reconnect(&self, observer: Option<ReconnectObserver>) {
+        *self.inner.reconnect_observer.lock().unwrap() = observer;
+    }
+
+    /// Whether the connection is currently torn down.
+    ///
+    /// A revived connection reports `false` again — this is the live state,
+    /// not a latch.
+    pub fn is_disconnected(&self) -> bool {
+        self.inner.disconnected.load(Ordering::Acquire)
+    }
+
+    /// How many times this connection has come back on a fresh socket.
+    ///
+    /// Increments only on a *successful* revival, so it doubles as the
+    /// identity of the current session: a handle, tree id, or message id
+    /// obtained under an older generation belongs to a session that no longer
+    /// exists.
+    pub fn generation(&self) -> u64 {
+        self.inner.revivals.load(Ordering::Acquire)
+    }
+
+    /// Bring the connection back if it has died, or do nothing if it is fine.
+    ///
+    /// The whole pipeline discovers a dead session at once, so this is written
+    /// for a stampede: the first caller in dials, everyone else waits on the
+    /// same attempt and returns as soon as it lands. Nothing here can spin —
+    /// see [`ReconnectPolicy`] for every bound.
+    ///
+    /// On success the connection is negotiated and authenticated again, and
+    /// **everything scoped to the old session is gone**: tree ids, file ids,
+    /// message ids, and the credit window. The caller re-establishes what it
+    /// still needs. That is why this is not called for you inside `execute`:
+    /// re-issuing an arbitrary request against a new session is a data-safety
+    /// decision only the layer that knows the operation's semantics can make.
+    ///
+    /// Errors:
+    ///
+    /// - [`Error::Disconnected`] when the connection is dead and no reviver is
+    ///   installed.
+    /// - [`Error::ReconnectFailed`] when every attempt failed, or the budget
+    ///   ran out, or a previous revival failed recently enough that its
+    ///   verdict still stands (see [`ReconnectPolicy::failure_cooldown`]).
+    pub async fn reconnect_if_needed(&self) -> Result<()> {
+        if !self.is_disconnected() {
+            return Ok(());
+        }
+        let seen = self.inner.revivals.load(Ordering::Acquire);
+        let _serialized = self.inner.revive_lock.lock().await;
+
+        // Somebody else fixed it while we queued for the lock. This is the
+        // common case under a deep pipeline and it must be cheap.
+        if self.inner.revivals.load(Ordering::Acquire) != seen {
+            return Ok(());
+        }
+        if !self.is_disconnected() {
+            return Ok(());
+        }
+        if let Some(verdict) = self.recent_revive_failure() {
+            return Err(verdict);
+        }
+        self.revive().await
+    }
+
+    /// The stored verdict of a recent failed revival, if it still stands.
+    fn recent_revive_failure(&self) -> Option<Error> {
+        let cooldown = self.reconnect_policy().failure_cooldown;
+        let held = self.inner.last_revive_failure.lock().unwrap();
+        let (at, err) = held.as_ref()?;
+        (at.elapsed() < cooldown).then(|| match err {
+            Error::ReconnectFailed {
+                attempts,
+                waited,
+                cause,
+                reason,
+            } => Error::ReconnectFailed {
+                attempts: *attempts,
+                waited: *waited,
+                cause: *cause,
+                reason: reason.clone(),
+            },
+            _ => Error::Disconnected,
+        })
+    }
+
+    /// Dial, install, and re-authenticate, under one hard wall-clock bound.
+    ///
+    /// Called with the revival lock held.
+    async fn revive(&self) -> Result<()> {
+        let Some(reviver) = self.inner.reviver.lock().unwrap().clone() else {
+            return Err(Error::Disconnected);
+        };
+        let policy = self.reconnect_policy();
+        if policy.max_attempts == 0 {
+            return Err(Error::Disconnected);
+        }
+
+        let started = Instant::now();
+        // ONE timeout around the entire loop. Every attempt, every backoff,
+        // and any dial or authentication that parks are all inside it, so
+        // there is no path — not a wedged socket, not a reviver that never
+        // returns — by which this outlives the budget. ❌ Don't move the bound
+        // inside the loop: a per-attempt timeout multiplies by the attempt
+        // count and stops being a bound.
+        let outcome = tokio::time::timeout(
+            policy.total_budget,
+            self.revive_attempts(&reviver, &policy, started),
+        )
+        .await;
+
+        match outcome {
+            Ok(Ok(attempts)) => {
+                let took = started.elapsed();
+                self.inner.revivals.fetch_add(1, Ordering::Release);
+                *self.inner.last_revive_failure.lock().unwrap() = None;
+                self.inner
+                    .metrics
+                    .reconnects_succeeded
+                    .fetch_add(1, Ordering::Relaxed);
+                info!(
+                    "reconnect: session re-established on a new socket after {attempts} \
+                     attempt(s) in {took:?}; every tree id and file handle from the old \
+                     session is invalid"
+                );
+                self.announce(ReconnectEvent::Succeeded { attempts, took });
+                Ok(())
+            }
+            Ok(Err((attempts, cause))) => Err(self.give_up(attempts, started, cause)),
+            Err(_) => {
+                let attempts = self
+                    .inner
+                    .metrics
+                    .reconnect_attempts
+                    .load(Ordering::Relaxed);
+                // The connection is mid-rebuild and nobody is going to finish
+                // it; leave it unambiguously dead rather than half-alive.
+                self.mark_dead();
+                Err(self.give_up(
+                    u32::try_from(attempts)
+                        .unwrap_or(u32::MAX)
+                        .min(policy.max_attempts),
+                    started,
+                    Error::Timeout,
+                ))
+            }
+        }
+    }
+
+    /// The attempt loop. Returns the attempt count on success, or the last
+    /// failure alongside it.
+    async fn revive_attempts(
+        &self,
+        reviver: &Arc<dyn SessionReviver>,
+        policy: &ReconnectPolicy,
+        started: Instant,
+    ) -> std::result::Result<u32, (u32, Error)> {
+        let mut backoff = policy.initial_backoff;
+        let mut last = Error::Disconnected;
+
+        for attempt in 1..=policy.max_attempts {
+            if attempt > 1 {
+                warn!(
+                    "reconnect: attempt {attempt} of {} after {:?}, backing off {backoff:?}",
+                    policy.max_attempts,
+                    started.elapsed()
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(policy.max_backoff);
+            }
+            self.inner
+                .metrics
+                .reconnect_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            self.announce(ReconnectEvent::Started {
+                attempt,
+                of: policy.max_attempts,
+            });
+
+            match self.revive_once(reviver).await {
+                Ok(()) => return Ok(attempt),
+                Err(e) => {
+                    warn!("reconnect: attempt {attempt} failed: {e}");
+                    // A half-built session must never look usable. Whatever
+                    // went wrong, the connection goes back to unambiguously
+                    // dead before the next attempt or before we give up.
+                    self.mark_dead();
+                    last = e;
+                }
+            }
+        }
+        Err((policy.max_attempts, last))
+    }
+
+    /// One attempt: fresh socket, wiped state, new session.
+    async fn revive_once(&self, reviver: &Arc<dyn SessionReviver>) -> Result<()> {
+        let (sender, receiver) = reviver.dial().await?;
+        self.install_transport(sender, receiver);
+        let mut conn = self.clone();
+        reviver.reauthenticate(&mut conn).await
+    }
+
+    /// Swap in a fresh transport and erase every trace of the dead session.
+    ///
+    /// Order is the whole correctness argument:
+    ///
+    /// 1. Tear down first, under the waiters lock, so `disconnected` is true
+    ///    and no caller can register into a half-built connection.
+    /// 2. Reset the per-session state. ❌ Nothing here may be carried over: a
+    ///    stale credit window over-spends the new server's budget, a stale
+    ///    message id makes the server drop the connection for a sequence gap,
+    ///    and stale signing keys make every frame fail verification.
+    /// 3. Rebuild the plumbing.
+    /// 4. Clear `disconnected` LAST, which is what reopens the gate.
+    fn install_transport(
+        &self,
+        sender: Box<dyn TransportSend>,
+        receiver: Box<dyn TransportReceive>,
+    ) {
+        let inner = &self.inner;
+
+        // Anything still registered was asked of a server that is gone.
+        fan_error_to_waiters(inner, &Error::Disconnected);
+
+        inner.credits.reset();
+        inner.next_message_id.store(0, Ordering::Release);
+        *inner.crypto.lock().unwrap() = CryptoState::new();
+        *inner.preauth_hasher.lock().unwrap() = PreauthHasher::new();
+        *inner.params.lock().unwrap() = None;
+        *inner.last_frame_at.lock().unwrap() = None;
+        *inner.estimated_rtt.lock().unwrap() = None;
+        inner.abandoned.lock().unwrap().clear();
+        inner.dfs_trees.lock().unwrap().clear();
+        inner.compression_enabled.store(false, Ordering::Release);
+        // ❌ `send_queue_depth` is deliberately NOT reset: a caller parked
+        // between its increment and its decrement would underflow the gauge
+        // into a nonsense number. It drains on its own.
+
+        let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_DEPTH);
+        *inner.write_tx.lock().unwrap() = write_tx;
+        spawn_plumbing(inner, sender, receiver, write_rx);
+
+        inner.disconnected.store(false, Ordering::Release);
+    }
+
+    /// Tear the connection down: every waiter told, every new send refused.
+    ///
+    /// Public because a consumer that has decided a connection is finished
+    /// (a user cancelling, a share unmounted) should be able to say so
+    /// without waiting for a deadline to notice.
+    pub fn mark_dead(&self) {
+        fan_error_to_waiters(&self.inner, &Error::Disconnected);
+    }
+
+    /// Record and report a revival that gave up.
+    fn give_up(&self, attempts: u32, started: Instant, cause: Error) -> Error {
+        let took = started.elapsed();
+        let reason = cause.to_string();
+        let err = Error::ReconnectFailed {
+            attempts,
+            waited: took,
+            cause: cause.kind(),
+            reason: reason.clone(),
+        };
+        self.inner
+            .metrics
+            .reconnects_failed
+            .fetch_add(1, Ordering::Relaxed);
+        error!("reconnect: gave up after {attempts} attempt(s) in {took:?}: {reason}");
+        *self.inner.last_revive_failure.lock().unwrap() = Some((
+            Instant::now(),
+            Error::ReconnectFailed {
+                attempts,
+                waited: took,
+                cause: cause.kind(),
+                reason: reason.clone(),
+            },
+        ));
+        self.announce(ReconnectEvent::Failed {
+            attempts,
+            took,
+            reason,
+        });
+        err
+    }
+
+    /// Hand an event to the consumer's observer, if there is one.
+    fn announce(&self, event: ReconnectEvent) {
+        let observer = self.inner.reconnect_observer.lock().unwrap().clone();
+        if let Some(observer) = observer {
+            observer(event);
+        }
+    }
+
     /// Remove a waiter from the map (used on send error).
     fn remove_waiter(&self, msg_id: MessageId) {
         self.inner.waiters.lock().unwrap().remove(&msg_id);
@@ -2638,9 +3200,7 @@ impl Connection {
 
     #[cfg(test)]
     pub(crate) fn set_test_params(&mut self, params: NegotiatedParams) {
-        // OnceLock: first setter wins. Tests sometimes stage params on a
-        // fresh connection; ignore any collision.
-        let _ = self.inner.params.set(params);
+        *self.inner.params.lock().unwrap() = Some(params);
     }
 
     #[cfg(test)]
@@ -2725,7 +3285,7 @@ impl Connection {
             negotiated: self.inner.compression_enabled.load(Ordering::Acquire),
         };
 
-        let negotiated = self.inner.params.get().map(|p| NegotiatedSummary {
+        let negotiated = self.params().map(|p| NegotiatedSummary {
             dialect: p.dialect,
             max_read_size: p.max_read_size,
             max_write_size: p.max_write_size,

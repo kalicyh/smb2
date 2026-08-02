@@ -22,7 +22,10 @@ pub mod tree;
 pub mod watcher;
 
 pub use crate::crypto::encryption::Cipher;
-pub use connection::{CompoundOp, Connection, Frame, NegotiatedParams};
+pub use connection::{
+    CompoundOp, Connection, Frame, NegotiatedParams, ReconnectEvent, ReconnectObserver,
+    ReconnectPolicy, SessionReviver,
+};
 pub use diagnostics::{
     ClientInfo, ClientMetricsSnapshot, CompressionInfo, ConnectionDiagnostics, CreditInfo,
     DfsCacheEntry, Diagnostics, EncryptionInfo, MetricsSnapshot, NegotiatedSummary,
@@ -270,8 +273,12 @@ impl SmbClient {
         Ok(())
     }
 
-    /// Get the negotiated parameters.
-    pub fn params(&self) -> Option<&NegotiatedParams> {
+    /// Get the negotiated parameters, or `None` before NEGOTIATE has run.
+    ///
+    /// Owned rather than borrowed: the parameters are replaced whenever the
+    /// connection is revived on a fresh socket. Every field is a scalar, so
+    /// the copy costs nothing.
+    pub fn params(&self) -> Option<NegotiatedParams> {
         self.conn.params()
     }
 

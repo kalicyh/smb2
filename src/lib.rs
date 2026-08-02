@@ -84,7 +84,10 @@ pub use client::tree::{DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep
 pub use client::pipeline::{Op, OpResult, Pipeline};
 
 // Connection-level types (useful for advanced users)
-pub use client::connection::{CompoundOp, Frame, NegotiatedParams};
+pub use client::connection::{
+    CompoundOp, Frame, NegotiatedParams, ReconnectEvent, ReconnectObserver, ReconnectPolicy,
+    SessionReviver,
+};
 pub use client::session::Session;
 
 // Diagnostics: snapshot tree returned by `SmbClient::diagnostics()` /

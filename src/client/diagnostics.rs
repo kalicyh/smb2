@@ -423,6 +423,25 @@ pub struct MetricsSnapshot {
     /// A rising count next to a flat `response_timeouts` is the keepalive
     /// working exactly as intended.
     pub response_deadline_extensions: u64,
+
+    /// Dials made trying to bring this connection back, across every revival.
+    pub reconnect_attempts: u64,
+    /// Revivals that ended with a live, authenticated session on a fresh
+    /// socket.
+    ///
+    /// The after-the-fact answer to "was this link quietly flaky?". A transfer
+    /// that finished with a non-zero value here survived something the user
+    /// never saw, which is exactly the outcome the spec worried about hiding:
+    /// the number is always here whether or not anyone subscribed to
+    /// [`ReconnectEvent`](crate::client::connection::ReconnectEvent).
+    ///
+    /// ❌ Unlike every other per-connection counter this one is NOT reset by a
+    /// reconnect — it counts them, and a counter that resets on the event it
+    /// counts would always read zero.
+    pub reconnects_succeeded: u64,
+    /// Revivals that gave up, each surfaced to its caller as
+    /// [`Error::ReconnectFailed`](crate::Error::ReconnectFailed).
+    pub reconnects_failed: u64,
 }
 
 /// Client-level counter snapshot. Lives on [`SmbClient`](crate::SmbClient)
@@ -555,6 +574,13 @@ fn fmt_connection_body(c: &ConnectionDiagnostics, f: &mut fmt::Formatter<'_>) ->
         m.keepalive_failures,
         m.response_deadline_extensions,
     )?;
+    if m.reconnect_attempts > 0 {
+        writeln!(
+            f,
+            "  reconnects: {} succeeded · {} failed · {} dials",
+            m.reconnects_succeeded, m.reconnects_failed, m.reconnect_attempts,
+        )?;
+    }
     if c.disconnected {
         writeln!(f, "  status: DISCONNECTED")?;
     }

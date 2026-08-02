@@ -19,14 +19,16 @@
 //! precisely the bug.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::Notify;
 
-use crate::client::connection::{pack_message, Connection};
+use crate::client::connection::{
+    pack_message, Connection, ReconnectEvent, ReconnectPolicy, SessionReviver,
+};
 use crate::error::{Error, Result};
 use crate::msg::echo::EchoResponse;
 use crate::msg::header::Header;
@@ -34,7 +36,7 @@ use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{ReadCursor, Unpack};
 use crate::transport::{TransportReceive, TransportSend};
 use crate::types::status::NtStatus;
-use crate::types::{Command, MessageId, TreeId};
+use crate::types::{Command, MessageId, SessionId, TreeId};
 
 // ── Timings ────────────────────────────────────────────────────────────────
 //
@@ -724,4 +726,617 @@ async fn a_probe_the_server_answers_with_an_error_still_counts_as_alive() {
         "the write should still be outstanding"
     );
     write.abort();
+}
+
+// ── A NAS you can bounce ───────────────────────────────────────────────────
+//
+// The `ScriptedServer` above can go silent, which is what M2 needed. Surviving
+// the blip needs one more thing: a server that goes away and then *comes
+// back*, on a different socket, with none of the old session's state. That is
+// a NAS reboot, a share remounting, and a laptop finding the network again
+// after a roam — three causes, one shape.
+
+/// Hands out a fresh [`ScriptedServer`] per dial, and can be told to fail or
+/// hang instead.
+///
+/// Doubles as the [`SessionReviver`] the connection is armed with. Its
+/// `reauthenticate` stages credits and a session id rather than running real
+/// NTLM: the negotiate and SESSION_SETUP flows already have their own
+/// coverage, and mixing them in here would test the wrong thing. What is under
+/// test is the revival machinery — the transport swap, the state reset, and
+/// the bounds.
+struct BouncingNas {
+    /// Every generation handed out, oldest first.
+    generations: Mutex<Vec<Arc<ScriptedServer>>>,
+    /// What the next generation answers when it comes up.
+    next_answer: Mutex<Answer>,
+    /// Dials that must fail before one is allowed to succeed.
+    dials_that_fail: AtomicUsize,
+    /// When set, `dial` parks forever. Only the reconnect budget can end it,
+    /// which is the point.
+    dial_hangs: AtomicBool,
+    /// When set, the socket comes up but authentication is refused.
+    auth_fails: AtomicBool,
+    dials: AtomicUsize,
+    /// Never notified. The park a hanging dial waits on.
+    never: Notify,
+}
+
+impl BouncingNas {
+    /// Power on with one generation already running.
+    fn new(answer: Answer) -> Arc<Self> {
+        let nas = Arc::new(Self {
+            generations: Mutex::new(Vec::new()),
+            next_answer: Mutex::new(answer),
+            dials_that_fail: AtomicUsize::new(0),
+            dial_hangs: AtomicBool::new(false),
+            auth_fails: AtomicBool::new(false),
+            dials: AtomicUsize::new(0),
+            never: Notify::new(),
+        });
+        nas.spin_up();
+        nas
+    }
+
+    fn spin_up(&self) -> Arc<ScriptedServer> {
+        let server = ScriptedServer::new(*self.next_answer.lock().unwrap());
+        self.generations.lock().unwrap().push(Arc::clone(&server));
+        server
+    }
+
+    /// The generation currently serving.
+    fn current(&self) -> Arc<ScriptedServer> {
+        self.generations.lock().unwrap().last().unwrap().clone()
+    }
+
+    fn generation(&self, n: usize) -> Arc<ScriptedServer> {
+        self.generations.lock().unwrap()[n].clone()
+    }
+
+    fn generations_handed_out(&self) -> usize {
+        self.generations.lock().unwrap().len()
+    }
+
+    fn dial_count(&self) -> usize {
+        self.dials.load(Ordering::Relaxed)
+    }
+
+    /// The server goes away without a word: the socket stays up and nothing is
+    /// ever answered again. Indistinguishable, from the client's side, from a
+    /// reboot, a share going offline, or an access point handover.
+    fn goes_away(&self) {
+        self.current().set_answer(Answer::Nothing);
+    }
+}
+
+#[async_trait]
+impl SessionReviver for BouncingNas {
+    async fn dial(&self) -> Result<(Box<dyn TransportSend>, Box<dyn TransportReceive>)> {
+        self.dials.fetch_add(1, Ordering::Relaxed);
+        if self.dial_hangs.load(Ordering::Relaxed) {
+            self.never.notified().await;
+            unreachable!("the budget must end this, not the notify");
+        }
+        if self
+            .dials_that_fail
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Error::Disconnected);
+        }
+        let server = self.spin_up();
+        Ok((Box::new(Arc::clone(&server)), Box::new(Arc::clone(&server))))
+    }
+
+    async fn reauthenticate(&self, conn: &mut Connection) -> Result<()> {
+        if self.auth_fails.load(Ordering::Relaxed) {
+            return Err(Error::Auth {
+                message: "the password changed while we were away".into(),
+            });
+        }
+        conn.set_credits(512);
+        conn.set_session_id(SessionId(0xBEEF));
+        Ok(())
+    }
+}
+
+/// Bounds scaled to the harness's timings, keeping the shipping shape: several
+/// attempts, growing backoff, one wall-clock ceiling over the lot.
+fn test_policy() -> ReconnectPolicy {
+    ReconnectPolicy {
+        max_attempts: 3,
+        initial_backoff: Duration::from_millis(20),
+        max_backoff: Duration::from_millis(80),
+        total_budget: Duration::from_secs(2),
+        failure_cooldown: Duration::from_millis(300),
+    }
+}
+
+/// A connection to `nas`'s current generation, armed to reconnect.
+///
+/// The response deadline is pushed far out on purpose. These tests are about
+/// what happens once a session is *declared dead*, and only the keepalive
+/// declares that — a plain response timeout abandons one request and leaves
+/// the connection standing. Letting the short deadline win the race would mean
+/// testing the revival against a connection that never died.
+fn connect_to(nas: &Arc<BouncingNas>) -> Connection {
+    let conn = connect(&nas.current());
+    conn.set_response_timeout(Some(Duration::from_secs(30)));
+    conn.set_reviver(Some(Arc::clone(nas) as Arc<dyn SessionReviver>));
+    conn.set_reconnect_policy(test_policy());
+    conn
+}
+
+/// Collects every [`ReconnectEvent`] the connection announces.
+fn watch_events(conn: &Connection) -> Arc<Mutex<Vec<ReconnectEvent>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    conn.on_reconnect(Some(Arc::new(move |e| sink.lock().unwrap().push(e))));
+    seen
+}
+
+// ── Surviving the blip ─────────────────────────────────────────────────────
+
+/// The headline: a server that vanishes mid-transfer and comes back does not
+/// end the transfer.
+///
+/// Before this, the best available outcome was a clean, typed error — better
+/// than the hang it replaced, and still a failed copy. The write here fails
+/// once, the connection comes back on a fresh socket, and the retry lands on
+/// the new server.
+#[tokio::test]
+async fn a_write_that_died_with_the_server_succeeds_once_the_connection_is_revived() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+    let events = watch_events(&conn);
+
+    assert!(finish(spawn_write(&conn), "the warm-up write")
+        .await
+        .is_ok());
+
+    nas.goes_away();
+    let stranded = finish(spawn_write(&conn), "the stranded write").await;
+    assert!(
+        matches!(stranded, Err(Error::ServerUnresponsive { .. })),
+        "the dead session should be named first, got {stranded:?}"
+    );
+
+    conn.reconnect_if_needed()
+        .await
+        .expect("the NAS is answering again; the revival must succeed");
+
+    let retried = finish(spawn_write(&conn), "the retried write").await;
+    assert!(
+        retried.is_ok(),
+        "a revived connection has to carry real work, got {retried:?}"
+    );
+    assert_eq!(
+        nas.generations_handed_out(),
+        2,
+        "exactly one fresh socket was dialed"
+    );
+    assert_eq!(
+        conn.metrics().reconnects_succeeded,
+        1,
+        "the counter is what makes a survived blip visible after the fact"
+    );
+    assert_eq!(conn.generation(), 1);
+    assert!(!conn.is_disconnected());
+
+    let events = events.lock().unwrap().clone();
+    assert!(
+        matches!(
+            events.first(),
+            Some(ReconnectEvent::Started { attempt: 1, .. })
+        ),
+        "got {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(ReconnectEvent::Succeeded { attempts: 1, .. })
+        ),
+        "a consumer that wants to say 'reconnected, resuming' needs the push, got {events:?}"
+    );
+}
+
+/// A frame built for the session that died must never land on the new socket.
+///
+/// This is a data-corruption boundary, not a tidiness one: the new server has
+/// its own message-id sequence, its own credit window, and its own signing
+/// keys, so a stale frame arriving there is at best rejected and at worst
+/// desynchronizes the stream for everything behind it.
+#[tokio::test]
+async fn a_frame_built_for_the_dead_session_cannot_reach_the_new_socket() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+
+    assert!(finish(spawn_write(&conn), "the warm-up write")
+        .await
+        .is_ok());
+    nas.goes_away();
+    let _ = finish(spawn_write(&conn), "the stranded write").await;
+
+    let sent_to_the_corpse = nas.generation(0).seen.lock().unwrap().len();
+    conn.reconnect_if_needed().await.expect("revival");
+    assert!(finish(spawn_write(&conn), "the retried write")
+        .await
+        .is_ok());
+
+    assert_eq!(
+        nas.generation(0).seen.lock().unwrap().len(),
+        sent_to_the_corpse,
+        "the dead generation received a frame after the connection moved on"
+    );
+    assert!(
+        !nas.generation(1).seen.lock().unwrap().is_empty(),
+        "the new generation should have received the retry"
+    );
+}
+
+/// Every scrap of the dead session is gone, not carried over.
+///
+/// Each of these has its own failure mode if it survives a revival: a stale
+/// credit window over-spends the new server's budget (the original 2026-07-31
+/// wedge), a stale message id makes the server drop the connection for a
+/// sequence gap, stale signing keys fail verification on every frame, and
+/// stale negotiated sizes chunk writes against a server that no longer exists.
+#[tokio::test]
+async fn a_revival_leaves_no_state_belonging_to_the_dead_session() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+
+    // Stage state that must not survive: signing keys, DFS trees, a message-id
+    // sequence well past zero, and a wide-open credit window.
+    let mut staged = conn.clone();
+    staged.activate_signing(
+        vec![0xAB; 16],
+        crate::crypto::signing::SigningAlgorithm::AesCmac,
+    );
+    staged.register_dfs_tree(TreeId(7));
+    assert!(finish(spawn_write(&conn), "the warm-up write")
+        .await
+        .is_ok());
+    assert!(conn.next_message_id() > 0);
+
+    nas.goes_away();
+    let _ = finish(spawn_write(&conn), "the stranded write").await;
+    conn.reconnect_if_needed().await.expect("revival");
+
+    assert_eq!(
+        conn.next_message_id(),
+        0,
+        "message ids restart with the session; a gap makes the server drop us"
+    );
+    assert_eq!(
+        conn.session_id(),
+        SessionId(0xBEEF),
+        "the session id must be the new session's, not the dead one's"
+    );
+    assert!(
+        conn.params().is_none(),
+        "negotiated sizes belong to the server we were talking to, not this one"
+    );
+    let d = conn.diagnostics();
+    assert!(
+        !d.signing.active,
+        "signing keys derived from a dead session verify nothing"
+    );
+    assert!(!d.disconnected);
+}
+
+/// A revived connection is fully plumbed, not just re-socketed.
+///
+/// The trap: the keepalive and the stale-request sweeper both exit for good
+/// when the connection is marked dead. A revival that only swapped the
+/// transport would come back with no liveness detection at all — and it would
+/// come back *silently*, so the next wedge would look exactly like the one
+/// this whole effort started with.
+#[tokio::test]
+async fn a_revived_connection_can_still_detect_the_next_death() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+
+    assert!(finish(spawn_write(&conn), "the warm-up write")
+        .await
+        .is_ok());
+    nas.goes_away();
+    let _ = finish(spawn_write(&conn), "the stranded write").await;
+    conn.reconnect_if_needed().await.expect("revival");
+    assert!(finish(spawn_write(&conn), "the retried write")
+        .await
+        .is_ok());
+
+    let probes_before = conn.metrics().keepalive_probes_sent;
+    nas.goes_away(); // the second generation dies too
+    let stranded_again = finish(spawn_write(&conn), "the second stranded write").await;
+
+    assert!(
+        matches!(stranded_again, Err(Error::ServerUnresponsive { .. })),
+        "the revived connection must still be able to notice a dead server, got \
+         {stranded_again:?}"
+    );
+    assert!(
+        conn.metrics().keepalive_probes_sent > probes_before,
+        "the keepalive did not come back with the connection"
+    );
+}
+
+// ── The bounds ─────────────────────────────────────────────────────────────
+
+/// A reconnect that cannot work gives up, inside its budget, with a typed
+/// error.
+///
+/// ❌ The one thing this must never do is keep trying. An unbounded retry loop
+/// is the infinite hang this entire effort exists to delete, wearing a
+/// different costume.
+#[tokio::test]
+async fn a_reconnect_that_cannot_work_gives_up_rather_than_retrying_forever() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+    let events = watch_events(&conn);
+    nas.dials_that_fail.store(usize::MAX, Ordering::Relaxed);
+
+    nas.goes_away();
+    let _ = finish(spawn_write(&conn), "the stranded write").await;
+
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("the revival hung, which is the bug this whole effort is about");
+    let took = started.elapsed();
+
+    assert!(
+        matches!(
+            outcome,
+            Err(Error::ReconnectFailed {
+                attempts: 3,
+                cause: crate::ErrorKind::ConnectionLost,
+                ..
+            })
+        ),
+        "expected a typed give-up naming the attempt count, got {outcome:?}"
+    );
+    assert!(
+        took < test_policy().total_budget,
+        "the attempts should have run out before the budget did; took {took:?}"
+    );
+    assert_eq!(nas.dial_count(), 3, "exactly max_attempts dials");
+    assert_eq!(conn.metrics().reconnects_failed, 1);
+    assert!(
+        conn.is_disconnected(),
+        "a connection whose revival failed must be unambiguously dead, never \
+         half-alive: a caller that thinks it is usable will send unauthenticated \
+         frames at it"
+    );
+    let events = events.lock().unwrap().clone();
+    assert!(
+        matches!(
+            events.last(),
+            Some(ReconnectEvent::Failed { attempts: 3, .. })
+        ),
+        "got {events:?}"
+    );
+}
+
+/// A reviver that never returns is ended by the budget.
+///
+/// The attempt counter cannot save us here — one attempt that parks forever
+/// never reaches the second. Only a wall-clock ceiling over the whole revival
+/// can, which is why the bound sits outside the attempt loop rather than
+/// inside it.
+#[tokio::test]
+async fn a_reviver_that_parks_forever_is_cut_off_by_the_wall_clock_budget() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+    nas.dial_hangs.store(true, Ordering::Relaxed);
+
+    nas.goes_away();
+    let _ = finish(spawn_write(&conn), "the stranded write").await;
+
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("a dial that parks forever must not park the caller forever");
+    let took = started.elapsed();
+
+    assert!(
+        matches!(outcome, Err(Error::ReconnectFailed { .. })),
+        "expected the budget to end it with a typed error, got {outcome:?}"
+    );
+    assert!(
+        took >= test_policy().total_budget,
+        "it gave up before the budget was spent; took {took:?}"
+    );
+    assert!(
+        took < test_policy().total_budget * 2,
+        "the budget is not bounding anything if it overshoots this far: {took:?}"
+    );
+    assert!(conn.is_disconnected());
+}
+
+/// A whole pipeline discovers the same dead session at once. It dials once.
+///
+/// Thirty-two concurrent revivals would be 32 sockets, 32 authentications, and
+/// 31 of them immediately thrown away — against a server that has just proven
+/// it is struggling.
+#[tokio::test]
+async fn a_pipeline_that_all_notices_the_same_death_dials_once() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+
+    assert!(finish(spawn_write(&conn), "the warm-up write")
+        .await
+        .is_ok());
+    nas.goes_away();
+
+    let stranded: Vec<_> = (0..32).map(|_| spawn_write(&conn)).collect();
+    for (i, task) in stranded.into_iter().enumerate() {
+        let outcome = finish(task, "a stranded write").await;
+        assert!(outcome.is_err(), "write {i} should have failed");
+    }
+
+    let revivals: Vec<_> = (0..32)
+        .map(|_| {
+            let c = conn.clone();
+            tokio::spawn(async move { c.reconnect_if_needed().await })
+        })
+        .collect();
+    for (i, task) in revivals.into_iter().enumerate() {
+        finish(task, "a revival")
+            .await
+            .unwrap_or_else(|e| panic!("caller {i} should see the shared success, got {e:?}"));
+    }
+
+    assert_eq!(nas.dial_count(), 1, "one death, one dial");
+    assert_eq!(conn.metrics().reconnects_succeeded, 1);
+}
+
+/// A failed revival's verdict stands for a cooldown, so a deep pipeline does
+/// not pay the full budget once per caller.
+///
+/// Thirty-two callers × a 60 s budget is half an hour of a frozen transfer.
+/// The bound has to hold for the pipeline, not just for one caller.
+#[tokio::test]
+async fn a_failed_revival_is_not_re_attempted_by_every_caller_in_turn() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+    nas.dials_that_fail.store(usize::MAX, Ordering::Relaxed);
+
+    nas.goes_away();
+    let _ = finish(spawn_write(&conn), "the stranded write").await;
+
+    let first = tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("the first revival hung");
+    assert!(matches!(first, Err(Error::ReconnectFailed { .. })));
+    let dials_after_first = nas.dial_count();
+
+    let started = Instant::now();
+    for i in 0..32 {
+        let outcome = tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+            .await
+            .unwrap_or_else(|_| panic!("caller {i} hung"));
+        assert!(
+            matches!(outcome, Err(Error::ReconnectFailed { .. })),
+            "caller {i} should get the standing verdict, got {outcome:?}"
+        );
+    }
+    assert_eq!(
+        nas.dial_count(),
+        dials_after_first,
+        "the cooldown should have answered from the stored verdict, not redialed"
+    );
+    assert!(
+        started.elapsed() < test_policy().total_budget,
+        "32 callers took {:?}; the whole point is that they don't each pay the budget",
+        started.elapsed()
+    );
+}
+
+/// Once the cooldown lapses, a caller may try again — a NAS finishing a reboot
+/// has to be reachable eventually.
+#[tokio::test]
+async fn the_cooldown_lapses_so_a_server_that_comes_back_late_is_still_found() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+    nas.dials_that_fail.store(usize::MAX, Ordering::Relaxed);
+
+    nas.goes_away();
+    let _ = finish(spawn_write(&conn), "the stranded write").await;
+    assert!(matches!(
+        tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+            .await
+            .expect("hung"),
+        Err(Error::ReconnectFailed { .. })
+    ));
+
+    // The NAS finishes booting.
+    nas.dials_that_fail.store(0, Ordering::Relaxed);
+    tokio::time::sleep(test_policy().failure_cooldown + Duration::from_millis(50)).await;
+
+    tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("hung")
+        .expect("the server is back; the cooldown must not latch the connection dead");
+    assert!(finish(spawn_write(&conn), "the write").await.is_ok());
+}
+
+/// A socket that comes up but refuses the credentials is a failure, not a
+/// half-open session.
+///
+/// The dangerous shape: the transport is installed and live, so the connection
+/// looks usable, but no session was ever established. A caller that believes
+/// it would send unauthenticated frames until the server closed the door.
+#[tokio::test]
+async fn a_dial_that_succeeds_but_cannot_authenticate_leaves_the_connection_dead() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+    nas.auth_fails.store(true, Ordering::Relaxed);
+
+    nas.goes_away();
+    let _ = finish(spawn_write(&conn), "the stranded write").await;
+
+    let outcome = tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("hung");
+    assert!(
+        matches!(
+            outcome,
+            Err(Error::ReconnectFailed {
+                cause: crate::ErrorKind::AuthRequired,
+                ..
+            })
+        ),
+        "the cause has to survive so a consumer can ask for a password rather \
+         than retry a network it never lost, got {outcome:?}"
+    );
+    assert!(
+        conn.is_disconnected(),
+        "an unauthenticated connection must not look usable"
+    );
+    let afterwards = tokio::time::timeout(
+        TEST_BUDGET,
+        conn.execute(Command::Write, &a_write(), Some(TreeId(1))),
+    )
+    .await
+    .expect("a request on a connection with no session must fail, not park");
+    assert!(matches!(afterwards, Err(Error::Disconnected)));
+}
+
+/// With no reviver installed, a dead connection stays dead and says so
+/// plainly. Auto-reconnect is opt-in; nothing dials on a consumer's behalf
+/// without an address and credentials it chose to hand over.
+#[tokio::test]
+async fn a_connection_with_no_reviver_reports_the_disconnect_rather_than_dialing() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect(&nas.current());
+    conn.set_response_timeout(Some(Duration::from_secs(30)));
+
+    nas.goes_away();
+    let _ = finish(spawn_write(&conn), "the stranded write").await;
+
+    assert!(!conn.can_reconnect());
+    let outcome = tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("hung");
+    assert!(
+        matches!(outcome, Err(Error::Disconnected)),
+        "got {outcome:?}"
+    );
+    assert_eq!(nas.dial_count(), 0, "nothing was dialed");
+}
+
+/// Asking a healthy connection to reconnect is free and does nothing.
+#[tokio::test]
+async fn reconnecting_a_connection_that_never_died_is_a_no_op() {
+    let nas = BouncingNas::new(Answer::Everything);
+    let conn = connect_to(&nas);
+
+    assert!(finish(spawn_write(&conn), "the write").await.is_ok());
+    conn.reconnect_if_needed().await.expect("nothing to do");
+
+    assert_eq!(nas.dial_count(), 0);
+    assert_eq!(conn.metrics().reconnects_succeeded, 0);
+    assert_eq!(conn.generation(), 0);
 }

@@ -48,6 +48,31 @@ pub enum Error {
     #[error("Disconnected from server")]
     Disconnected,
 
+    /// Bringing a dead connection back on a fresh socket did not work.
+    ///
+    /// Every attempt failed, or the whole revival ran past
+    /// [`ReconnectPolicy::total_budget`](crate::client::connection::ReconnectPolicy::total_budget),
+    /// or a revival failed recently enough that its verdict still stands (see
+    /// [`ReconnectPolicy::failure_cooldown`](crate::client::connection::ReconnectPolicy::failure_cooldown)).
+    ///
+    /// The connection is dead and stays dead. Branch on `cause` to tell "the
+    /// credentials are wrong now, ask the user" from "the network is down, try
+    /// again later"; `reason` is display text for a human and ❌ must never be
+    /// matched on. Classifies as [`ErrorKind::ConnectionLost`] and reports as
+    /// retryable — the *connection* is finished, but the work usually is not,
+    /// and re-running the file on a fresh client is the intended response.
+    #[error("could not reconnect after {attempts} attempt(s) over {waited:?}: {reason}")]
+    ReconnectFailed {
+        /// Dials made before giving up.
+        attempts: u32,
+        /// Wall clock spent trying.
+        waited: std::time::Duration,
+        /// What the last attempt failed with, as a typed classification.
+        cause: ErrorKind,
+        /// The last failure rendered for a human. Display only.
+        reason: String,
+    },
+
     /// The path requires DFS referral resolution.
     ///
     /// The server returned `STATUS_PATH_NOT_COVERED`, meaning this path
@@ -202,6 +227,7 @@ impl Error {
                 | Error::CreditStarvation { .. }
                 | Error::SendTimeout { .. }
                 | Error::ServerUnresponsive { .. }
+                | Error::ReconnectFailed { .. }
                 | Error::Protocol {
                     status: NtStatus::INSUFFICIENT_RESOURCES,
                     ..
@@ -358,6 +384,10 @@ impl Error {
             // useful response, so it classifies with `Disconnected` rather
             // than with the per-request timeouts.
             Error::ServerUnresponsive { .. } => ErrorKind::ConnectionLost,
+            // Deliberately NOT `cause`: the caller asked about the connection,
+            // and the answer is that it is gone. The cause is there for a
+            // consumer that wants to explain why.
+            Error::ReconnectFailed { .. } => ErrorKind::ConnectionLost,
             Error::Protocol { status, .. } => classify_status(*status),
         }
     }

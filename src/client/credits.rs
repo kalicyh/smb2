@@ -18,6 +18,7 @@
 //! the same "plenty available" number and pile on.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{AcquireError, Semaphore};
@@ -48,7 +49,13 @@ pub(crate) const DEFAULT_CREDIT_WAIT: Duration = Duration::from_secs(30);
 /// the caller (see `Inner::reserve_credits`), so a server that stops granting
 /// produces an error rather than a wait that never ends.
 pub(crate) struct CreditPool {
-    permits: Semaphore,
+    /// The live budget. Behind a `Mutex<Arc<..>>` rather than owned outright
+    /// because a closed `Semaphore` can never reopen (tokio makes closing
+    /// terminal), and a connection revived in place needs a budget again.
+    /// [`reset`](Self::reset) swaps in a fresh one; whoever still holds the old
+    /// `Arc` is parked on a generation that is never coming back and sees
+    /// `Err` from the close that killed it.
+    permits: Mutex<Arc<Semaphore>>,
     /// The reserve deadline in milliseconds, tunable per connection.
     wait_ms: AtomicU64,
 }
@@ -58,28 +65,45 @@ impl CreditPool {
     /// (MS-SMB2 § 3.2.5.1.1) — enough to send NEGOTIATE and nothing else.
     pub(crate) fn new() -> Self {
         Self {
-            permits: Semaphore::new(1),
+            permits: Mutex::new(Arc::new(Semaphore::new(1))),
             wait_ms: AtomicU64::new(DEFAULT_CREDIT_WAIT.as_millis() as u64),
         }
+    }
+
+    /// The budget as of right now.
+    fn current(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.permits.lock().unwrap())
+    }
+
+    /// Throw the spent budget away and start again from the pre-NEGOTIATE
+    /// single credit.
+    ///
+    /// Called when a connection is revived on a new transport. ❌ Don't reuse
+    /// the old budget: its permits were granted by a session that no longer
+    /// exists, and the new server may have a much smaller window. Carrying
+    /// them over would let the first burst after a reconnect out-spend the
+    /// server exactly the way the original wedge did.
+    pub(crate) fn reset(&self) {
+        *self.permits.lock().unwrap() = Arc::new(Semaphore::new(1));
     }
 
     /// Credits on hand: granted by the server and not reserved by a request.
     ///
     /// Saturates at `u16::MAX`; no server grants a window that wide.
     pub(crate) fn available(&self) -> u16 {
-        self.permits.available_permits().min(u16::MAX as usize) as u16
+        self.current().available_permits().min(u16::MAX as usize) as u16
     }
 
     /// Bank the `CreditResponse` from a response header.
     pub(crate) fn grant(&self, credits: u16) {
         if credits > 0 {
-            self.permits.add_permits(credits as usize);
+            self.current().add_permits(credits as usize);
         }
     }
 
     /// Take `charge` credits if they are on hand right now.
     pub(crate) fn try_reserve(&self, charge: u16) -> bool {
-        match self.permits.try_acquire_many(u32::from(charge)) {
+        match self.current().try_acquire_many(u32::from(charge)) {
             Ok(permit) => {
                 permit.forget();
                 true
@@ -93,8 +117,15 @@ impl CreditPool {
     ///
     /// Fair: waiters are served in order, so a large request can't be starved
     /// by a stream of small ones behind it.
+    ///
+    /// Binds to the budget as it is when the wait starts, so a reset mid-wait
+    /// resolves the waiter with `Err` (the pool it was queued on was closed)
+    /// rather than silently migrating it onto the new session's budget.
     pub(crate) async fn reserve(&self, charge: u16) -> Result<(), AcquireError> {
-        self.permits.acquire_many(u32::from(charge)).await?.forget();
+        self.current()
+            .acquire_many_owned(u32::from(charge))
+            .await?
+            .forget();
         Ok(())
     }
 
@@ -129,24 +160,25 @@ impl CreditPool {
     /// task parked on credits fails immediately instead of waiting out the
     /// full deadline for a server that will never answer again.
     pub(crate) fn close(&self) {
-        self.permits.close();
+        self.current().close();
     }
 
     /// Whether [`close`](Self::close) has been called.
     pub(crate) fn is_closed(&self) -> bool {
-        self.permits.is_closed()
+        self.current().is_closed()
     }
 
     /// Force the pool to exactly `credits`, for tests that need to stage a
     /// specific window without a full negotiate exchange.
     #[cfg(test)]
     pub(crate) fn set_available(&self, credits: u16) {
-        let have = self.permits.available_permits();
+        let permits = self.current();
+        let have = permits.available_permits();
         let want = usize::from(credits);
         match want.cmp(&have) {
-            std::cmp::Ordering::Greater => self.permits.add_permits(want - have),
+            std::cmp::Ordering::Greater => permits.add_permits(want - have),
             std::cmp::Ordering::Less => {
-                if let Ok(permit) = self.permits.try_acquire_many((have - want) as u32) {
+                if let Ok(permit) = permits.try_acquire_many((have - want) as u32) {
                     permit.forget();
                 }
             }
@@ -286,5 +318,56 @@ mod tests {
         pool.close();
         assert!(waiting.await.is_err());
         assert!(pool.is_closed());
+    }
+
+    #[tokio::test]
+    async fn a_reset_pool_starts_from_one_credit_again_and_is_no_longer_closed() {
+        let pool = CreditPool::new();
+        pool.set_available(400);
+        pool.close();
+        assert!(pool.is_closed());
+
+        pool.reset();
+
+        assert!(
+            !pool.is_closed(),
+            "a revived connection needs a live budget"
+        );
+        assert_eq!(
+            pool.available(),
+            1,
+            "credits granted by a dead session must not carry over -- the new \
+             server's window may be far smaller"
+        );
+        assert!(pool.try_reserve(1));
+    }
+
+    #[tokio::test]
+    async fn a_waiter_on_the_old_budget_is_failed_by_the_reset_rather_than_migrated() {
+        let pool = CreditPool::new();
+        pool.set_available(0);
+
+        let waiting = pool.reserve(4);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "nothing to reserve yet"
+        );
+
+        // Teardown, then revival. The waiter belongs to the dead generation.
+        pool.close();
+        pool.reset();
+        pool.grant(64);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), waiting)
+                .await
+                .expect("the waiter must resolve, not hang")
+                .is_err(),
+            "a send queued against the old session must fail rather than \
+             silently continue on the new one"
+        );
     }
 }
