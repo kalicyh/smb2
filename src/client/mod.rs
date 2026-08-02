@@ -72,13 +72,25 @@ pub struct ClientConfig {
     pub password: String,
     /// Domain (empty for local).
     pub domain: String,
-    /// Whether to automatically reconnect on connection loss.
+    /// Bring the connection back by itself when the session dies.
     ///
-    /// When `true`, the client will attempt to reconnect with exponential
-    /// backoff when a connection loss is detected. The actual auto-reconnect
-    /// logic (retry with backoff, re-issue failed operations) will be
-    /// implemented alongside the concurrent pipeline. For now this flag
-    /// is stored so the API is ready.
+    /// With this on, [`SmbClient::connect`] arms the connection with a
+    /// [`SessionReviver`] built from this config, so a dead session (a NAS
+    /// rebooting, a Wi-Fi roam with no TCP reset, a share going briefly
+    /// offline) is re-dialed, re-negotiated, and re-authenticated in place
+    /// under every `Connection` clone the consumer is holding. Bounds live in
+    /// [`ReconnectPolicy`]; nothing here can retry forever.
+    ///
+    /// **What it does NOT do is re-issue arbitrary work.** Only operations
+    /// whose retry cannot change what the caller asked for are replayed
+    /// (directory listings, reads, `stat`, `fs_info`). A `delete`, `rename`,
+    /// or `create` that died in flight may already have taken effect on the
+    /// server, so it surfaces the error and lets the caller decide — hiding
+    /// that would be the library guessing about the user's data.
+    ///
+    /// **Security note:** the reviver keeps a copy of
+    /// [`password`](Self::password) for the life of the client, for the same
+    /// reason this struct does.
     pub auto_reconnect: bool,
     /// Enable LZ4 compression for SMB 3.1.1 connections.
     /// When enabled, messages are compressed if it reduces their size.
@@ -104,6 +116,65 @@ pub struct ClientConfig {
     pub dfs_target_overrides: std::collections::HashMap<String, String>,
 }
 
+/// Dials and re-authenticates on a consumer's behalf when a session dies.
+///
+/// Holds a snapshot of the client's config rather than a back-reference to the
+/// [`SmbClient`], so a revival can run from any `Connection` clone (a
+/// `FileWriter` deep in a transfer, a `Watcher` on its own task) without
+/// reaching back through a client nobody has a handle to.
+///
+/// **Security note:** it keeps the password for the life of the client, which
+/// is the same trade [`SmbClient`] already makes to reconnect without
+/// re-prompting.
+struct ClientReviver {
+    addr: String,
+    timeout: Duration,
+    compression: bool,
+    username: String,
+    password: String,
+    domain: String,
+}
+
+impl ClientReviver {
+    fn from_config(config: &ClientConfig) -> Self {
+        Self {
+            addr: config.addr.clone(),
+            timeout: config.timeout,
+            compression: config.compression,
+            username: config.username.clone(),
+            password: config.password.clone(),
+            domain: config.domain.clone(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl connection::SessionReviver for ClientReviver {
+    async fn dial(
+        &self,
+    ) -> Result<(
+        Box<dyn crate::transport::TransportSend>,
+        Box<dyn crate::transport::TransportReceive>,
+    )> {
+        let transport = std::sync::Arc::new(
+            crate::transport::TcpTransport::connect(&self.addr, self.timeout).await?,
+        );
+        Ok((
+            Box::new(std::sync::Arc::clone(&transport)),
+            Box::new(transport),
+        ))
+    }
+
+    async fn reauthenticate(&self, conn: &mut Connection) -> Result<()> {
+        conn.set_compression_requested(self.compression);
+        conn.negotiate().await?;
+        // `Session::setup` publishes the new session onto the connection, so
+        // an `SmbClient` that has one cached picks the new keys up.
+        Session::setup(conn, &self.username, &self.password, &self.domain).await?;
+        Ok(())
+    }
+}
+
 /// A connection to a specific server with its authenticated session.
 ///
 /// Used for DFS cross-server referrals where the client needs connections
@@ -127,7 +198,10 @@ pub(crate) struct ConnectionEntry {
 pub struct SmbClient {
     config: ClientConfig,
     conn: Connection,
-    session: Session,
+    /// The session as of the last authentication. Behind an `Arc` because a
+    /// revival can establish a new one behind this client's back; every
+    /// `&mut self` path that reads the session keys refreshes it first.
+    session: std::sync::Arc<Session>,
     /// Server name of the primary connection (from `conn.server_name()`).
     primary_server: String,
     /// Extra connections for DFS cross-server targets, keyed by server name.
@@ -165,11 +239,16 @@ impl SmbClient {
         );
 
         let primary_server = config.addr.clone();
+        if config.auto_reconnect {
+            conn.set_reviver(Some(std::sync::Arc::new(ClientReviver::from_config(
+                &config,
+            ))));
+        }
 
         Ok(SmbClient {
             config,
             conn,
-            session,
+            session: std::sync::Arc::new(session),
             primary_server,
             extra_connections: HashMap::new(),
             dfs_resolver: DfsResolver::new(),
@@ -184,11 +263,30 @@ impl SmbClient {
         SmbClient {
             config,
             conn,
-            session,
+            session: std::sync::Arc::new(session),
             primary_server,
             extra_connections: HashMap::new(),
             dfs_resolver: DfsResolver::new(),
             reconnects: AtomicU64::new(0),
+        }
+    }
+
+    /// Adopt a session established on the connection behind this client's
+    /// back, which is what a revival does.
+    ///
+    /// ❌ Skipping this is not cosmetic: [`connect_share`](Self::connect_share)
+    /// activates share encryption from these keys, and the previous session's
+    /// keys decrypt nothing — every frame afterwards fails.
+    fn refresh_session(&mut self) {
+        if let Some(current) = self.conn.current_session() {
+            if current.session_id != self.session.session_id {
+                debug!(
+                    "smb_client: adopting session {} established by a reconnect \
+                     (was {})",
+                    current.session_id, self.session.session_id
+                );
+                self.session = current;
+            }
         }
     }
 
@@ -207,6 +305,7 @@ impl SmbClient {
     /// and encryption is not already active, encryption is activated
     /// using the session's keys.
     pub async fn connect_share(&mut self, share_name: &str) -> Result<Tree> {
+        self.refresh_session();
         let mut tree = Tree::connect(&mut self.conn, share_name).await?;
         tree.server = self.primary_server.clone();
 
@@ -230,40 +329,40 @@ impl SmbClient {
         Ok(tree)
     }
 
-    /// Manually reconnect after a connection loss.
+    /// Reconnect now, whether or not the connection has noticed it is dead.
     ///
-    /// Re-does TCP connect, negotiate, and session setup using the stored
-    /// credentials. All previous tree connections and file handles are
-    /// invalidated. The caller must re-do [`SmbClient::connect_share`] for
-    /// any shares they need.
+    /// Dials a fresh socket, renegotiates, and re-authenticates with the
+    /// stored credentials, **in place under the existing connection**: every
+    /// `Connection` clone the consumer is holding (a `FileWriter` mid-upload,
+    /// a `Watcher`, a pipelined task) stays usable. All previous tree
+    /// connections and file handles are invalidated regardless — they belong
+    /// to a session that no longer exists — so the caller must re-do
+    /// [`connect_share`](Self::connect_share) for any shares it still needs.
+    ///
+    /// Bounded by [`ReconnectPolicy`](crate::ReconnectPolicy); on failure the
+    /// connection is left unambiguously dead and the error is
+    /// [`Error::ReconnectFailed`].
     pub async fn reconnect(&mut self) -> Result<()> {
         info!("smb_client: reconnecting to {}", self.config.addr);
-
-        let conn = Connection::connect(&self.config.addr, self.config.timeout).await?;
-        self.reconnect_with(conn).await
-    }
-
-    /// Reconnect using an already-established connection.
-    ///
-    /// Negotiates and authenticates on the given connection using stored
-    /// credentials. This is the core reconnection logic, separated from
-    /// TCP connect so it can be tested with mock transports.
-    async fn reconnect_with(&mut self, mut conn: Connection) -> Result<()> {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
-        conn.set_compression_requested(self.config.compression);
-        conn.negotiate().await?;
 
-        let session = Session::setup(
-            &mut conn,
-            &self.config.username,
-            &self.config.password,
-            &self.config.domain,
-        )
-        .await?;
+        // An explicit reconnect works even when `auto_reconnect` is off: the
+        // caller is asking for exactly this, and everything needed to do it is
+        // already in the config.
+        if !self.conn.can_reconnect() {
+            self.conn
+                .set_reviver(Some(std::sync::Arc::new(ClientReviver::from_config(
+                    &self.config,
+                ))));
+        }
+        // Say so first: `reconnect_if_needed` is a no-op on a connection that
+        // still looks alive, and a caller reaching for this has decided
+        // otherwise.
+        self.conn.mark_dead();
+        self.conn.reconnect_if_needed().await?;
+        self.refresh_session();
 
         self.primary_server = self.config.addr.clone();
-        self.conn = conn;
-        self.session = session;
         self.extra_connections.clear();
 
         info!(
@@ -271,6 +370,23 @@ impl SmbClient {
             self.session.session_id
         );
         Ok(())
+    }
+
+    /// Whether the connection is currently torn down.
+    pub fn is_disconnected(&self) -> bool {
+        self.conn.is_disconnected()
+    }
+
+    /// Be told about every reconnect as it happens. See
+    /// [`Connection::on_reconnect`].
+    pub fn on_reconnect(&self, observer: Option<connection::ReconnectObserver>) {
+        self.conn.on_reconnect(observer);
+    }
+
+    /// Replace the bounds on an automatic reconnect. See
+    /// [`ReconnectPolicy`](crate::ReconnectPolicy).
+    pub fn set_reconnect_policy(&self, policy: connection::ReconnectPolicy) {
+        self.conn.set_reconnect_policy(policy);
     }
 
     /// Get the negotiated parameters, or `None` before NEGOTIATE has run.
@@ -516,6 +632,40 @@ impl SmbClient {
         self.config.dfs_enabled && err.kind() == ErrorKind::DfsReferral
     }
 
+    /// Whether this failure means "the session is gone" and auto-reconnect is
+    /// armed to do something about it.
+    ///
+    /// Deliberately narrow. [`Error::CreditStarvation`] and
+    /// [`Error::SendTimeout`] also smell like a dead link, but neither proves
+    /// the session died, and re-running an operation against a connection
+    /// that is merely struggling buys a duplicate request rather than a
+    /// recovery. These two are the ones that mean it.
+    fn session_is_gone(&self, err: &Error) -> bool {
+        self.config.auto_reconnect
+            && self.conn.can_reconnect()
+            && matches!(err, Error::Disconnected | Error::ServerUnresponsive { .. })
+    }
+
+    /// Bring the connection back and re-establish `tree` on the new session.
+    ///
+    /// Only for trees on the primary connection: a DFS extra connection has
+    /// its own socket and its own session, and reviving the primary says
+    /// nothing about it.
+    async fn recover_tree(&mut self, tree: &mut Tree) -> Result<()> {
+        if tree.server != self.primary_server {
+            return Err(Error::Disconnected);
+        }
+        self.conn.reconnect_if_needed().await?;
+        self.refresh_session();
+        let share = tree.share_name.clone();
+        let fresh = self.connect_share(&share).await?;
+        // In place, exactly as the DFS redirect does: the caller keeps using
+        // the `&mut Tree` it passed in, now pointing at the new session's
+        // tree id.
+        *tree = fresh;
+        Ok(())
+    }
+
     // ── Convenience methods that delegate to Tree ──────────────────────
 
     /// List files in a directory on the given share.
@@ -539,6 +689,11 @@ impl SmbClient {
                 let conn = self.connection_for_tree(tree);
                 tree.list_directory(conn, &new_path).await
             }
+            Err(e) if self.session_is_gone(&e) => {
+                self.recover_tree(tree).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.list_directory(conn, path).await
+            }
             other => other,
         }
     }
@@ -554,6 +709,11 @@ impl SmbClient {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.read_file(conn, &new_path).await
+            }
+            Err(e) if self.session_is_gone(&e) => {
+                self.recover_tree(tree).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.read_file(conn, path).await
             }
             other => other,
         }
@@ -575,6 +735,11 @@ impl SmbClient {
                 let conn = self.connection_for_tree(tree);
                 tree.read_file_compound(conn, &new_path).await
             }
+            Err(e) if self.session_is_gone(&e) => {
+                self.recover_tree(tree).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.read_file_compound(conn, path).await
+            }
             other => other,
         }
     }
@@ -590,6 +755,11 @@ impl SmbClient {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.read_file_pipelined(conn, &new_path).await
+            }
+            Err(e) if self.session_is_gone(&e) => {
+                self.recover_tree(tree).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.read_file_pipelined(conn, path).await
             }
             other => other,
         }
@@ -675,6 +845,11 @@ impl SmbClient {
                 let conn = self.connection_for_tree(tree);
                 tree.fs_info(conn).await
             }
+            Err(e) if self.session_is_gone(&e) => {
+                self.recover_tree(tree).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.fs_info(conn).await
+            }
             other => other,
         }
     }
@@ -719,6 +894,11 @@ impl SmbClient {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.stat(conn, &new_path).await
+            }
+            Err(e) if self.session_is_gone(&e) => {
+                self.recover_tree(tree).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.stat(conn, path).await
             }
             other => other,
         }
@@ -1419,58 +1599,267 @@ mod tests {
         assert_eq!(tree.share_name, "TestShare");
     }
 
+    /// A reviver that answers each dial with a fresh mock transport, already
+    /// loaded with a negotiate + session-setup conversation. Exercises the real
+    /// `negotiate` and `Session::setup` paths, unlike the scripted-server
+    /// double in `fault_injection_tests`, which is deliberately about the
+    /// revival machinery rather than the protocol.
+    struct MockReviver {
+        session_id: SessionId,
+        dialed: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockReviver {
+        fn new(session_id: SessionId) -> Self {
+            Self {
+                session_id,
+                dialed: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl connection::SessionReviver for MockReviver {
+        async fn dial(
+            &self,
+        ) -> Result<(
+            Box<dyn crate::transport::TransportSend>,
+            Box<dyn crate::transport::TransportReceive>,
+        )> {
+            self.dialed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mock = Arc::new(MockTransport::new());
+            mock.enable_auto_rewrite_msg_id();
+            queue_negotiate_and_session(&mock, self.session_id);
+            Ok((Box::new(mock.clone()), Box::new(mock)))
+        }
+
+        async fn reauthenticate(&self, conn: &mut Connection) -> Result<()> {
+            conn.negotiate().await?;
+            Session::setup(conn, "user", "pass", "").await?;
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn smb_client_reconnect_creates_new_session() {
         let mock = Arc::new(MockTransport::new());
         let original_session_id = SessionId(0x1111);
         let mut client = make_mock_client(&mock, original_session_id).await;
-
-        // Verify original session.
         assert_eq!(client.session().session_id, original_session_id);
 
-        // Create a new mock for the "reconnected" transport.
-        let mock2 = Arc::new(MockTransport::new());
-        mock2.enable_auto_rewrite_msg_id();
-        let new_session_id = SessionId(0x2222);
-        queue_negotiate_and_session(mock2.as_ref(), new_session_id);
+        let reviver = Arc::new(MockReviver::new(SessionId(0x2222)));
+        client.conn.set_reviver(Some(reviver.clone()));
+        client.reconnect().await.unwrap();
 
-        let new_conn = Connection::from_transport(
-            Box::new(mock2.clone()),
-            Box::new(mock2.clone()),
-            "test-server",
+        assert_eq!(
+            client.session().session_id,
+            SessionId(0x2222),
+            "the client must adopt the session the revival established, not \
+             keep signing with the dead one's keys"
         );
+        assert_eq!(reviver.dialed.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
 
-        client.reconnect_with(new_conn).await.unwrap();
+    /// The reason reconnect happens in place: a `Connection` clone taken before
+    /// the reconnect keeps working afterwards.
+    ///
+    /// Consumers hand these clones out everywhere — a `FileWriter` mid-upload,
+    /// a `Watcher`, every task in a pipelined transfer. If a reconnect minted a
+    /// fresh `Connection` instead, all of them would be permanently dead and
+    /// the consumer would have to rebuild the world, which is reporting the
+    /// blip rather than surviving it.
+    #[tokio::test]
+    async fn a_connection_clone_taken_before_a_reconnect_is_alive_after_it() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x1111)).await;
+        let held = client.conn.clone();
+        assert_eq!(held.generation(), 0);
 
-        // Session should be new.
-        assert_eq!(client.session().session_id, new_session_id);
+        client
+            .conn
+            .set_reviver(Some(Arc::new(MockReviver::new(SessionId(0x2222)))));
+        client.reconnect().await.unwrap();
+
+        assert!(
+            !held.is_disconnected(),
+            "the clone somebody was mid-transfer on must come back with the \
+             connection"
+        );
+        assert_eq!(held.generation(), 1, "and know it is on a new session");
+        assert_eq!(held.session_id(), SessionId(0x2222));
     }
 
     #[tokio::test]
-    async fn smb_client_reconnect_invalidates_old_params() {
+    async fn smb_client_reconnect_renegotiates_params() {
         let mock = Arc::new(MockTransport::new());
         let mut client = make_mock_client(&mock, SessionId(0x1111)).await;
-
-        // Get old params for comparison.
         let old_server_guid = client.params().unwrap().server_guid;
 
-        // Create a new mock for the "reconnected" transport.
-        let mock2 = Arc::new(MockTransport::new());
-        mock2.enable_auto_rewrite_msg_id();
-        queue_negotiate_and_session(mock2.as_ref(), SessionId(0x2222));
+        client
+            .conn
+            .set_reviver(Some(Arc::new(MockReviver::new(SessionId(0x2222)))));
+        client.reconnect().await.unwrap();
 
-        let new_conn = Connection::from_transport(
-            Box::new(mock2.clone()),
-            Box::new(mock2.clone()),
-            "test-server",
-        );
-
-        client.reconnect_with(new_conn).await.unwrap();
-
-        // Params should be freshly negotiated (same values in this mock,
-        // but the connection is new).
+        // Freshly negotiated. The mock answers with the same numbers, but they
+        // came from the new socket -- a rebooted server offering a smaller
+        // MaxWriteSize would be reflected here, which a `OnceLock` could not do.
         assert!(client.params().is_some());
         assert_eq!(client.params().unwrap().server_guid, old_server_guid);
+    }
+
+    /// A reviver that brings up a whole working share: negotiate, session
+    /// setup, tree connect, and one compound CREATE+READ+CLOSE ready to serve.
+    struct RevivedShare {
+        session_id: SessionId,
+        tree_id: TreeId,
+        contents: Vec<u8>,
+        dialed: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl connection::SessionReviver for RevivedShare {
+        async fn dial(
+            &self,
+        ) -> Result<(
+            Box<dyn crate::transport::TransportSend>,
+            Box<dyn crate::transport::TransportReceive>,
+        )> {
+            self.dialed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mock = Arc::new(MockTransport::new());
+            mock.enable_auto_rewrite_msg_id();
+            queue_negotiate_and_session(&mock, self.session_id);
+            mock.queue_response(crate::client::test_helpers::build_tree_connect_response(
+                self.tree_id,
+                ShareType::Disk,
+            ));
+            mock.queue_response(crate::client::test_helpers::build_compound_response_frame(
+                &[
+                    crate::client::test_helpers::build_create_response(
+                        FileId {
+                            persistent: 9,
+                            volatile: 9,
+                        },
+                        self.contents.len() as u64,
+                    ),
+                    crate::client::test_helpers::build_read_response(self.contents.clone()),
+                    crate::client::test_helpers::build_close_response(),
+                ],
+            ));
+            Ok((Box::new(mock.clone()), Box::new(mock)))
+        }
+
+        async fn reauthenticate(&self, conn: &mut Connection) -> Result<()> {
+            conn.negotiate().await?;
+            Session::setup(conn, "user", "pass", "").await?;
+            Ok(())
+        }
+    }
+
+    /// Build a client on a dead connection, armed to reconnect into
+    /// `RevivedShare`.
+    async fn client_on_a_dead_session(reviver: Arc<RevivedShare>) -> (SmbClient, Tree) {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x1111)).await;
+        mock.queue_response(crate::client::test_helpers::build_tree_connect_response(
+            TreeId(1),
+            ShareType::Disk,
+        ));
+        let tree = client.connect_share("TestShare").await.unwrap();
+
+        client.config.auto_reconnect = true;
+        client.conn.set_reviver(Some(reviver));
+        client.conn.mark_dead(); // the NAS went away
+        (client, tree)
+    }
+
+    /// What `auto_reconnect` buys at the client level: a read that lands on a
+    /// dead session comes back anyway, on a new one, with the tree re-connected
+    /// underneath the caller's `&mut Tree`.
+    #[tokio::test]
+    async fn a_read_on_a_dead_session_reconnects_and_returns_the_data() {
+        let reviver = Arc::new(RevivedShare {
+            session_id: SessionId(0x2222),
+            tree_id: TreeId(77),
+            contents: b"survived the blip".to_vec(),
+            dialed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (mut client, mut tree) = client_on_a_dead_session(reviver.clone()).await;
+
+        let data = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.read_file_compound(&mut tree, "notes.txt"),
+        )
+        .await
+        .expect("the read hung, which is the bug")
+        .expect("auto_reconnect should have recovered this read");
+
+        assert_eq!(data, b"survived the blip");
+        assert_eq!(
+            reviver.dialed.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one death, one dial"
+        );
+        assert_eq!(
+            tree.tree_id,
+            TreeId(77),
+            "the caller's tree must be re-established in place -- the old tree \
+             id belongs to a session that no longer exists"
+        );
+        assert_eq!(client.session().session_id, SessionId(0x2222));
+    }
+
+    /// The data-safety boundary: a mutating operation is NEVER replayed across
+    /// a reconnect.
+    ///
+    /// A DELETE that died in flight may already have taken effect on the
+    /// server. Re-running it after a reconnect turns "it worked" into "not
+    /// found" and, worse, could delete a file the user recreated in between.
+    /// The library has no way to tell, so it surfaces the error and lets the
+    /// caller decide.
+    #[tokio::test]
+    async fn a_mutating_operation_is_never_replayed_across_a_reconnect() {
+        let reviver = Arc::new(RevivedShare {
+            session_id: SessionId(0x2222),
+            tree_id: TreeId(77),
+            contents: Vec::new(),
+            dialed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (mut client, mut tree) = client_on_a_dead_session(reviver.clone()).await;
+
+        for (what, outcome) in [
+            ("delete", client.delete_file(&mut tree, "x.txt").await.err()),
+            ("rename", client.rename(&mut tree, "a", "b").await.err()),
+            ("mkdir", client.create_directory(&mut tree, "d").await.err()),
+            (
+                "write",
+                client.write_file(&mut tree, "x.txt", b"data").await.err(),
+            ),
+        ] {
+            assert!(
+                outcome.is_some(),
+                "{what} on a dead session must fail, not silently re-run"
+            );
+        }
+        assert_eq!(
+            reviver.dialed.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing may reconnect-and-replay an operation that could already \
+             have taken effect on the server"
+        );
+    }
+
+    /// `auto_reconnect` is what arms the connection, and it is off by default.
+    #[tokio::test]
+    async fn auto_reconnect_off_leaves_the_connection_unarmed() {
+        let mock = Arc::new(MockTransport::new());
+        let client = make_mock_client(&mock, SessionId(1)).await;
+        assert!(!client.config().auto_reconnect);
+        assert!(
+            !client.conn.can_reconnect(),
+            "nothing should dial on a consumer's behalf without being asked"
+        );
     }
 
     #[tokio::test]

@@ -39,6 +39,24 @@ pub struct Session {
 }
 
 impl Session {
+    /// A by-value copy.
+    ///
+    /// `Session` deliberately isn't `Clone`: it holds signing and encryption
+    /// keys, and a derive would make duplicating them invisible. Copying here
+    /// is explicit and has one caller — [`Connection::adopt_session`], which
+    /// keeps the current session reachable from a `Connection` alone.
+    pub(crate) fn snapshot(&self) -> Session {
+        Session {
+            session_id: self.session_id,
+            signing_key: self.signing_key.clone(),
+            encryption_key: self.encryption_key.clone(),
+            decryption_key: self.decryption_key.clone(),
+            signing_algorithm: self.signing_algorithm,
+            should_sign: self.should_sign,
+            should_encrypt: self.should_encrypt,
+        }
+    }
+
     /// Perform the multi-round-trip SESSION_SETUP exchange.
     ///
     /// Steps:
@@ -272,7 +290,7 @@ impl Session {
             session_id, should_sign, should_encrypt
         );
 
-        Ok(Session {
+        let session = Session {
             session_id,
             signing_key,
             encryption_key,
@@ -280,7 +298,12 @@ impl Session {
             signing_algorithm,
             should_sign,
             should_encrypt,
-        })
+        };
+        // Publish it on the connection so a caller holding only a `Connection`
+        // (an auto-reconnect that re-authenticated behind everyone's back, for
+        // instance) can pick up the new keys instead of using a dead session's.
+        conn.adopt_session(&session);
+        Ok(session)
     }
 
     /// Perform Kerberos-based SESSION_SETUP.
@@ -504,7 +527,7 @@ impl Session {
             session_id, should_sign, should_encrypt
         );
 
-        Ok(Session {
+        let session = Session {
             session_id,
             signing_key,
             encryption_key,
@@ -512,7 +535,12 @@ impl Session {
             signing_algorithm,
             should_sign,
             should_encrypt,
-        })
+        };
+        // Publish it on the connection so a caller holding only a `Connection`
+        // (an auto-reconnect that re-authenticated behind everyone's back, for
+        // instance) can pick up the new keys instead of using a dead session's.
+        conn.adopt_session(&session);
+        Ok(session)
     }
 }
 

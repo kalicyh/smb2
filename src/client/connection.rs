@@ -982,6 +982,14 @@ struct Inner {
     /// Called on every reconnect lifecycle event, if a consumer asked to be
     /// told. See [`Connection::on_reconnect`].
     reconnect_observer: StdMutex<Option<ReconnectObserver>>,
+    /// The session most recently established on this connection.
+    ///
+    /// Exists so a session established behind a consumer's back — by a
+    /// revival, which re-authenticates without anyone asking — is reachable.
+    /// A consumer still holding the *old* `Session` would otherwise activate
+    /// share encryption with keys the current server has never seen, and every
+    /// frame after that fails to decrypt.
+    session: StdMutex<Option<Arc<crate::client::Session>>>,
 
     /// Server name (hostname or IP) used for UNC paths. Set at construction
     /// and never mutated.
@@ -1038,6 +1046,7 @@ impl Inner {
             revivals: AtomicU64::new(0),
             last_revive_failure: StdMutex::new(None),
             reconnect_observer: StdMutex::new(None),
+            session: StdMutex::new(None),
             server_name,
             params: StdMutex::new(None),
             estimated_rtt: StdMutex::new(None),
@@ -2884,6 +2893,23 @@ impl Connection {
         self.inner.reviver.lock().unwrap().is_some()
     }
 
+    /// Record the session that has just been established here.
+    ///
+    /// Called by [`Session::setup`](crate::Session::setup); consumers should
+    /// not need it.
+    pub fn adopt_session(&self, session: &crate::client::Session) {
+        *self.inner.session.lock().unwrap() = Some(Arc::new(session.snapshot()));
+    }
+
+    /// The session currently established on this connection, or `None` before
+    /// authentication.
+    ///
+    /// ❌ Don't cache this across a possible reconnect: a revival replaces it,
+    /// and the previous session's keys decrypt nothing.
+    pub fn current_session(&self) -> Option<Arc<crate::client::Session>> {
+        self.inner.session.lock().unwrap().clone()
+    }
+
     /// Replace the bounds on a revival. See [`ReconnectPolicy`].
     pub fn set_reconnect_policy(&self, policy: ReconnectPolicy) {
         *self.inner.reconnect_policy.lock().unwrap() = policy;
@@ -3127,6 +3153,7 @@ impl Connection {
         *inner.crypto.lock().unwrap() = CryptoState::new();
         *inner.preauth_hasher.lock().unwrap() = PreauthHasher::new();
         *inner.params.lock().unwrap() = None;
+        *inner.session.lock().unwrap() = None;
         *inner.last_frame_at.lock().unwrap() = None;
         *inner.estimated_rtt.lock().unwrap() = None;
         inner.abandoned.lock().unwrap().clear();
@@ -3924,27 +3951,7 @@ mod tests {
     /// Pack a set of SMB2 sub-responses into one compound transport frame
     /// by wiring up `NextCommand` offsets and 8-byte-padding each sub
     /// except the last. Used by compound execute tests below.
-    fn build_compound_response_frame(responses: &[Vec<u8>]) -> Vec<u8> {
-        let mut padded: Vec<Vec<u8>> = Vec::new();
-        for (i, resp) in responses.iter().enumerate() {
-            let mut r = resp.clone();
-            let is_last = i == responses.len() - 1;
-            if !is_last {
-                let remainder = r.len() % 8;
-                if remainder != 0 {
-                    r.resize(r.len() + (8 - remainder), 0);
-                }
-                let next_cmd = r.len() as u32;
-                r[20..24].copy_from_slice(&next_cmd.to_le_bytes());
-            }
-            padded.push(r);
-        }
-        let mut frame = Vec::new();
-        for r in &padded {
-            frame.extend_from_slice(r);
-        }
-        frame
-    }
+    use crate::client::test_helpers::build_compound_response_frame;
 
     /// Build a canned negotiate response with the given dialect.
     fn build_negotiate_response(dialect: Dialect) -> Vec<u8> {

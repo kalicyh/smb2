@@ -5856,29 +5856,7 @@ mod tests {
     // ── Compound request tests ──────────────────────────────────────
 
     /// Build a compound response frame with proper NextCommand offsets and padding.
-    fn build_compound_response_frame(responses: &[Vec<u8>]) -> Vec<u8> {
-        let mut padded: Vec<Vec<u8>> = Vec::new();
-        for (i, resp) in responses.iter().enumerate() {
-            let mut r = resp.clone();
-            let is_last = i == responses.len() - 1;
-            if !is_last {
-                // Pad to 8-byte alignment.
-                let remainder = r.len() % 8;
-                if remainder != 0 {
-                    r.resize(r.len() + (8 - remainder), 0);
-                }
-                // Set NextCommand.
-                let next_cmd = r.len() as u32;
-                r[20..24].copy_from_slice(&next_cmd.to_le_bytes());
-            }
-            padded.push(r);
-        }
-        let mut frame = Vec::new();
-        for r in &padded {
-            frame.extend_from_slice(r);
-        }
-        frame
-    }
+    use crate::client::test_helpers::build_compound_response_frame;
 
     #[tokio::test]
     async fn read_file_compound_returns_file_data() {

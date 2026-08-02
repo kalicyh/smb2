@@ -267,3 +267,24 @@ pub(crate) fn build_tree_connect_response(tree_id: TreeId, share_type: ShareType
 
     pack_message(&h, &body)
 }
+
+/// Concatenate sub-responses into one compound transport frame, chaining them
+/// with `NextCommand` offsets the way a server does.
+pub(crate) fn build_compound_response_frame(responses: &[Vec<u8>]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    for (i, resp) in responses.iter().enumerate() {
+        let mut r = resp.clone();
+        if i != responses.len() - 1 {
+            // Every sub-response but the last is 8-byte aligned and points at
+            // the next one.
+            let remainder = r.len() % 8;
+            if remainder != 0 {
+                r.resize(r.len() + (8 - remainder), 0);
+            }
+            let next_cmd = r.len() as u32;
+            r[20..24].copy_from_slice(&next_cmd.to_le_bytes());
+        }
+        frame.extend_from_slice(&r);
+    }
+    frame
+}
