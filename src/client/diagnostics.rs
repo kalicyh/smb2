@@ -393,6 +393,36 @@ pub struct MetricsSnapshot {
     /// Non-zero means the wedge was on OUR side of the wire — the request
     /// never reached the server, so nothing about the server follows from it.
     pub send_failures: u64,
+    /// SMB2 ECHO probes the keepalive put on the wire.
+    ///
+    /// Zero on a healthy busy connection and that is correct, not a bug: the
+    /// keepalive only probes when the server has gone quiet with work
+    /// outstanding, and responses flowing are already proof of life.
+    pub keepalive_probes_sent: u64,
+    /// Probe rounds that asked the server nothing, so they are evidence of
+    /// nothing: no credit was on hand for the ECHO, or the connection was
+    /// already going down.
+    ///
+    /// A steady stream of these means the credit window is fully spent
+    /// whenever the server goes quiet, which leaves the connection without a
+    /// liveness signal — slow-but-alive operations fall back to the plain
+    /// response deadline. Skips are never counted as failures: doing so would
+    /// turn a saturated pipeline into a false death sentence.
+    pub keepalive_probes_skipped: u64,
+    /// Probes that reached the wire and were never answered. Two in a row
+    /// declare the session dead and tear the connection down with
+    /// [`Error::ServerUnresponsive`](crate::Error::ServerUnresponsive).
+    pub keepalive_failures: u64,
+    /// Requests that went past
+    /// [`Connection::set_response_timeout`](crate::client::connection::Connection::set_response_timeout)
+    /// without being abandoned, because an ECHO had just proven the server
+    /// alive.
+    ///
+    /// Each tick is a slow-but-healthy operation the deadline alone would have
+    /// killed — a large write to a loaded spinning-disk NAS is the usual one.
+    /// A rising count next to a flat `response_timeouts` is the keepalive
+    /// working exactly as intended.
+    pub response_deadline_extensions: u64,
 }
 
 /// Client-level counter snapshot. Lives on [`SmbClient`](crate::SmbClient)
@@ -516,6 +546,14 @@ fn fmt_connection_body(c: &ConnectionDiagnostics, f: &mut fmt::Formatter<'_>) ->
         f,
         "  credit waits: {} parked · {} starved · {} response timeouts · {} send failures",
         m.credit_waits, m.credit_starvations, m.response_timeouts, m.send_failures,
+    )?;
+    writeln!(
+        f,
+        "  keepalive: {} probes · {} skipped · {} unanswered · {} deadline extensions",
+        m.keepalive_probes_sent,
+        m.keepalive_probes_skipped,
+        m.keepalive_failures,
+        m.response_deadline_extensions,
     )?;
     if c.disconnected {
         writeln!(f, "  status: DISCONNECTED")?;

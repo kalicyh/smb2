@@ -150,6 +150,38 @@ pub enum Error {
         /// How long the send waited, queue time included.
         waited: std::time::Duration,
     },
+
+    /// The server stopped answering, so the session was declared dead.
+    ///
+    /// The keepalive asks an idle-looking server directly with SMB2 ECHO
+    /// (MS-SMB2 § 2.2.28), a request that touches no disk and no share. A
+    /// server that will not answer *that* is not merely busy, so the
+    /// connection is torn down and every waiter gets this instead of sitting
+    /// out its own deadline one by one.
+    ///
+    /// The distinction from the other three is what it lets you conclude:
+    ///
+    /// - [`Error::Timeout`] -- *this* request went unanswered. The connection
+    ///   may be perfectly healthy and the operation merely stuck.
+    /// - [`Error::SendTimeout`] -- the request never reached the network, so
+    ///   nothing at all follows about the server.
+    /// - [`Error::Disconnected`] -- the socket itself went away (EOF, reset).
+    /// - `ServerUnresponsive` -- the socket is up and the server is answering
+    ///   nothing at all. Reconnect; retrying on this connection can only fail.
+    ///
+    /// Classifies as [`ErrorKind::ConnectionLost`] (the same as
+    /// `Disconnected`, so existing reconnect paths pick it up unchanged) and
+    /// reports as retryable. Tune or disable the probing with
+    /// [`Connection::set_keepalive`](crate::client::connection::Connection::set_keepalive).
+    #[error(
+        "server stopped answering: silent for {silent_for:?}, {probes} ECHO probe(s) unanswered"
+    )]
+    ServerUnresponsive {
+        /// How long since the server last put any frame on the wire.
+        silent_for: std::time::Duration,
+        /// Consecutive unanswered ECHO probes that led to the verdict.
+        probes: u32,
+    },
 }
 
 impl Error {
@@ -169,6 +201,7 @@ impl Error {
                 | Error::Disconnected
                 | Error::CreditStarvation { .. }
                 | Error::SendTimeout { .. }
+                | Error::ServerUnresponsive { .. }
                 | Error::Protocol {
                     status: NtStatus::INSUFFICIENT_RESOURCES,
                     ..
@@ -320,6 +353,11 @@ impl Error {
             // wearing a live socket; consumers already reconnect on TimedOut.
             Error::CreditStarvation { .. } => ErrorKind::TimedOut,
             Error::SendTimeout { .. } => ErrorKind::TimedOut,
+            // The socket is up but nobody is home. Consumers already
+            // reconnect on `ConnectionLost`, and reconnecting is the only
+            // useful response, so it classifies with `Disconnected` rather
+            // than with the per-request timeouts.
+            Error::ServerUnresponsive { .. } => ErrorKind::ConnectionLost,
             Error::Protocol { status, .. } => classify_status(*status),
         }
     }
