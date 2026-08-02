@@ -347,8 +347,9 @@ offline) so local clippy matches CI's always-latest stable, then runs `cargo fmt
 `status_pending_loops`, `signature_failures`, `credit_waits` / `credit_starvations` / `response_timeouts`,
 `keepalive_probes_sent` / `keepalive_probes_skipped` / `keepalive_failures` / `response_deadline_extensions`,
 `reconnect_attempts` / `reconnects_succeeded` / `reconnects_failed`, etc.) and three client-level counters (`reconnects`,
-`dfs_referrals_resolved`, `dfs_cache_hits`). Eventually consistent, survives connection teardown, per-connection
-counters reset on reconnect. `OutstandingRequest::sent_age` says which side of the wire a request is on: `None` means
+`dfs_referrals_resolved`, `dfs_cache_hits`). Eventually consistent, survives connection teardown, and now survives a
+reconnect too (which revives the connection in place rather than replacing it), so the numbers describe the whole life
+of the link. `OutstandingRequest::sent_age` says which side of the wire a request is on: `None` means
 it is still queued for the transport, so the server has not been asked and nothing about the server follows from it. `Display` impl for terminal output; optional `serde` feature for JSON.
 
 Spec: [`docs/specs/diagnostics-plan.md`](docs/specs/diagnostics-plan.md). Quick smoke test:

@@ -33,13 +33,20 @@
 //! snapshot taken on a torn-down connection (`disconnected: true`) returns
 //! the final counter values at the moment of death.
 //!
-//! ## Counters reset on reconnect
+//! ## Counters carry across a reconnect
 //!
-//! [`SmbClient::reconnect`](crate::SmbClient::reconnect) builds a fresh
-//! [`Connection`](crate::client::Connection) with a fresh `Inner`, so
-//! per-connection counters return to zero. Client-level counters (the
-//! [`ClientMetricsSnapshot`] on [`Diagnostics::client`]) survive — `reconnects`
-//! is monotonic across the client's lifetime.
+//! [`SmbClient::reconnect`](crate::SmbClient::reconnect) revives the existing
+//! [`Connection`](crate::client::Connection) on a fresh socket rather than
+//! building a new one, so `Inner` — and every counter on it — survives. The
+//! numbers describe the whole life of the client's link to this server, blips
+//! included, which is also what makes
+//! [`MetricsSnapshot::reconnects_succeeded`] meaningful: a counter reset by the
+//! event it counts would always read zero.
+//!
+//! Client-level counters (the [`ClientMetricsSnapshot`] on
+//! [`Diagnostics::client`]) survive too; `reconnects` counts explicit
+//! [`SmbClient::reconnect`](crate::SmbClient::reconnect) calls, while
+//! `reconnects_succeeded` counts every revival including the automatic ones.
 //!
 //! See `docs/specs/diagnostics-plan.md` for the design rationale.
 

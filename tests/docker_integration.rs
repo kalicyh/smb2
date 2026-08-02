@@ -3652,7 +3652,7 @@ async fn diagnostics_basic_counters_against_smb_guest() {
 
 #[tokio::test]
 #[ignore]
-async fn diagnostics_reconnects_counter_survives_reconnect() {
+async fn diagnostics_counters_accumulate_across_a_reconnect() {
     let _ = env_logger::try_init();
 
     let mut client = guest_client().await;
@@ -3663,15 +3663,21 @@ async fn diagnostics_reconnects_counter_survives_reconnect() {
     let _ = client.list_directory(&mut tree, "").await;
     let before = client.diagnostics();
     assert_eq!(before.client.metrics.reconnects, 0);
+    assert_eq!(before.primary.metrics.reconnects_succeeded, 0);
 
     client.reconnect().await.expect("reconnect failed");
-    // Per-conn counters reset to a fresh `Inner` and only reflect the
-    // post-reconnect negotiate + session setup; client-level survives.
+
+    // A reconnect revives the connection in place rather than replacing it,
+    // so its counters carry on rather than starting over. That is what makes
+    // `reconnects_succeeded` meaningful at all — a counter reset by the event
+    // it counts would always read zero — and it means the numbers describe the
+    // whole life of the client's link to this server, blips included.
     let after = client.diagnostics();
     assert_eq!(after.client.metrics.reconnects, 1);
+    assert_eq!(after.primary.metrics.reconnects_succeeded, 1);
     assert!(
-        after.primary.metrics.responses_routed_ok < before.primary.metrics.responses_routed_ok,
-        "per-conn counters reset across reconnect: before {} → after {}",
+        after.primary.metrics.responses_routed_ok > before.primary.metrics.responses_routed_ok,
+        "counters should carry across an in-place revival: before {} → after {}",
         before.primary.metrics.responses_routed_ok,
         after.primary.metrics.responses_routed_ok,
     );

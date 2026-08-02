@@ -259,7 +259,7 @@ impl SmbClient {
     /// Capture a tree of diagnostics for the client, its primary and DFS-extra connections,
     /// each connection's session, and the DFS referral cache.
     ///
-    /// Per-connection counters reset on `reconnect()`. Client-level counters survive.
+    /// Counters survive `reconnect()`, which revives the connection in place.
     pub fn diagnostics(&self) -> Diagnostics;
 }
 ```
@@ -523,7 +523,7 @@ None. The snapshot is `Relaxed` atomic loads + cloned primitives. No parsing.
 - `src/client/CLAUDE.md`: M4 fixes plus a new "Diagnostics model" subsection summarising counters + lock order +
   invariants.
 - `src/client/diagnostics.rs` top-of-file doc-comment: full lock order, eventual-consistency contract, "snapshot
-  survives teardown", "counters reset across reconnect", "fields may skew".
+  survives teardown", "counters carry across reconnect", "fields may skew".
 - `CHANGELOG.md`: entry under Unreleased.
 
 ## What can be done in parallel
