@@ -2230,3 +2230,73 @@ async fn bench_100_tiny_files_seq_vs_parallel() {
     );
     println!("─────────────────────────────────────────────────────────");
 }
+
+// ── ECHO keepalive against the QNAP TS-464 ───────────────────────────
+
+/// The NAS that wedged answers the ECHO probe.
+///
+/// This is the machine from the 2026-07-31 and 2026-08-01 incidents, and the
+/// whole keepalive rests on it answering a frame that names no share and no
+/// handle. Samba behavior is covered by the Docker suite; QNAP ships its own
+/// build on its own firmware, and it is the one that went silent for 40
+/// minutes on a live socket. Worth asking directly.
+///
+/// The connection is kept quiet-but-busy with a `Watcher` on a directory of
+/// its own, which is the shape the keepalive exists for: something
+/// outstanding, nothing coming back. A neighbouring change would be a frame on
+/// the wire, which is exactly what stops the keepalive from probing.
+#[tokio::test]
+#[ignore]
+async fn nas_answers_the_echo_keepalive_probe() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_to_nas().await;
+    conn.set_keepalive(Some(Duration::from_millis(200)));
+
+    let watched = "smb2_test_echo_keepalive_watch";
+    let _ = tree.delete_directory(&mut conn, watched).await;
+    tree.create_directory(&mut conn, watched)
+        .await
+        .expect("could not create the watched directory");
+    let mut watcher = tree
+        .watch(&mut conn, watched, false)
+        .await
+        .expect("watch failed");
+    let watching = tokio::spawn(async move { watcher.next_events().await });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let m = conn.diagnostics().metrics;
+        if m.keepalive_probes_sent >= 2 && m.keepalive_probes_sent > m.keepalive_failures {
+            println!(
+                "NAS answered {} ECHO probe(s), {} unanswered, {} skipped",
+                m.keepalive_probes_sent, m.keepalive_failures, m.keepalive_probes_skipped
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the NAS never got two probes answered (sent {}, unanswered {}, skipped {}, \
+             {} request(s) outstanding)",
+            m.keepalive_probes_sent,
+            m.keepalive_failures,
+            m.keepalive_probes_skipped,
+            conn.diagnostics().outstanding.len(),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(
+        conn.diagnostics().metrics.keepalive_failures,
+        0,
+        "the NAS left an ECHO probe unanswered, which would tear a healthy connection down"
+    );
+    assert!(
+        !conn.diagnostics().disconnected,
+        "probing the NAS cost us the connection"
+    );
+
+    watching.abort();
+    let _ = tree.delete_directory(&mut conn, watched).await;
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
