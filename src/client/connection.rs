@@ -400,17 +400,16 @@ async fn keepalive_loop(weak: Weak<Inner>) {
         // without a restart. While probing is off we still wake on the default
         // interval, so turning it back on doesn't need one either.
         //
-        // A connection with nothing on the wire drops to the coarse interval:
-        // there is no work to protect, and a per-second timer on every idle
-        // connection is a cost a consumer holding several mounted shares
-        // would pay all day for nothing.
+        // ❌ Don't "save wakeups" by sleeping longer while the connection is
+        // idle. The sleep is chosen before the check, so a coarse idle
+        // interval delays the NEXT round too — including the one that would
+        // notice a consumer's `set_keepalive` — and a setter that takes
+        // effect five seconds later is a setter nobody can reason about. One
+        // timer per second per connection is not the cost worth chasing.
         let tick = match weak.upgrade() {
             Some(inner) => {
                 let after = (*inner.keepalive_after.lock().unwrap()).unwrap_or(KEEPALIVE_AFTER);
-                match inner.quiet_for() {
-                    Some(_) => Inner::keepalive_tick(after),
-                    None => after,
-                }
+                Inner::keepalive_tick(after)
             }
             None => return, // last Connection clone dropped
         };

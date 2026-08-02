@@ -3834,3 +3834,116 @@ async fn guest_server_side_copy_range_then_positioned_append() {
     let _ = tree.delete_file(&mut conn, tmp).await;
     tree.disconnect(&mut conn).await.expect("disconnect");
 }
+
+// ── ECHO keepalive against real servers ──────────────────────────────
+
+/// A real server answers the ECHO probe the keepalive sends.
+///
+/// Everything the keepalive does rests on this one fact, and no mock can
+/// establish it: the probe carries the session id, gets signed when the
+/// session signs and encrypted when the session encrypts, and names no tree.
+/// A server that ignored such a frame — or dropped the connection over it —
+/// would turn the keepalive from a safety net into the thing that kills
+/// healthy transfers.
+///
+/// Run against four session modes because the header rules are exactly what is
+/// in question: guest (unsigned), authenticated, mandatory signing, and
+/// mandatory encryption.
+///
+/// The connection is kept quiet-but-busy with a CHANGE_NOTIFY on a directory
+/// nothing touches, which is the shape the keepalive exists for: something
+/// outstanding, nothing coming back.
+#[tokio::test]
+#[ignore]
+async fn a_real_server_answers_the_echo_keepalive_probe() {
+    let _ = env_logger::try_init();
+
+    for (label, addr, user, pass, share) in [
+        ("guest", GUEST_ADDR, "", "", "public"),
+        (
+            "authenticated",
+            AUTH_ADDR,
+            "testuser",
+            "testpass",
+            "private",
+        ),
+        ("signed", SIGNING_ADDR, "testuser", "testpass", "private"),
+        (
+            "encrypted",
+            ENCRYPTION_ADDR,
+            "testuser",
+            "testpass",
+            "private",
+        ),
+    ] {
+        let mut conn = Connection::connect(addr, TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: connect failed: {e}"));
+        conn.negotiate()
+            .await
+            .unwrap_or_else(|e| panic!("{label}: negotiate failed: {e}"));
+        let _session = Session::setup(&mut conn, user, pass, "")
+            .await
+            .unwrap_or_else(|e| panic!("{label}: session setup failed: {e}"));
+        let tree = Tree::connect(&mut conn, share)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: tree connect failed: {e}"));
+
+        conn.set_keepalive(Some(Duration::from_millis(200)));
+
+        // Park a long-poll on the wire so the connection has work outstanding
+        // and nothing to say. A `Watcher` is exactly the shape a consumer
+        // produces, and the CHANGE_NOTIFY it holds open is exempt from the
+        // response deadline — so the keepalive is the only thing that can
+        // produce traffic here.
+        //
+        // Its own directory, not the share root: the rest of this suite
+        // writes to these shares, and a notify event from a neighbouring test
+        // is a frame on the wire, which is precisely what stops the keepalive
+        // from probing. Sharing the root made this test pass alone and fail
+        // in the suite.
+        let watched = format!("echo_probe_watch_{label}");
+        let _ = tree.delete_directory(&mut conn, &watched).await;
+        tree.create_directory(&mut conn, &watched)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: could not create {watched}: {e}"));
+        let mut watcher = tree
+            .watch(&mut conn, &watched, false)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: watch failed: {e}"));
+        let watching = tokio::spawn(async move { watcher.next_events().await });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let m = conn.diagnostics().metrics;
+            if m.keepalive_probes_sent >= 2 && m.keepalive_probes_sent > m.keepalive_failures {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{label}: the keepalive never got two probes answered \
+                 (sent {}, unanswered {}, skipped {}, {} request(s) outstanding)",
+                m.keepalive_probes_sent,
+                m.keepalive_failures,
+                m.keepalive_probes_skipped,
+                conn.diagnostics().outstanding.len(),
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let m = conn.diagnostics().metrics;
+        assert_eq!(
+            m.keepalive_failures, 0,
+            "{label}: the server left an ECHO probe unanswered, which would tear a \
+             healthy connection down"
+        );
+        assert!(
+            !conn.diagnostics().disconnected,
+            "{label}: probing the server cost us the connection"
+        );
+
+        watching.abort();
+        let _ = tree.delete_directory(&mut conn, &watched).await;
+        let _ = tree.disconnect(&mut conn).await;
+    }
+}
