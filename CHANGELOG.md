@@ -5,6 +5,15 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A `Watcher` on a silent-but-open session is finally told, instead of watching a dead server forever.** 0.16.0 bounded CHANGE_NOTIFY by connection-wide silence rather than by its own deadline, which is the only thing that can end a wait for an event that may never come. That bound lives in `Connection::await_response`, and `Watcher::next_events` was the one caller that never went through it: it awaited its `WaiterGuard` directly, and `recv()` is a bare `oneshot` await with no deadline of any kind. So the single production consumer of the long-poll bound was the one thing it did not protect, and a watcher whose server stopped answering on a still-open socket waited silently forever -- the exact failure the feature was written to end.
+  - Measured against a real Samba (Raspberry Pi 4, Samba 4.9.5) with its `smbd` suspended: 90 s of connection-wide silence and 15 consecutive unanswered ECHO probes left the watcher none the wiser. Through `await_response` it is now told at 30.1 s -- the response-deadline budget, as documented.
+  - **Nothing else changes.** The bound was already there and already tested; only the path to it was missing. A watch on a healthy server is unaffected: on a QNAP TS-464 saturated with concurrent streamed writes, the connection's longest gap without a frame stayed at the 5 s probe cadence, six times under the 30 s bound.
+  - The regression test drives a real `Watcher` rather than `Connection::execute` with a CHANGE_NOTIFY body. The two existing long-poll tests use `execute`, which is why they passed throughout: they exercised a path no consumer takes.
+
 ## [0.16.0] - 2026-08-02
 
 ### Breaking

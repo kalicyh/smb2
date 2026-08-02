@@ -2743,7 +2743,11 @@ impl Connection {
     /// torn down so every other waiter learns at once. Reaching that verdict
     /// always costs a request its full deadline first, so it can never lose
     /// anything the plain deadline was not already losing.
-    async fn await_response(&self, mut guard: WaiterGuard, command: Command) -> Result<Frame> {
+    pub(crate) async fn await_response(
+        &self,
+        mut guard: WaiterGuard,
+        command: Command,
+    ) -> Result<Frame> {
         let msg_id = guard.msg_id();
         let timeout = *self.inner.response_timeout.lock().unwrap();
         let Some(timeout) = timeout else {

@@ -4,6 +4,15 @@
 //! and returns [`FileNotifyEvent`] entries describing changes as they happen.
 //! The server holds the request until a change occurs, making this a long-poll
 //! operation.
+//!
+//! Because hours of silence is the healthy case here, nothing about the
+//! request itself can say the server died -- so the wait is bounded by the
+//! connection going silent instead, which only the ECHO keepalive makes
+//! meaningful. That bound lives in `Connection::await_response`, and this
+//! module reaches it by handing the pre-issued request's `WaiterGuard` there
+//! rather than awaiting the guard directly. ❌ A bare `WaiterGuard::recv()` is
+//! an unbounded `oneshot` await; using one here is what left a watcher on a
+//! silent-but-open session waiting forever.
 
 use log::debug;
 
@@ -185,11 +194,21 @@ impl Watcher {
         // when it returns, the next CHANGE_NOTIFY is on the wire and the
         // server has somewhere to put new events even while we process
         // the response for the previous one.
-        let mut in_flight = self.pending.take().expect("pending populated above");
+        let in_flight = self.pending.take().expect("pending populated above");
         let next_rx = self.dispatch_next().await?;
         self.pending = Some(next_rx);
 
-        let frame = in_flight.recv().await?;
+        // ❌ Not `in_flight.recv()`. A bare await on the guard walks past
+        // every bound the connection has: CHANGE_NOTIFY is exempt from the
+        // request deadline by design, so `await_response` is the only thing
+        // that applies the one bound it does have — connection-wide silence,
+        // in `await_long_poll`. Awaiting the guard directly left a watcher on
+        // a silent-but-open session waiting forever, which is the exact
+        // failure the long-poll bound exists to end.
+        let frame = self
+            .conn
+            .await_response(in_flight, Command::ChangeNotify)
+            .await?;
 
         if frame.header.status == NtStatus::NOTIFY_ENUM_DIR {
             return Err(Error::Protocol {

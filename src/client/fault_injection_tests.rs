@@ -730,6 +730,52 @@ async fn a_long_poll_with_the_keepalive_off_is_never_given_up_on() {
     watching.abort();
 }
 
+/// The same verdict, reached through the type a consumer actually holds.
+///
+/// The two tests above drive CHANGE_NOTIFY through `Connection::execute`,
+/// which is not how anything watches a directory: `Watcher` dispatches its own
+/// request and keeps the next one pre-issued, so it holds a `WaiterGuard`
+/// rather than calling `execute`. Awaiting that guard directly walked straight
+/// past the long-poll bound, and a `Watcher` on a silent-but-open session
+/// waited forever — measured against a real Samba with its `smbd` suspended:
+/// 90 s of connection-wide silence and 15 consecutive unanswered ECHO probes
+/// left the watcher none the wiser (2026-08-02, Raspberry Pi 4, Samba 4.9.5).
+/// ❌ Don't "simplify" `next_events` back to a bare `recv()`.
+#[tokio::test]
+async fn a_real_watcher_on_a_dead_server_is_told_instead_of_waiting_forever() {
+    let server = ScriptedServer::new(Answer::Nothing);
+    let conn = connect(&server);
+    conn.set_response_timeout(Some(BASE_DEADLINE * 4));
+
+    let mut watcher = crate::client::watcher::Watcher::new(
+        crate::client::tree::Tree {
+            tree_id: TreeId(1),
+            share_name: "test".to_string(),
+            server: "scripted-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        },
+        conn.clone(),
+        crate::types::FileId {
+            persistent: 1,
+            volatile: 2,
+        },
+        true,
+    );
+    let watching = tokio::spawn(async move { watcher.next_events().await });
+
+    let outcome = finish(watching, "the Watcher").await;
+    assert!(
+        matches!(outcome, Err(Error::ServerUnresponsive { .. })),
+        "a Watcher on a dead session has to be told, got {outcome:?}"
+    );
+    assert!(
+        server.echo_count() >= 2,
+        "the verdict has to rest on probes, saw {}",
+        server.echo_count()
+    );
+}
+
 /// A probe answered with an error is still a probe answered.
 ///
 /// `STATUS_NETWORK_SESSION_EXPIRED` is the realistic case: the session needs
