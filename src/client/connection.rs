@@ -1292,6 +1292,18 @@ impl Inner {
     ///
     /// A request that runs out of deadline while this reads `None` is ONE
     /// stalled operation, not a dead link, and must not be reported as one.
+    ///
+    /// ⚠️ The check is that probing is ARMED, not that a probe actually reached
+    /// the wire. A probe with no credit on hand is skipped
+    /// (`keepalive_probes_skipped`), so a fully credit-starved connection can
+    /// reach this verdict on silence nobody put a question to. ❌ Don't
+    /// "tighten" it to require a sent probe without a design pass: credits run
+    /// out only when many requests are outstanding and the server has answered
+    /// none of them, which is the wedge shape itself, and downgrading that to
+    /// `Error::Timeout` would leave the connection standing while every waiter
+    /// burns its own deadline one at a time — exactly what
+    /// `declare_unresponsive` exists to replace. The premise is weaker there
+    /// than the doc above claims; the verdict is still the useful one.
     fn unresponsive_for(&self) -> Option<Duration> {
         let after = (*self.keepalive_after.lock().unwrap())?;
         let quiet = self.quiet_for()?;

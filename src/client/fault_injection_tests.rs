@@ -738,7 +738,7 @@ async fn a_long_poll_with_the_keepalive_off_is_never_given_up_on() {
 /// rather than calling `execute`. Awaiting that guard directly walked straight
 /// past the long-poll bound, and a `Watcher` on a silent-but-open session
 /// waited forever — measured against a real Samba with its `smbd` suspended:
-/// 90 s of connection-wide silence and 15 consecutive unanswered ECHO probes
+/// 90.3 s of connection-wide silence and 17 consecutive unanswered ECHO probes
 /// left the watcher none the wiser (2026-08-02, Raspberry Pi 4, Samba 4.9.5).
 /// ❌ Don't "simplify" `next_events` back to a bare `recv()`.
 #[tokio::test]
