@@ -75,6 +75,34 @@ pub(crate) fn build_create_response(file_id: FileId, end_of_file: u64) -> Vec<u8
     pack_message(&h, &body)
 }
 
+/// Build a CREATE response carrying a chain of create contexts.
+pub(crate) fn build_create_response_with_contexts(
+    file_id: FileId,
+    end_of_file: u64,
+    contexts: &[crate::msg::create_context::CreateContext],
+) -> Vec<u8> {
+    let mut h = Header::new_request(Command::Create);
+    h.flags.set_response();
+    h.credits = 32;
+
+    let body = CreateResponse {
+        oplock_level: OplockLevel::Batch,
+        flags: 0,
+        create_action: CreateAction::FileOpened,
+        creation_time: FileTime::ZERO,
+        last_access_time: FileTime::ZERO,
+        last_write_time: FileTime::ZERO,
+        change_time: FileTime::ZERO,
+        allocation_size: 0,
+        end_of_file,
+        file_attributes: 0,
+        file_id,
+        create_contexts: crate::msg::create_context::pack_contexts(contexts),
+    };
+
+    pack_message(&h, &body)
+}
+
 /// Build a CREATE response with a non-success status (for error tests).
 pub(crate) fn build_create_error_response(status: crate::types::status::NtStatus) -> Vec<u8> {
     use crate::msg::header::ErrorResponse;

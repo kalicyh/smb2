@@ -593,7 +593,9 @@ use crate::pack::{Guid, Pack, ReadCursor, Unpack, WriteCursor};
 use crate::transport::{TcpTransport, TransportReceive, TransportSend};
 use crate::types::flags::{Capabilities, HeaderFlags, SecurityMode};
 use crate::types::status::NtStatus;
-use crate::types::{Command, CreditCharge, Dialect, MessageId, SessionId, TreeId};
+use crate::types::{
+    Command, CreditCharge, Dialect, FileId, MessageId, OplockLevel, SessionId, TreeId,
+};
 
 // ── Reconnect ──────────────────────────────────────────────────────────────
 
@@ -1014,6 +1016,15 @@ struct Inner {
     preauth_hasher: StdMutex<PreauthHasher>,
     /// Tree IDs that have DFS capability (auto-set `SMB2_FLAGS_DFS_OPERATIONS`).
     dfs_trees: StdMutex<HashSet<TreeId>>,
+    /// Which tree each oplocked handle belongs to.
+    ///
+    /// Only durable opens take an oplock, and only so the server will grant
+    /// durability at all. The map exists because an oplock break notification
+    /// arrives with no usable tree id and the acknowledgment must carry the
+    /// one the open belongs to (MS-SMB2 § 2.2.24.1) — and an unacknowledged
+    /// break makes the *other* client wait out the server's break timeout,
+    /// which is around 35 s on both Samba and Windows.
+    oplock_trees: StdMutex<HashMap<FileId, TreeId>>,
     /// Counters for diagnostics. Snapshotted via [`Inner::metrics_snapshot`].
     /// Survives connection teardown — counters are read off the still-alive
     /// `Arc<Inner>` after the receiver task has exited.
@@ -1054,6 +1065,7 @@ impl Inner {
             compression_requested: AtomicBool::new(true),
             preauth_hasher: StdMutex::new(PreauthHasher::new()),
             dfs_trees: StdMutex::new(HashSet::new()),
+            oplock_trees: StdMutex::new(HashMap::new()),
             metrics: Metrics::default(),
         }
     }
@@ -1512,7 +1524,7 @@ impl Connection {
     /// Perform the SMB2 NEGOTIATE exchange.
     pub async fn negotiate(&mut self) -> Result<()> {
         debug!("negotiate: sending request, dialects={:?}", Dialect::ALL);
-        let client_guid = generate_guid();
+        let client_guid = random_guid();
 
         let mut negotiate_contexts = vec![
             NegotiateContext::PreauthIntegrity {
@@ -2893,6 +2905,21 @@ impl Connection {
         self.inner.reviver.lock().unwrap().is_some()
     }
 
+    /// Note that `file_id` holds an oplock on `tree_id`, so a break
+    /// notification can be acknowledged on the right tree.
+    pub(crate) fn register_oplock(&self, file_id: FileId, tree_id: TreeId) {
+        self.inner
+            .oplock_trees
+            .lock()
+            .unwrap()
+            .insert(file_id, tree_id);
+    }
+
+    /// Drop the oplock bookkeeping for a handle that is being closed.
+    pub(crate) fn forget_oplock(&self, file_id: FileId) {
+        self.inner.oplock_trees.lock().unwrap().remove(&file_id);
+    }
+
     /// Record the session that has just been established here.
     ///
     /// Called by [`Session::setup`](crate::Session::setup); consumers should
@@ -3158,6 +3185,7 @@ impl Connection {
         *inner.estimated_rtt.lock().unwrap() = None;
         inner.abandoned.lock().unwrap().clear();
         inner.dfs_trees.lock().unwrap().clear();
+        inner.oplock_trees.lock().unwrap().clear();
         inner.compression_enabled.store(false, Ordering::Release);
         // ❌ `send_queue_depth` is deliberately NOT reset: a caller parked
         // between its increment and its decrement would underflow the gauge
@@ -3478,7 +3506,10 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
         for sub in sub_frames {
             match prepare_sub_frame(&sub, was_encrypted, &inner) {
                 Ok(SubFrameAction::Route(msg_id, result)) => routable.push((msg_id, result)),
-                Ok(SubFrameAction::Skip) => { /* oplock break / STATUS_PENDING */ }
+                Ok(SubFrameAction::Skip) => { /* notification / STATUS_PENDING */ }
+                Ok(SubFrameAction::AckOplockBreak(brk, tree_id)) => {
+                    acknowledge_oplock_break(&inner, brk, tree_id);
+                }
                 Err(e) => {
                     inner
                         .metrics
@@ -3597,9 +3628,11 @@ pub(crate) enum SubFrameAction {
     /// waiter without disturbing others.
     Route(MessageId, std::result::Result<Frame, Error>),
     /// Skip silently — not forwarded to any waiter.
-    /// Used for oplock-break notifications (MessageId=UNSOLICITED) and
-    /// STATUS_PENDING interim responses (keep the waiter alive).
+    /// Used for STATUS_PENDING interim responses (keep the waiter alive) and
+    /// unsolicited notifications there is nothing to do about.
     Skip,
+    /// An oplock break the server is waiting on an answer to.
+    AckOplockBreak(crate::msg::oplock_break::OplockBreak, TreeId),
 }
 
 /// Prepare a routable sub-frame from raw bytes.
@@ -3636,14 +3669,40 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
     // concurrent senders each spend the same credits.
     inner.credits.grant(header.credits);
 
-    // Oplock break notification: MessageId=UNSOLICITED. Skip silently.
+    // Oplock break notification: MessageId=UNSOLICITED.
     if header.message_id == MessageId::UNSOLICITED {
         inner
             .metrics
             .unsolicited_notifications_received
             .fetch_add(1, Ordering::Relaxed);
+        if header.command == Command::OplockBreak {
+            // Only a handle this crate opened durably ever holds an oplock, so
+            // a break we can place is one of ours; anything else (a lease
+            // break, whose body has a different shape entirely) is not ours to
+            // answer. ❌ Never guess the tree id: an acknowledgment on the
+            // wrong tree is rejected, and the other client waits out the
+            // server's break timeout exactly as if we had said nothing.
+            let parsed = crate::msg::oplock_break::OplockBreak::unpack(&mut ReadCursor::new(
+                &sub[Header::SIZE..],
+            ));
+            if let Ok(brk) = parsed {
+                let tree = inner
+                    .oplock_trees
+                    .lock()
+                    .unwrap()
+                    .get(&brk.file_id)
+                    .copied();
+                if let Some(tree_id) = tree {
+                    return Ok(SubFrameAction::AckOplockBreak(brk, tree_id));
+                }
+                debug!(
+                    "recv: oplock break for a handle we hold no oplock on, file_id={:?}",
+                    brk.file_id
+                );
+            }
+        }
         debug!(
-            "recv: skipping unsolicited oplock break notification, cmd={:?}",
+            "recv: skipping unsolicited notification, cmd={:?}",
             header.command
         );
         return Ok(SubFrameAction::Skip);
@@ -3854,7 +3913,12 @@ pub(crate) fn pack_message(header: &Header, body: &dyn Pack) -> Vec<u8> {
     cursor.into_inner()
 }
 
-fn generate_guid() -> Guid {
+/// A cryptographically random GUID.
+///
+/// Used for the client GUID at negotiate and for the `CreateGuid` that proves
+/// ownership of a durable handle. ❌ It must stay unpredictable: a guessable
+/// `CreateGuid` would let another client on the same server claim our open.
+pub(crate) fn random_guid() -> Guid {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("failed to generate random GUID");
     Guid {
@@ -6002,4 +6066,61 @@ mod send_path_liveness_tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
+}
+
+/// Answer an oplock break so the client that triggered it isn't left waiting.
+///
+/// A batch oplock is the price of a durable handle (MS-SMB2 § 3.3.5.9.10): the
+/// server will not promise to keep an open alive across a disconnect without
+/// one. The cost lands on *other* clients — while we hold it, anyone else
+/// opening the file waits for the server's break timeout (~35 s on Samba and
+/// Windows) unless we answer. So we answer immediately and give the oplock up.
+///
+/// Giving it up costs the handle its durability (MS-SMB2 § 3.3.4.6), which is
+/// the right trade: a resumable transfer is worth less than not freezing
+/// somebody else's file operation for half a minute. The loss surfaces
+/// honestly at reclaim time as [`crate::error::DurableLoss::Expired`], and the
+/// transfer restarts.
+///
+/// Sent on its own task and never awaited: the receiver loop must get back to
+/// reading, and nothing downstream depends on the acknowledgment's response.
+fn acknowledge_oplock_break(
+    inner: &Arc<Inner>,
+    brk: crate::msg::oplock_break::OplockBreak,
+    tree_id: TreeId,
+) {
+    use crate::msg::oplock_break::OplockBreak;
+
+    debug!(
+        "recv: oplock break to {:?} on file_id={:?}; acknowledging so the other \
+         client isn't left waiting out the server's break timeout",
+        brk.oplock_level, brk.file_id
+    );
+    // The handle keeps working; it just stops being resumable.
+    inner.oplock_trees.lock().unwrap().remove(&brk.file_id);
+
+    let conn = Connection {
+        inner: Arc::clone(inner),
+    };
+    tokio::spawn(async move {
+        let ack = OplockBreak {
+            // Down to none: we only ever took the oplock to get durability,
+            // and durability is already gone the moment a break arrives.
+            oplock_level: OplockLevel::None,
+            file_id: brk.file_id,
+        };
+        match conn
+            .execute(Command::OplockBreak, &ack, Some(tree_id))
+            .await
+        {
+            Ok(_) => trace!("oplock break acknowledged for file_id={:?}", brk.file_id),
+            // Nothing to recover: the break is the server's business and the
+            // handle still works. Worth a line because a server that rejects
+            // the acknowledgment will hold the other client anyway.
+            Err(e) => debug!(
+                "oplock break acknowledgment for file_id={:?} did not land: {e}",
+                brk.file_id
+            ),
+        }
+    });
 }

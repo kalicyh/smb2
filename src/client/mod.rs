@@ -10,6 +10,7 @@ pub mod copy;
 pub(crate) mod credits;
 pub(crate) mod dfs;
 pub mod diagnostics;
+pub mod durable;
 #[cfg(test)]
 mod fault_injection_tests;
 pub mod pipeline;
@@ -31,6 +32,7 @@ pub use diagnostics::{
     DfsCacheEntry, Diagnostics, EncryptionInfo, MetricsSnapshot, NegotiatedSummary,
     SessionDiagnostics, SigningInfo,
 };
+pub use durable::{DurableHandle, DurableOpen};
 pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;

@@ -3367,6 +3367,10 @@ impl Tree {
     /// and did not hand to a streaming type (which close themselves) must be
     /// closed with this, or it leaks server-side until session teardown.
     pub async fn close_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
+        // A no-op for the handles that never held an oplock, which is nearly
+        // all of them. Done before the CLOSE so a break arriving in the gap
+        // isn't acknowledged on a handle that is on its way out.
+        conn.forget_oplock(file_id);
         let req = CloseRequest { flags: 0, file_id };
 
         let frame = conn

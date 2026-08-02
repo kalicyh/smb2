@@ -4,6 +4,44 @@ use crate::types::status::NtStatus;
 use crate::types::Command;
 use thiserror::Error;
 
+/// Why a durable handle could not be claimed back.
+///
+/// All four mean "reopen and rewrite from the start" to a caller. They are
+/// told apart because only one of them says anything is wrong with the server:
+/// [`IdentityMismatch`](Self::IdentityMismatch) means it matched our
+/// `CreateGuid` and still handed back a different file, which the protocol
+/// says cannot happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DurableLoss {
+    /// The server no longer has the open: it timed out, or the server
+    /// restarted (a durable handle survives a dead connection, not a dead
+    /// server — only a *persistent* handle on a continuously-available share
+    /// does that). Routine.
+    Expired,
+    /// The server gave the handle back but would not say which file it points
+    /// at, so nothing could be proven. The handle was closed again.
+    IdentityUnavailable,
+    /// The server gave back a handle to a **different file**. The handle was
+    /// closed and the write refused; writing into it is the outcome this whole
+    /// mechanism exists to prevent.
+    IdentityMismatch,
+    /// The handle was never durable, so there was nothing to reclaim.
+    NotDurable,
+}
+
+impl std::fmt::Display for DurableLoss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Expired => "the server no longer has the open",
+            Self::IdentityUnavailable => "the server would not say which file the handle points at",
+            Self::IdentityMismatch => "the server handed back a different file",
+            Self::NotDurable => "the handle was never durable",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Top-level error type for SMB2 operations.
 ///
 /// `#[non_exhaustive]`: new variants appear as the crate learns to tell more
@@ -71,6 +109,23 @@ pub enum Error {
         cause: ErrorKind,
         /// The last failure rendered for a human. Display only.
         reason: String,
+    },
+
+    /// A durable handle could not be claimed back after a reconnect, so the
+    /// interrupted transfer has to restart rather than resume.
+    ///
+    /// Never a data-safety failure: it is what the client returns *instead of*
+    /// guessing. Branch on `reason` to tell an expired open (routine) from a
+    /// server that handed back the wrong file (alarming, and logged at
+    /// `error!`). Whatever the reason, the response is the same: reopen the
+    /// file and write it from the start. Classifies as
+    /// [`ErrorKind::ConnectionLost`] and reports as retryable.
+    #[error("could not reclaim the durable handle for {path}: {reason}")]
+    DurableHandleLost {
+        /// The path the handle was opened at.
+        path: String,
+        /// Which guarantee did not hold.
+        reason: DurableLoss,
     },
 
     /// The path requires DFS referral resolution.
@@ -228,6 +283,7 @@ impl Error {
                 | Error::SendTimeout { .. }
                 | Error::ServerUnresponsive { .. }
                 | Error::ReconnectFailed { .. }
+                | Error::DurableHandleLost { .. }
                 | Error::Protocol {
                     status: NtStatus::INSUFFICIENT_RESOURCES,
                     ..
@@ -388,6 +444,7 @@ impl Error {
             // and the answer is that it is gone. The cause is there for a
             // consumer that wants to explain why.
             Error::ReconnectFailed { .. } => ErrorKind::ConnectionLost,
+            Error::DurableHandleLost { .. } => ErrorKind::ConnectionLost,
             Error::Protocol { status, .. } => classify_status(*status),
         }
     }
