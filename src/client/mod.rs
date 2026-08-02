@@ -341,7 +341,7 @@ impl SmbClient {
     /// to a session that no longer exists — so the caller must re-do
     /// [`connect_share`](Self::connect_share) for any shares it still needs.
     ///
-    /// Bounded by [`ReconnectPolicy`](crate::ReconnectPolicy); on failure the
+    /// Bounded by [`ReconnectPolicy`]; on failure the
     /// connection is left unambiguously dead and the error is
     /// [`Error::ReconnectFailed`].
     pub async fn reconnect(&mut self) -> Result<()> {
@@ -386,7 +386,7 @@ impl SmbClient {
     }
 
     /// Replace the bounds on an automatic reconnect. See
-    /// [`ReconnectPolicy`](crate::ReconnectPolicy).
+    /// [`ReconnectPolicy`].
     pub fn set_reconnect_policy(&self, policy: connection::ReconnectPolicy) {
         self.conn.set_reconnect_policy(policy);
     }
@@ -637,11 +637,15 @@ impl SmbClient {
     /// Whether this failure means "the session is gone" and auto-reconnect is
     /// armed to do something about it.
     ///
-    /// Deliberately narrow. [`Error::CreditStarvation`] and
-    /// [`Error::SendTimeout`] also smell like a dead link, but neither proves
-    /// the session died, and re-running an operation against a connection
-    /// that is merely struggling buys a duplicate request rather than a
-    /// recovery. These two are the ones that mean it.
+    /// Deliberately narrow. [`Error::CreditStarvation`], [`Error::SendTimeout`]
+    /// and a plain [`Error::Timeout`] also smell like a dead link, but none of
+    /// them proves the session died, and re-running an operation against a
+    /// connection that is merely struggling buys a duplicate request rather
+    /// than a recovery. These two are the ones that mean it: `Disconnected`
+    /// says the socket went away, and `ServerUnresponsive` is only reached
+    /// when a request burned its whole deadline on a connection that put
+    /// nothing at all on the wire — and it leaves the connection marked dead,
+    /// which is what gives `reconnect_if_needed` something to revive.
     fn session_is_gone(&self, err: &Error) -> bool {
         self.config.auto_reconnect
             && self.conn.can_reconnect()

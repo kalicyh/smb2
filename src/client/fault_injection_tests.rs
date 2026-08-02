@@ -42,13 +42,18 @@ use crate::types::{Command, MessageId, SessionId, TreeId};
 //
 // Scaled-down versions of the shipping defaults, keeping the same ratios so a
 // test proves something about the real configuration rather than about a shape
-// that only exists in tests. The keepalive reaches a verdict inside the
+// that only exists in tests. A probe goes out and is answered well inside the
 // response deadline, exactly as the defaults do.
 
 /// Server silence that triggers a probe. Real default: 5 s.
-const KEEPALIVE: Duration = Duration::from_millis(200);
+const KEEPALIVE: Duration = Duration::from_millis(100);
 /// Silence budget for one request. Real default: 30 s.
-const BASE_DEADLINE: Duration = Duration::from_millis(500);
+///
+/// Six probe thresholds, the shipping ratio. It has to be more than
+/// `LIVENESS_WINDOW_PROBES` of them or a request would run out of budget
+/// before the connection could be judged either way, which is a shape the
+/// defaults deliberately do not have.
+const BASE_DEADLINE: Duration = Duration::from_millis(600);
 /// Outer bound on any single test. Generously above every deadline above, so
 /// tripping it means something genuinely hung rather than ran slowly on a
 /// loaded machine.
@@ -312,6 +317,24 @@ fn spawn_write(conn: &Connection) -> tokio::task::JoinHandle<Result<crate::clien
     tokio::spawn(async move { c.execute(Command::Write, &a_write(), Some(TreeId(1))).await })
 }
 
+/// Park a long-poll CHANGE_NOTIFY on the wire, the way a `Watcher` does.
+fn spawn_change_notify(conn: &Connection) -> tokio::task::JoinHandle<Result<crate::client::Frame>> {
+    let c = conn.clone();
+    tokio::spawn(async move {
+        let req = crate::msg::change_notify::ChangeNotifyRequest {
+            flags: 0,
+            output_buffer_length: 4096,
+            file_id: crate::types::FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            completion_filter: 0xFF,
+        };
+        c.execute(Command::ChangeNotify, &req, Some(TreeId(1)))
+            .await
+    })
+}
+
 /// Poll until `cond` holds, panicking rather than hanging if it never does.
 ///
 /// Every timing assertion in this file is one-sided on purpose. A loaded
@@ -423,13 +446,15 @@ async fn a_write_the_server_was_merely_slow_about_completes_successfully() {
 /// offline looks: it was answering, and then it is not, and the socket never
 /// says a word about it.
 ///
-/// The response deadline is set far out on purpose — passing this test means
-/// the keepalive reached the verdict, not that the deadline eventually did.
+/// Two facts have to line up before anything is declared: a request ran out of
+/// its own deadline, AND the server put nothing at all on the wire while it
+/// did, ECHO probes included. Either alone is not enough — the first on its own
+/// is one stalled operation, and the second on its own is the false positive
+/// that killed healthy transfers on a busy NAS.
 #[tokio::test]
 async fn a_server_that_dies_mid_transfer_is_declared_dead_and_every_waiter_told() {
     let server = ScriptedServer::new(Answer::Everything);
     let conn = connect(&server);
-    conn.set_response_timeout(Some(Duration::from_secs(30)));
 
     // A healthy exchange first, so the connection has real proof of life to
     // lose. Detection has to survive the transition, not just the cold case.
@@ -444,13 +469,14 @@ async fn a_server_that_dies_mid_transfer_is_declared_dead_and_every_waiter_told(
     let second = finish(second, "the second write").await;
     for (which, outcome) in [("first", first), ("second", second)] {
         assert!(
-            matches!(outcome, Err(Error::ServerUnresponsive { probes: 2, .. })),
-            "the {which} write should name the dead session, got {outcome:?}"
+            matches!(outcome, Err(Error::ServerUnresponsive { .. })),
+            "the {which} write should name the dead session rather than blaming itself, \
+             got {outcome:?}"
         );
     }
     assert!(
-        conn.metrics().keepalive_failures >= 2,
-        "two unanswered probes are what justify the verdict"
+        conn.metrics().keepalive_failures >= 1,
+        "the probes are what separate this from an ordinary stalled request"
     );
     assert!(
         conn.diagnostics().disconnected,
@@ -471,7 +497,6 @@ async fn a_server_that_dies_mid_transfer_is_declared_dead_and_every_waiter_told(
 async fn a_link_that_goes_black_without_a_reset_fails_current_and_future_requests() {
     let server = ScriptedServer::new(Answer::Everything);
     let conn = connect(&server);
-    conn.set_response_timeout(Some(Duration::from_secs(30)));
 
     let warmup = spawn_write(&conn);
     assert!(finish(warmup, "the warm-up write").await.is_ok());
@@ -535,7 +560,7 @@ async fn a_server_that_keeps_saying_it_is_working_is_never_probed() {
     // for well past the base deadline. The wide margin is deliberate: a
     // loaded machine overshooting one sleep must not be able to look like a
     // quiet wire.
-    for _ in 0..40 {
+    for _ in 0..80 {
         tokio::time::sleep(KEEPALIVE / 8).await;
         server.push_pending(Command::Write, msg_id);
     }
@@ -557,13 +582,18 @@ async fn a_server_that_keeps_saying_it_is_working_is_never_probed() {
 }
 
 /// A probe that cannot be sent is evidence of nothing, and must never be
-/// counted as a death.
+/// counted against the server.
 ///
 /// The trap this guards: the credit window is fully spent exactly when the
 /// pipeline is deepest, which is exactly when a server goes quiet under load.
-/// Treating "I could not ask" as "it did not answer" would turn the busiest
-/// healthy transfers into the ones most likely to be torn down — the
-/// starvation hang from the client side, wearing a different hat.
+/// Treating "I could not ask" as "it did not answer" would put the busiest
+/// healthy transfers first in line for every harsh conclusion the client
+/// draws — the starvation hang from the client side, wearing a different hat.
+///
+/// What still ends the write here is its own deadline, at its own length. The
+/// connection is torn down afterwards, because a server owing both a response
+/// and a credit grant and producing neither is what a wedge looks like, but
+/// nothing gets cut short to reach that: the skipped probes moved nothing.
 #[tokio::test]
 async fn a_probe_that_cannot_get_a_credit_is_skipped_rather_than_called_a_death() {
     let server = ScriptedServer::new(Answer::Nothing);
@@ -573,6 +603,7 @@ async fn a_probe_that_cannot_get_a_credit_is_skipped_rather_than_called_a_death(
     conn.set_credits(1);
     conn.set_response_timeout(Some(BASE_DEADLINE * 8));
 
+    let started = Instant::now();
     let write = spawn_write(&conn);
     let metrics = conn.clone();
     wait_until("a probe round to be skipped for want of a credit", || {
@@ -587,8 +618,13 @@ async fn a_probe_that_cannot_get_a_credit_is_skipped_rather_than_called_a_death(
 
     let outcome = finish(write, "the write").await;
     assert!(
-        matches!(outcome, Err(Error::Timeout)),
-        "with no probe possible the plain response deadline is what should fire, got {outcome:?}"
+        started.elapsed() >= BASE_DEADLINE * 8,
+        "the write was cut short of its own deadline by probes that never went out"
+    );
+    assert!(
+        matches!(outcome, Err(Error::ServerUnresponsive { .. })),
+        "a server that answered neither the request nor a credit grant is a dead link, \
+         got {outcome:?}"
     );
     assert_eq!(
         server.echo_count(),
@@ -598,11 +634,7 @@ async fn a_probe_that_cannot_get_a_credit_is_skipped_rather_than_called_a_death(
     assert_eq!(
         conn.metrics().keepalive_failures,
         0,
-        "a connection that could never be probed must never be declared dead"
-    );
-    assert!(
-        !conn.diagnostics().disconnected,
-        "the keepalive tore down a connection it never managed to ask a question"
+        "a probe that was never sent cannot be a probe that went unanswered"
     );
 }
 
@@ -648,33 +680,18 @@ async fn a_request_with_no_liveness_evidence_gets_the_plain_deadline() {
 /// A `Watcher` holds one open on the wire at all times, so before the
 /// keepalive a dead server left it waiting for an event that could never
 /// arrive — for hours, silently, with the connection looking idle rather than
-/// broken. Probing is what closes that, and it is the reason long-poll
-/// commands are deliberately NOT exempt from the keepalive the way they are
-/// from the deadline.
+/// broken. What ends it is the connection going silent rather than the request
+/// running long: hours of silence on an open watch is the healthy case, and
+/// only the probes make the difference visible.
 #[tokio::test]
 async fn a_long_poll_waiting_on_a_dead_server_is_told_instead_of_waiting_forever() {
     let server = ScriptedServer::new(Answer::Nothing);
     let conn = connect(&server);
-    // Off entirely: if this test passes, nothing but the keepalive could have
-    // made it pass, since CHANGE_NOTIFY ignores the deadline at any setting.
-    conn.set_response_timeout(None);
+    // Room for several probe rounds inside the budget, so the verdict rests on
+    // probes rather than on the first one that happened to be late.
+    conn.set_response_timeout(Some(BASE_DEADLINE * 4));
 
-    let watching = {
-        let c = conn.clone();
-        tokio::spawn(async move {
-            let req = crate::msg::change_notify::ChangeNotifyRequest {
-                flags: 0,
-                output_buffer_length: 4096,
-                file_id: crate::types::FileId {
-                    persistent: 1,
-                    volatile: 2,
-                },
-                completion_filter: 0xFF,
-            };
-            c.execute(Command::ChangeNotify, &req, Some(TreeId(1)))
-                .await
-        })
-    };
+    let watching = spawn_change_notify(&conn);
 
     let outcome = finish(watching, "the CHANGE_NOTIFY").await;
     assert!(
@@ -686,6 +703,31 @@ async fn a_long_poll_waiting_on_a_dead_server_is_told_instead_of_waiting_forever
         "the verdict has to rest on probes, saw {}",
         server.echo_count()
     );
+}
+
+/// The same watch, with probing off, waits forever — deliberately.
+///
+/// "The server has said nothing" is a claim only the ECHO probes can support.
+/// With nothing asking, a silent connection is indistinguishable from a
+/// watched directory nobody has touched, and ending the wait would be a guess
+/// dressed as a diagnosis.
+#[tokio::test]
+async fn a_long_poll_with_the_keepalive_off_is_never_given_up_on() {
+    let server = ScriptedServer::new(Answer::Nothing);
+    let conn = connect(&server);
+    conn.set_response_timeout(Some(BASE_DEADLINE));
+    conn.set_keepalive(None);
+
+    let watching = spawn_change_notify(&conn);
+
+    tokio::time::sleep(BASE_DEADLINE * 6).await;
+    assert!(
+        !watching.is_finished(),
+        "a long poll was given up on with nothing but silence to go on"
+    );
+    assert_eq!(server.echo_count(), 0, "the keepalive was turned off");
+    assert!(!conn.diagnostics().disconnected);
+    watching.abort();
 }
 
 /// A probe answered with an error is still a probe answered.
@@ -857,11 +899,9 @@ fn test_policy() -> ReconnectPolicy {
 /// The response deadline is pushed far out on purpose. These tests are about
 /// what happens once a session is *declared dead*, and only the keepalive
 /// declares that — a plain response timeout abandons one request and leaves
-/// the connection standing. Letting the short deadline win the race would mean
-/// testing the revival against a connection that never died.
+/// the connection standing.
 fn connect_to(nas: &Arc<BouncingNas>) -> Connection {
     let conn = connect(&nas.current());
-    conn.set_response_timeout(Some(Duration::from_secs(30)));
     conn.set_reviver(Some(Arc::clone(nas) as Arc<dyn SessionReviver>));
     conn.set_reconnect_policy(test_policy());
     conn
@@ -1320,7 +1360,6 @@ async fn a_dial_that_succeeds_but_cannot_authenticate_leaves_the_connection_dead
 async fn a_connection_with_no_reviver_reports_the_disconnect_rather_than_dialing() {
     let nas = BouncingNas::new(Answer::Everything);
     let conn = connect(&nas.current());
-    conn.set_response_timeout(Some(Duration::from_secs(30)));
 
     nas.goes_away();
     let _ = finish(spawn_write(&conn), "the stranded write").await;
@@ -1829,7 +1868,7 @@ fn a_share() -> Tree {
 async fn attach(nas: &Arc<Nas>) -> Connection {
     let mut conn =
         Connection::from_transport(Box::new(nas.current()), Box::new(nas.current()), "nas");
-    conn.set_response_timeout(Some(Duration::from_secs(30)));
+    conn.set_response_timeout(Some(BASE_DEADLINE));
     conn.set_keepalive(Some(KEEPALIVE));
     conn.set_reviver(Some(Arc::clone(nas) as Arc<dyn SessionReviver>));
     conn.set_reconnect_policy(test_policy());

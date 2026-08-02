@@ -172,22 +172,30 @@ const SLOW_SEND_REPORT: Duration = Duration::from_secs(5);
 /// which is why [`RESPONSE_TIMEOUT`] has to be sized for the slowest healthy
 /// case and is therefore a poor detector of the dead one. ECHO separates them:
 /// it touches no disk, no share, and no open handle, so an answer means the
-/// server is processing requests and the slow operation deserves more room,
-/// while silence means nobody is home.
+/// server is processing requests and the slow operation deserves more room.
 ///
 /// 5 s of silence, not 5 s on a timer: a connection with responses flowing
 /// never probes at all, so a busy transfer pays nothing for this. It only ever
 /// fires on the shape that used to wedge — requests outstanding, wire quiet.
+///
+/// ❌ A missed probe is never a verdict on its own. It means "no extension"
+/// and nothing more: a real NAS drops ECHO probes precisely when it is busy
+/// writing, which is exactly when a transfer is running (measured on a QNAP
+/// TS-464 under write load, 2026-08-02), so anything that tears a connection
+/// down over a missed probe kills the healthy transfers this exists to
+/// protect.
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(5);
 
-/// Consecutive unanswered probes that declare the session dead.
+/// How many probe thresholds of silence before a connection stops counting as
+/// provably alive and starts counting as unresponsive.
 ///
-/// One is not enough. On Samba (and the NAS firmware built on it) the process
-/// answering ECHO is the same one that may be blocked in a `pwrite` on a
-/// stalled disk, so a single missed probe can happen to a server that is about
-/// to recover. Two misses spanning [`Inner::keepalive_deadline`] make that
-/// explanation implausible.
-const KEEPALIVE_FAILURES_BEFORE_DEAD: u32 = 2;
+/// Two would be the tightest reading that still makes sense (one round to
+/// notice the silence, one to answer it), but a probe round that runs late on
+/// a loaded client would then read as a dead server. One number for both
+/// readings of this clock — [`Inner::liveness_is_proven`] and
+/// [`Inner::unresponsive_for`] — so no tuning pass can open a gap between
+/// "no longer provably alive" and "unresponsive".
+const LIVENESS_WINDOW_PROBES: u32 = 3;
 
 /// How much longer a request may go unanswered when the connection is provably
 /// alive, as a multiple of the configured response deadline.
@@ -324,11 +332,12 @@ async fn writer_loop(
 /// CHANGE_NOTIFY sits open until the watched directory changes — hours is
 /// normal, and timing it out would break the watcher rather than protect it.
 ///
-/// Being exempt from the deadline is exactly why these need the keepalive:
-/// nothing else can tell a watcher that its session died, so a dead server
-/// used to leave one waiting for an event that could never arrive. The
-/// keepalive deliberately does NOT exempt them, which is why a connection
-/// holding a watcher open sends a periodic ECHO.
+/// Being exempt from the *request's* deadline is exactly why these need the
+/// keepalive: with no clock of their own, a dead server would leave a watcher
+/// waiting for an event that could never arrive. They are bounded by the
+/// connection instead of by themselves — see
+/// [`Connection::await_long_poll`] — which is why a connection holding a
+/// watcher open sends a periodic ECHO.
 fn is_long_poll(command: Command) -> bool {
     matches!(command, Command::ChangeNotify)
 }
@@ -363,9 +372,11 @@ fn spawn_stale_waiter_sweeper(inner: &Arc<Inner>) {
 /// What one probe round learned about the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeOutcome {
-    /// It answered. It is processing requests.
+    /// It answered. It is processing requests, so the liveness clock it just
+    /// refreshed can be trusted.
     Alive,
-    /// The probe reached the wire and nothing came back.
+    /// The probe reached the wire and nothing came back. Costs the connection
+    /// its deadline extension until a frame does arrive, and nothing else.
     Silent,
     /// Nothing was asked, so nothing was learned. ❌ Never treat this as a
     /// failure — see [`Connection::echo_probe`].
@@ -375,16 +386,19 @@ enum ProbeOutcome {
     Broken,
 }
 
-/// Ask a quiet server whether it is still there, and act on the answer.
+/// Ask a quiet server whether it is still there.
 ///
 /// This is what makes an aggressive response deadline safe. A deadline alone
 /// cannot tell "the server is slow" from "the server is dead", so it has to be
 /// sized for the slowest healthy case, which makes it a poor detector of the
 /// dead one — and a 2026-07-31 QNAP wedge is what that costs. ECHO separates
 /// them: an answer means the connection has earned more patience for the
-/// operation that is running long, and silence means nobody is home and every
-/// waiter should be told at once rather than discovering it one deadline at a
-/// time.
+/// operation that is running long.
+///
+/// **The answer is the loop's only product.** It refreshes the liveness clock
+/// and nothing else; every decision that can cost a caller something is the
+/// response deadline's, in [`Connection::await_response`]. See
+/// [`KEEPALIVE_AFTER`] for why a missed probe must never be a verdict.
 ///
 /// A separate task rather than work inside `receiver_loop`, for the same
 /// reason as the stale-waiter sweeper: the receive loop is parked inside
@@ -437,7 +451,6 @@ fn spawn_plumbing(
 }
 
 async fn keepalive_loop(weak: Weak<Inner>) {
-    let mut unanswered: u32 = 0;
     loop {
         // Re-read the cadence every round so `set_keepalive` takes effect
         // without a restart. While probing is off we still wake on the default
@@ -465,7 +478,6 @@ async fn keepalive_loop(weak: Weak<Inner>) {
             return;
         }
         let Some(after) = *inner.keepalive_after.lock().unwrap() else {
-            unanswered = 0;
             continue;
         };
         // Nothing on the wire (no work to protect), or the server has spoken
@@ -474,54 +486,23 @@ async fn keepalive_loop(weak: Weak<Inner>) {
         // connection never sends one.
         match inner.quiet_for() {
             Some(quiet) if quiet >= after => {}
-            _ => {
-                unanswered = 0;
-                continue;
-            }
+            _ => continue,
         }
 
         let conn = Connection {
             inner: Arc::clone(&inner),
         };
-        match conn.echo_probe(after).await {
-            ProbeOutcome::Alive => {
-                if unanswered > 0 {
-                    debug!(
-                        "keepalive: the server answered again after {unanswered} missed probe(s)"
-                    );
-                }
-                unanswered = 0;
-            }
-            // Evidence of nothing: no credit to ask with, or the send side is
-            // what is stuck (which has its own deadline and its own teardown).
-            // Leaving the count alone rather than guessing either way is what
-            // keeps a saturated pipeline from being declared dead.
-            ProbeOutcome::Skipped => {}
-            ProbeOutcome::Broken => return,
-            ProbeOutcome::Silent => {
-                unanswered += 1;
-                let silent_for = inner.quiet_for().unwrap_or_default();
-                if unanswered >= KEEPALIVE_FAILURES_BEFORE_DEAD {
-                    error!(
-                        "keepalive: {unanswered} ECHO probe(s) unanswered and nothing on the wire \
-                         for {silent_for:?}; declaring the session dead and failing \
-                         {} waiter(s)",
-                        inner.waiters.lock().unwrap().len()
-                    );
-                    fan_error_to_waiters(
-                        &inner,
-                        &Error::ServerUnresponsive {
-                            silent_for,
-                            probes: unanswered,
-                        },
-                    );
-                    return;
-                }
-                warn!(
-                    "keepalive: an ECHO probe went unanswered ({unanswered} of \
-                     {KEEPALIVE_FAILURES_BEFORE_DEAD}); the server has been quiet for {silent_for:?}"
-                );
-            }
+        // An answer refreshes `last_frame_at` on its way through the receiver
+        // task, which is the whole product of this loop: a request on a
+        // connection proven alive that way gets [`ALIVE_DEADLINE_FACTOR`]
+        // times the response deadline. A miss leaves the clock stale, which
+        // costs the connection that extension and nothing else.
+        //
+        // ❌ Never conclude anything harsher from here. The one outcome worth
+        // acting on is a connection somebody else has already torn down, and
+        // only because there is nothing left to probe.
+        if conn.echo_probe(after).await == ProbeOutcome::Broken {
+            return;
         }
     }
 }
@@ -1263,23 +1244,6 @@ impl Inner {
         Some(now.saturating_duration_since(reference))
     }
 
-    /// How long a probe cycle takes to declare a session dead: the silence
-    /// that triggers the first probe, plus every probe's budget and the tick
-    /// between them.
-    ///
-    /// Assumes a healthy send side, which is the case this is sized for. A
-    /// probe that cannot reach the socket is the send deadline's problem and
-    /// tears the connection down on its own schedule.
-    ///
-    /// Exists so `the_default_deadlines_are_layered` can pin the one property
-    /// that makes the keepalive safe to act on: it must reach a verdict BEFORE
-    /// the response deadline would have fired anyway. Later than that and it
-    /// is adding a way to be wrong without buying any detection.
-    #[cfg(test)]
-    fn keepalive_deadline(after: Duration) -> Duration {
-        after + KEEPALIVE_FAILURES_BEFORE_DEAD * (after + Self::keepalive_tick(after))
-    }
-
     /// How often the keepalive loop wakes to check the liveness clock.
     ///
     /// Derived from the probe threshold rather than configured separately: the
@@ -1292,9 +1256,9 @@ impl Inner {
     /// Is the connection provably alive right now?
     ///
     /// "Provably" is the whole point: a frame arrived recently enough that if
-    /// the server had gone quiet, the keepalive would already have said so.
-    /// Anything weaker would extend a deadline on an assumption, which is how
-    /// a hang comes back.
+    /// the server had gone quiet, an ECHO probe would have gone out and gone
+    /// unanswered. Anything weaker would extend a deadline on an assumption,
+    /// which is how a hang comes back.
     ///
     /// Always false when the keepalive is off — with nothing refreshing the
     /// clock, a stale reading means "quiet connection", not "dead server", and
@@ -1304,16 +1268,34 @@ impl Inner {
             return false;
         };
         match self.server_silent_for() {
-            // Three probe thresholds. Two would be the tightest reading that
-            // still makes sense (one to notice the silence, one to answer),
-            // but a probe round that runs late on a loaded client would then
-            // read as a dead server and cut a healthy transfer off. The
-            // ceiling on how wide this may go is `keepalive_deadline`: a
-            // connection the keepalive has already given up on must never
-            // still look alive here.
-            Some(silent) => silent < after * 3,
+            Some(silent) => silent < after * LIVENESS_WINDOW_PROBES,
             None => false,
         }
+    }
+
+    /// The other reading of the same clock: how long the server has been
+    /// silent while owing us something, when that silence is evidence rather
+    /// than an assumption.
+    ///
+    /// `Some` only when the keepalive is armed and the connection has been
+    /// quiet for longer than [`liveness_is_proven`](Self::liveness_is_proven)
+    /// tolerates. The keepalive is what makes the silence mean anything: it
+    /// has been asking a question that needs no disk and no share, so "busy
+    /// with a slow write" stops explaining the quiet. With probing off the
+    /// same reading is just a quiet connection, and this returns `None`.
+    ///
+    /// Measured with [`quiet_for`](Self::quiet_for) rather than
+    /// [`server_silent_for`](Self::server_silent_for), so it never counts
+    /// silence from before we asked anything, and so a server that has said
+    /// nothing at all since the first request still counts — which
+    /// `server_silent_for` cannot express.
+    ///
+    /// A request that runs out of deadline while this reads `None` is ONE
+    /// stalled operation, not a dead link, and must not be reported as one.
+    fn unresponsive_for(&self) -> Option<Duration> {
+        let after = (*self.keepalive_after.lock().unwrap())?;
+        let quiet = self.quiet_for()?;
+        (quiet >= after * LIVENESS_WINDOW_PROBES).then_some(quiet)
     }
 
     /// How long `msg_id` has gone without a sign of life, or `None` if it is
@@ -2263,18 +2245,18 @@ impl Connection {
     /// Ask the server directly whether it is still processing requests.
     ///
     /// SMB2 ECHO (MS-SMB2 § 2.2.28) is a four-byte request that touches no
-    /// share, no handle, and no disk. That is what makes the answer mean
-    /// something specific: a server too busy for THIS is not busy, it is gone.
+    /// share, no handle, and no disk. That is what makes an answer mean
+    /// something specific: the server is processing requests, full stop.
     ///
     /// Bounded on both legs, and the two are told apart deliberately:
     ///
-    /// - **Could not ask** → [`ProbeOutcome::Skipped`], never a failure. No
-    ///   credit on hand is the common case, and it happens precisely when the
-    ///   pipeline is deepest; counting it as silence would make the busiest
-    ///   healthy transfers the ones most likely to be torn down, which is the
-    ///   credit-starvation hang wearing a different hat.
-    /// - **Asked, no answer** → [`ProbeOutcome::Silent`], the only outcome
-    ///   that counts against the server.
+    /// - **Could not ask** → [`ProbeOutcome::Skipped`]. No credit on hand is
+    ///   the common case, and it happens precisely when the pipeline is
+    ///   deepest, so it is counted and logged separately rather than filed
+    ///   under "the server said nothing".
+    /// - **Asked, no answer** → [`ProbeOutcome::Silent`]. Evidence, not a
+    ///   verdict: it leaves the liveness clock stale, which is what withholds
+    ///   the deadline extension.
     ///
     /// Getting the probe onto the wire is the send deadline's business
     /// ([`set_send_timeout`](Self::set_send_timeout) bounds it and tears the
@@ -2349,6 +2331,11 @@ impl Connection {
                     .metrics
                     .keepalive_failures
                     .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "keepalive: an ECHO probe went unanswered within {budget:?}; this connection \
+                     has no liveness proof until a frame arrives, so a slow request on it gets \
+                     the plain response deadline"
+                );
                 ProbeOutcome::Silent
             }
         }
@@ -2748,12 +2735,23 @@ impl Connection {
     /// evidence of a slow operation. That is the entire reason the keepalive
     /// exists: without it there is one number for two situations, and every
     /// value of it is wrong for one of them.
+    ///
+    /// The same reading names the failure when the budget does run out. A
+    /// connection that kept answering has one stalled operation on it
+    /// ([`Error::Timeout`]); a connection that answered nothing at all, ECHO
+    /// probes included, is a dead link ([`Error::ServerUnresponsive`]) and is
+    /// torn down so every other waiter learns at once. Reaching that verdict
+    /// always costs a request its full deadline first, so it can never lose
+    /// anything the plain deadline was not already losing.
     async fn await_response(&self, mut guard: WaiterGuard, command: Command) -> Result<Frame> {
         let msg_id = guard.msg_id();
         let timeout = *self.inner.response_timeout.lock().unwrap();
-        let Some(timeout) = timeout.filter(|_| !is_long_poll(command)) else {
+        let Some(timeout) = timeout else {
             return guard.recv().await;
         };
+        if is_long_poll(command) {
+            return self.await_long_poll(guard, command, timeout).await;
+        }
         // Bounded even when the connection is healthy: "alive" is a reason for
         // more patience, never for unlimited patience. A server answering ECHO
         // that still has not answered THIS is stalled in a way waiting cannot
@@ -2792,33 +2790,121 @@ impl Connection {
                             }
                             continue;
                         }
+                        // Read the connection's verdict BEFORE dropping out of
+                        // the waiters map: `quiet_for` measures from the
+                        // oldest outstanding request, so a lone waiter that
+                        // deregisters first takes the evidence with it.
+                        let verdict = self.inner.unresponsive_for();
                         self.remove_waiter(msg_id);
                         self.inner
                             .metrics
                             .response_timeouts
                             .fetch_add(1, Ordering::Relaxed);
-                        // Two different diagnoses, and the log has to say
+                        // Two different diagnoses, and the error has to say
                         // which: a connection that went quiet is a network or
                         // server death, while one that kept answering has a
                         // single stalled operation on it.
-                        if extended {
-                            warn!(
-                                "no response: cmd={:?}, msg_id={}, silent for {:?} on a connection \
-                                 that stayed alive; giving up — the operation is stalled, not the \
-                                 session",
-                                command, msg_id.0, idle
-                            );
-                        } else {
-                            warn!(
-                                "no response: cmd={:?}, msg_id={}, silent for {:?}; giving up",
-                                command, msg_id.0, idle
-                            );
+                        if let Some(silent_for) = verdict {
+                            return Err(self.declare_unresponsive(silent_for));
                         }
+                        warn!(
+                            "no response: cmd={:?}, msg_id={}, silent for {:?}; giving up — \
+                             nothing here says the connection itself is gone, so this is one \
+                             stalled operation",
+                            command, msg_id.0, idle
+                        );
                         return Err(Error::Timeout);
                     }
                 }
             }
         }
+    }
+
+    /// Wait for a long-poll command, bounded by the connection rather than by
+    /// the request.
+    ///
+    /// A CHANGE_NOTIFY has no deadline of its own by design: it waits for an
+    /// event that may never come, and hours of silence is the healthy case.
+    /// That leaves it as the one wait in the crate with nothing to end it, so
+    /// a dead server used to park a `Watcher` on an event that could never
+    /// arrive. What ends it here is the connection going silent, which is a
+    /// reading only the keepalive makes meaningful — with probing off, a quiet
+    /// connection is just a quiet connection and this waits forever, as it
+    /// always did.
+    ///
+    /// The clock is [`Inner::quiet_for`], not the request's own idle time: a
+    /// watcher that has been open for an hour is not a symptom of anything,
+    /// and measuring from the later of "the server last spoke" and "we asked"
+    /// gives a watch registered on an already-quiet connection its full budget
+    /// before anyone concludes anything from it.
+    async fn await_long_poll(
+        &self,
+        mut guard: WaiterGuard,
+        command: Command,
+        budget: Duration,
+    ) -> Result<Frame> {
+        let msg_id = guard.msg_id();
+        let tick = (budget / 4).clamp(Duration::from_millis(25), Duration::from_secs(1));
+        let mut receiving = Box::pin(guard.recv());
+        loop {
+            let idle_check = Box::pin(tokio::time::sleep(tick));
+            match select(receiving, idle_check).await {
+                Either::Left((frame, _)) => return frame,
+                Either::Right((_, still_receiving)) => {
+                    receiving = still_receiving;
+                    // The response has been routed and the next poll will
+                    // produce it — never a timeout.
+                    if self.inner.waiter_idle_for(msg_id).is_none() {
+                        continue;
+                    }
+                    // The same verdict an ordinary request's deadline reaches,
+                    // on the connection's clock instead of the request's, and
+                    // held to the response deadline's budget rather than to
+                    // the shorter window that merely withholds an extension.
+                    let Some(quiet) = self.inner.unresponsive_for().filter(|q| *q >= budget) else {
+                        continue;
+                    };
+                    self.remove_waiter(msg_id);
+                    self.inner
+                        .metrics
+                        .response_timeouts
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "no sign of life: cmd={:?}, msg_id={}, nothing on the wire for {:?} \
+                         while this long poll waited; giving up on it",
+                        command, msg_id.0, quiet
+                    );
+                    return Err(self.declare_unresponsive(quiet));
+                }
+            }
+        }
+    }
+
+    /// The link is dead: end every wait on it at once and mark it so.
+    ///
+    /// Called only when a wait has already run out of budget AND the server
+    /// has put nothing at all on the wire, ECHO probes included. Both halves
+    /// matter. The budget is what keeps this from costing anything the plain
+    /// deadline was not already costing, and the connection-wide silence is
+    /// what makes "dead link" a better description than "stalled operation" —
+    /// telling the other waiters now beats each discovering it a deadline at a
+    /// time, and marking it dead is what gives
+    /// [`reconnect_if_needed`](Self::reconnect_if_needed) something to revive.
+    ///
+    /// ❌ This is deliberately not something the keepalive can reach on its
+    /// own. A missed probe means "no extension" and nothing more; see
+    /// [`KEEPALIVE_AFTER`] for the NAS that made that distinction necessary.
+    fn declare_unresponsive(&self, silent_for: Duration) -> Error {
+        let err = Error::ServerUnresponsive { silent_for };
+        error!(
+            "the server has put nothing on the wire for {:?} while work was outstanding and \
+             the keepalive was probing it; declaring the session dead and failing {} other \
+             waiter(s)",
+            silent_for,
+            self.inner.waiters.lock().unwrap().len()
+        );
+        fan_error_to_waiters(&self.inner, &err);
+        err
     }
 
     /// How long a request may go without any sign of life from the server
@@ -2864,16 +2950,14 @@ impl Connection {
     /// before the client asks it directly with an SMB2 ECHO. `None` turns the
     /// keepalive off.
     ///
-    /// Defaults to 5 s. This is what makes
-    /// [`set_response_timeout`](Self::set_response_timeout) safe to keep
-    /// short: a deadline on its own cannot tell a slow server from a dead one,
-    /// so it has to be sized for the slowest healthy case and is a poor
-    /// detector of the dead one. ECHO touches no disk, no share, and no open
-    /// handle, so an answer means the server is processing requests. Two
-    /// unanswered probes tear the connection down with
-    /// [`crate::Error::ServerUnresponsive`];
-    /// an answered one lets a slow request run to a ceiling well past the
-    /// plain deadline.
+    /// **The keepalive tells the response deadline whether the server is
+    /// alive; an alive server gets more time.** That is the whole feature. It
+    /// is on by default (5 s) because it can only ever hand time out, never
+    /// take it away: a request on a connection ECHO has just proven alive runs
+    /// to [`set_response_timeout`](Self::set_response_timeout) × 6 instead of
+    /// × 1, and a probe the server ignores simply leaves that extension
+    /// ungranted. ❌ A missed probe never ends anything on its own — a busy
+    /// NAS drops probes exactly while a transfer is running.
     ///
     /// It measures **silence**, not elapsed time, so a connection with
     /// responses flowing never probes at all and a busy transfer pays nothing
@@ -2881,10 +2965,19 @@ impl Connection {
     /// there is no work to protect, and the next request's own deadlines
     /// cover it.
     ///
-    /// ❌ Turning it off also turns off the deadline extension, which is the
-    /// half of this that keeps slow-but-healthy operations alive: with nothing
-    /// refreshing the liveness clock, a fresh reading is luck rather than
-    /// evidence, and extending a deadline on luck is how a hang comes back.
+    /// Two things follow from turning it off, both by design:
+    ///
+    /// - **No extension**, ever. With nothing refreshing the liveness clock a
+    ///   fresh reading is luck rather than evidence, and a deadline extended
+    ///   on luck is the hang coming back.
+    /// - **No [`crate::Error::ServerUnresponsive`]**, and a long-poll
+    ///   CHANGE_NOTIFY waits indefinitely again. Both of those rest on
+    ///   "nobody could get a word out of this server", which is a claim only
+    ///   probing can support.
+    ///
+    /// Independent of [`ClientConfig::auto_reconnect`](crate::client::ClientConfig::auto_reconnect):
+    /// this decides how patient a deadline is, that decides whether a dead
+    /// session is re-dialed. Neither switches the other on.
     pub fn set_keepalive(&self, after: Option<Duration>) {
         *self.inner.keepalive_after.lock().unwrap() = after;
     }
@@ -3851,9 +3944,8 @@ fn fan_error_to_waiters(inner: &Inner, e: &Error) {
 /// needs retrying" is choosing on exactly that.
 fn clone_err_for_waiters(e: &Error) -> Error {
     match e {
-        Error::ServerUnresponsive { silent_for, probes } => Error::ServerUnresponsive {
+        Error::ServerUnresponsive { silent_for } => Error::ServerUnresponsive {
             silent_for: *silent_for,
-            probes: *probes,
         },
         _ => Error::Disconnected,
     }
@@ -4423,28 +4515,25 @@ mod tests {
              timing out"
         );
         assert!(
-            Inner::keepalive_deadline(KEEPALIVE_AFTER) < RESPONSE_TIMEOUT,
-            "the keepalive has to reach its verdict before the response deadline would \
-             have fired anyway. Later than that and it can only ever be wrong (a healthy \
-             connection torn down) without ever being useful (a dead one caught sooner)"
+            KEEPALIVE_AFTER + Inner::keepalive_tick(KEEPALIVE_AFTER) < RESPONSE_TIMEOUT,
+            "a probe has to go out and be given time to come back before the response \
+             deadline fires, or the deadline would always decide with no evidence to \
+             hand and the keepalive could never earn anyone an extension"
         );
         assert!(
-            KEEPALIVE_AFTER * 3 <= Inner::keepalive_deadline(KEEPALIVE_AFTER),
-            "liveness must stop looking 'proven' no later than the keepalive's own \
-             verdict, or a request could be granted an extension on a connection the \
-             keepalive has already declared dead"
-        );
-        assert!(
-            KEEPALIVE_AFTER * 3 < RESPONSE_TIMEOUT,
-            "evidence older than the deadline it overrides is not evidence"
+            KEEPALIVE_AFTER * LIVENESS_WINDOW_PROBES < RESPONSE_TIMEOUT,
+            "evidence older than the deadline it overrides is not evidence: liveness \
+             must stop looking 'proven' before a request's own budget runs out, or the \
+             extension would be granted on a reading nothing has refreshed"
         );
         // Compile-time: a tuning pass that breaks these should fail the build,
         // not merely a test run.
         const {
             assert!(
-                KEEPALIVE_FAILURES_BEFORE_DEAD >= 2,
-                "on Samba the process answering ECHO is the one that may be blocked in a \
-                 pwrite on a stalled disk, so a single missed probe is not proof of death"
+                LIVENESS_WINDOW_PROBES >= 2,
+                "one probe threshold leaves no room for a probe round that ran late on a \
+                 loaded client, so a healthy connection would drop out of 'proven alive' \
+                 between two answered probes"
             )
         };
         const {

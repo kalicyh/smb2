@@ -3848,9 +3848,13 @@ async fn guest_server_side_copy_range_then_positioned_append() {
 /// Everything the keepalive does rests on this one fact, and no mock can
 /// establish it: the probe carries the session id, gets signed when the
 /// session signs and encrypted when the session encrypts, and names no tree.
-/// A server that ignored such a frame — or dropped the connection over it —
-/// would turn the keepalive from a safety net into the thing that kills
-/// healthy transfers.
+/// A server that ignored such a frame would leave every connection to it
+/// without liveness proof, so slow-but-healthy operations would fall back to
+/// the plain response deadline.
+///
+/// ⚠️ Deliberately not "every probe is answered". A real NAS drops them under
+/// write load, and a dropped probe is harmless by design: it withholds the
+/// deadline extension and nothing else.
 ///
 /// Run against four session modes because the header rules are exactly what is
 /// in question: guest (unsigned), authenticated, mandatory signing, and
@@ -3922,7 +3926,7 @@ async fn a_real_server_answers_the_echo_keepalive_probe() {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let m = conn.diagnostics().metrics;
-            if m.keepalive_probes_sent >= 2 && m.keepalive_probes_sent > m.keepalive_failures {
+            if m.keepalive_probes_sent - m.keepalive_failures >= 2 {
                 break;
             }
             assert!(
@@ -3937,15 +3941,10 @@ async fn a_real_server_answers_the_echo_keepalive_probe() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        let m = conn.diagnostics().metrics;
-        assert_eq!(
-            m.keepalive_failures, 0,
-            "{label}: the server left an ECHO probe unanswered, which would tear a \
-             healthy connection down"
-        );
         assert!(
             !conn.diagnostics().disconnected,
-            "{label}: probing the server cost us the connection"
+            "{label}: probing the server cost us the connection — a dropped probe must \
+             never do more than withhold a deadline extension"
         );
 
         watching.abort();

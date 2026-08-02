@@ -413,12 +413,17 @@ pub struct MetricsSnapshot {
     /// A steady stream of these means the credit window is fully spent
     /// whenever the server goes quiet, which leaves the connection without a
     /// liveness signal — slow-but-alive operations fall back to the plain
-    /// response deadline. Skips are never counted as failures: doing so would
-    /// turn a saturated pipeline into a false death sentence.
+    /// response deadline. Skips are never counted as failures: they say
+    /// nothing about the server.
     pub keepalive_probes_skipped: u64,
-    /// Probes that reached the wire and were never answered. Two in a row
-    /// declare the session dead and tear the connection down with
-    /// [`Error::ServerUnresponsive`](crate::Error::ServerUnresponsive).
+    /// Probes that reached the wire and were never answered.
+    ///
+    /// Not a failure count in any operational sense — a busy NAS drops probes
+    /// while it writes, and this rising on its own costs a connection nothing
+    /// but the deadline extension it would otherwise have earned. It is worth
+    /// watching next to `response_deadline_extensions`: probes going
+    /// unanswered while slow operations need the extra room is the shape that
+    /// ends in [`Error::Timeout`](crate::Error::Timeout).
     pub keepalive_failures: u64,
     /// Requests that went past
     /// [`Connection::set_response_timeout`](crate::client::connection::Connection::set_response_timeout)

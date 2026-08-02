@@ -2241,6 +2241,14 @@ async fn bench_100_tiny_files_seq_vs_parallel() {
 /// build on its own firmware, and it is the one that went silent for 40
 /// minutes on a live socket. Worth asking directly.
 ///
+/// ⚠️ What this must NOT assert is that every probe comes back. This NAS drops
+/// them under heavy write load (measured 2026-08-02: two answered, one
+/// dropped, while an earlier version of this test demanded zero drops), and a
+/// dropped probe is deliberately harmless now — it withholds a deadline
+/// extension and nothing else. The contract worth pinning is that probes get
+/// answered often enough to *earn* that extension, and that the drops cost
+/// the connection nothing.
+///
 /// The connection is kept quiet-but-busy with a `Watcher` on a directory of
 /// its own, which is the shape the keepalive exists for: something
 /// outstanding, nothing coming back. A neighbouring change would be a frame on
@@ -2267,17 +2275,20 @@ async fn nas_answers_the_echo_keepalive_probe() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let m = conn.diagnostics().metrics;
-        if m.keepalive_probes_sent >= 2 && m.keepalive_probes_sent > m.keepalive_failures {
+        let answered = m.keepalive_probes_sent - m.keepalive_failures;
+        if answered >= 2 {
             println!(
-                "NAS answered {} ECHO probe(s), {} unanswered, {} skipped",
-                m.keepalive_probes_sent, m.keepalive_failures, m.keepalive_probes_skipped
+                "NAS answered {answered} of {} ECHO probe(s), {} skipped",
+                m.keepalive_probes_sent, m.keepalive_probes_skipped
             );
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the NAS never got two probes answered (sent {}, unanswered {}, skipped {}, \
-             {} request(s) outstanding)",
+            "the NAS never answered two probes (sent {}, unanswered {}, skipped {}, \
+             {} request(s) outstanding). Nothing here can be recovered by waiting: with no \
+             answered probe the connection has no liveness proof, so every slow request on \
+             it falls back to the plain response deadline",
             m.keepalive_probes_sent,
             m.keepalive_failures,
             m.keepalive_probes_skipped,
@@ -2286,14 +2297,10 @@ async fn nas_answers_the_echo_keepalive_probe() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    assert_eq!(
-        conn.diagnostics().metrics.keepalive_failures,
-        0,
-        "the NAS left an ECHO probe unanswered, which would tear a healthy connection down"
-    );
     assert!(
         !conn.diagnostics().disconnected,
-        "probing the NAS cost us the connection"
+        "probing the NAS cost us the connection — a dropped probe must never do more than \
+         withhold a deadline extension"
     );
 
     watching.abort();

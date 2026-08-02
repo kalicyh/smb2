@@ -231,18 +231,22 @@ pub enum Error {
         waited: std::time::Duration,
     },
 
-    /// The server stopped answering, so the session was declared dead.
+    /// A request ran out of deadline on a connection the server had gone
+    /// completely silent on, so the whole session was declared dead.
     ///
-    /// The keepalive asks an idle-looking server directly with SMB2 ECHO
-    /// (MS-SMB2 § 2.2.28), a request that touches no disk and no share. A
-    /// server that will not answer *that* is not merely busy, so the
-    /// connection is torn down and every waiter gets this instead of sitting
-    /// out its own deadline one by one.
+    /// This is [`Error::Timeout`] with a second fact attached. Both mean a
+    /// request went unanswered for its full budget; this one adds that the
+    /// server put *nothing* on the wire in the meantime, not even an answer to
+    /// the SMB2 ECHO probes the keepalive sends (MS-SMB2 § 2.2.28, a request
+    /// that touches no disk and no share). One stuck operation cannot look
+    /// like that, so the connection is torn down and every other waiter is
+    /// told at once rather than sitting out its own deadline one by one.
     ///
     /// The distinction from the other three is what it lets you conclude:
     ///
     /// - [`Error::Timeout`] -- *this* request went unanswered. The connection
-    ///   may be perfectly healthy and the operation merely stuck.
+    ///   may be perfectly healthy and the operation merely stuck; retrying it
+    ///   on the same connection is reasonable.
     /// - [`Error::SendTimeout`] -- the request never reached the network, so
     ///   nothing at all follows about the server.
     /// - [`Error::Disconnected`] -- the socket itself went away (EOF, reset).
@@ -251,16 +255,13 @@ pub enum Error {
     ///
     /// Classifies as [`ErrorKind::ConnectionLost`] (the same as
     /// `Disconnected`, so existing reconnect paths pick it up unchanged) and
-    /// reports as retryable. Tune or disable the probing with
-    /// [`Connection::set_keepalive`](crate::client::connection::Connection::set_keepalive).
-    #[error(
-        "server stopped answering: silent for {silent_for:?}, {probes} ECHO probe(s) unanswered"
-    )]
+    /// reports as retryable. It cannot occur with the keepalive off
+    /// ([`Connection::set_keepalive`](crate::client::connection::Connection::set_keepalive)),
+    /// since nothing would then be asking: expect [`Error::Timeout`] instead.
+    #[error("server stopped answering: nothing on the wire for {silent_for:?}")]
     ServerUnresponsive {
         /// How long since the server last put any frame on the wire.
         silent_for: std::time::Duration,
-        /// Consecutive unanswered ECHO probes that led to the verdict.
-        probes: u32,
     },
 }
 
