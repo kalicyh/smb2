@@ -958,7 +958,10 @@ async fn a_frame_built_for_the_dead_session_cannot_reach_the_new_socket() {
     let _ = finish(spawn_write(&conn), "the stranded write").await;
 
     let sent_to_the_corpse = nas.generation(0).seen.lock().unwrap().len();
-    conn.reconnect_if_needed().await.expect("revival");
+    tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("the revival hung")
+        .expect("revival");
     assert!(finish(spawn_write(&conn), "the retried write")
         .await
         .is_ok());
@@ -1001,7 +1004,10 @@ async fn a_revival_leaves_no_state_belonging_to_the_dead_session() {
 
     nas.goes_away();
     let _ = finish(spawn_write(&conn), "the stranded write").await;
-    conn.reconnect_if_needed().await.expect("revival");
+    tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("the revival hung")
+        .expect("revival");
 
     assert_eq!(
         conn.next_message_id(),
@@ -1042,7 +1048,10 @@ async fn a_revived_connection_can_still_detect_the_next_death() {
         .is_ok());
     nas.goes_away();
     let _ = finish(spawn_write(&conn), "the stranded write").await;
-    conn.reconnect_if_needed().await.expect("revival");
+    tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("the revival hung")
+        .expect("revival");
     assert!(finish(spawn_write(&conn), "the retried write")
         .await
         .is_ok());
