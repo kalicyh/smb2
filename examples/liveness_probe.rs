@@ -314,7 +314,11 @@ async fn main() {
         m_events.load(Ordering::Relaxed)
     );
 
-    // Leave the server as we found it.
-    let _ = s_tree.delete_directory(&mut s_conn, &s_dir).await;
+    // Leave the server as we found it. Both removals go through the measured
+    // connection: the shipping one is the one under test, so on any run that
+    // proves the point it is already torn down and would leave its directory
+    // behind.
+    let _ = m_tree.delete_directory(&mut m_conn, &s_dir).await;
     let _ = m_tree.delete_directory(&mut m_conn, &cfg.dir).await;
+    drop((s_conn, s_tree));
 }
