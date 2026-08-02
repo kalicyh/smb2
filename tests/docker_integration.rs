@@ -4122,3 +4122,126 @@ async fn guest_durable_handle_survives_a_reconnect_when_the_server_grants_one() 
     }
     tree.delete_file(conn, path).await.ok();
 }
+
+/// A revival re-derives the signing keys, and the server proves it by
+/// accepting what we sign afterwards.
+///
+/// This is the sharpest edge of `install_transport` wiping the crypto state.
+/// Signing keys are derived per session from a preauth hash; carrying a dead
+/// session's keys, or a stale preauth hash, over a revival makes every frame
+/// after it fail verification. A server with mandatory signing rejects a badly
+/// signed frame outright, so a read that comes back correct on the far side of
+/// a reconnect is the server vouching for the keys.
+#[tokio::test]
+#[ignore]
+async fn a_reconnect_to_a_signing_required_server_re_derives_working_keys() {
+    let _ = env_logger::try_init();
+
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: SIGNING_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: "testuser".to_string(),
+        password: "testpass".to_string(),
+        domain: String::new(),
+        auto_reconnect: true,
+        compression: false,
+        dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
+    })
+    .await
+    .expect("connect to smb-signing");
+    assert!(client.params().unwrap().signing_required);
+
+    let mut tree = client
+        .connect_share("private")
+        .await
+        .expect("connect_share");
+    let path = "reconnect_signed.tmp";
+    let payload = b"signed on both sides of the blip";
+    client
+        .write_file(&mut tree, path, payload)
+        .await
+        .expect("write before the reconnect");
+
+    client.reconnect().await.expect("reconnect");
+
+    let mut tree = client
+        .connect_share("private")
+        .await
+        .expect("re-connect_share");
+    let read_back = client.read_file(&mut tree, path).await.expect(
+        "a signing-required server rejects badly signed frames, so this \
+                 succeeding IS the proof that the keys were re-derived",
+    );
+    assert_eq!(read_back, payload);
+    client.delete_file(&mut tree, path).await.ok();
+}
+
+/// The same round trip against the SMB 3.1.1 encryption-capable server.
+///
+/// ⚠️ **This does NOT prove an encrypted session survives a revival**, and it
+/// is documented here so nobody reads it as though it does. Both encryption
+/// fixtures run `smb encrypt = desired` rather than `required`, and Samba 4.20
+/// only sets `SMB2_SHAREFLAG_ENCRYPT_DATA` for `required` — so this client
+/// never activates encryption against them and the traffic is plaintext
+/// (verified 2026-08-02: `should_encrypt` and `tree.encrypt_data` are both
+/// false before any reconnect). What it does cover is the crypto posture being
+/// *preserved* across a revival on an SMB 3.1.1 session, and it will start
+/// covering the real thing the day a fixture demands encryption.
+///
+/// The encrypted-session revival itself rests on the unit tests, which assert
+/// the crypto state is wiped and re-derived.
+#[tokio::test]
+#[ignore]
+async fn a_reconnect_preserves_the_crypto_posture_on_an_smb311_session() {
+    let _ = env_logger::try_init();
+
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: ENCRYPTION_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: "testuser".to_string(),
+        password: "testpass".to_string(),
+        domain: String::new(),
+        auto_reconnect: true,
+        compression: false,
+        dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
+    })
+    .await
+    .expect("connect to smb-encryption");
+
+    let mut tree = client
+        .connect_share("private")
+        .await
+        .expect("connect_share");
+    let posture_before = client.diagnostics().primary.encryption.active;
+    let path = "reconnect_encrypted.tmp";
+    let payload = b"the same posture on both sides of the blip";
+    client
+        .write_file(&mut tree, path, payload)
+        .await
+        .expect("write before the reconnect");
+
+    client.reconnect().await.expect("reconnect");
+
+    // `connect_share` is where share-level encryption is re-activated, from
+    // the session keys the client adopts off the revived connection. Getting
+    // that adoption wrong is silent: the old session's keys would encrypt
+    // frames this server has never seen a key for.
+    let mut tree = client
+        .connect_share("private")
+        .await
+        .expect("re-connect_share");
+    let read_back = client
+        .read_file(&mut tree, path)
+        .await
+        .expect("read after the reconnect");
+    assert_eq!(read_back, payload);
+    assert_eq!(
+        client.diagnostics().primary.encryption.active,
+        posture_before,
+        "a revival must re-establish the same crypto posture the session had, \
+         not quietly drop or add encryption"
+    );
+    client.delete_file(&mut tree, path).await.ok();
+}
