@@ -1340,3 +1340,625 @@ async fn reconnecting_a_connection_that_never_died_is_a_no_op() {
     assert_eq!(conn.metrics().reconnects_succeeded, 0);
     assert_eq!(conn.generation(), 0);
 }
+
+// ── A NAS with a disk, and a transfer that survives it rebooting ────────────
+//
+// [`BouncingNas`] above answers nothing but ECHO and WRITE, which is all the
+// revival machinery needs. Proving that a transfer *resumes* rather than
+// *restarts* needs a server that actually keeps files: a durable handle
+// survives the connection, not the storage behind it, so every generation of
+// the connection has to see the same disk and the same open table.
+
+use std::collections::HashMap;
+
+use crate::client::durable::DurableHandle;
+use crate::client::tree::Tree;
+use crate::msg::close::CloseResponse;
+use crate::msg::create::{CreateAction, CreateRequest, CreateResponse};
+use crate::msg::create_context::{self};
+use crate::pack::{FileTime, Guid};
+use crate::types::flags::Capabilities;
+use crate::types::{Dialect, FileId, OplockLevel};
+
+/// One durable open the server is holding on the client's behalf.
+#[derive(Clone)]
+struct HeldOpen {
+    path: String,
+    /// What the client sent in `DH2Q`. A reclaim must match it.
+    create_guid: Vec<u8>,
+    /// The file's identity on this NAS's disk.
+    inode: u64,
+}
+
+/// The storage behind every generation of the connection.
+#[derive(Default)]
+struct NasDisk {
+    /// path → contents.
+    files: Mutex<HashMap<String, Vec<u8>>>,
+    /// path → inode, stable for the life of the NAS.
+    inodes: Mutex<HashMap<String, u64>>,
+    /// The durable opens the server is holding, keyed by the persistent id it
+    /// handed out.
+    opens: Mutex<HashMap<u64, HeldOpen>>,
+    next_id: AtomicUsize,
+    /// Every byte the server has ever accepted. The number that tells a
+    /// resumed transfer from a restarted one: restarting a 40 KB file makes
+    /// this 80 KB.
+    bytes_accepted: AtomicUsize,
+    /// When set, the next reclaim is answered with a handle to a DIFFERENT
+    /// file. Not something a correct server does; the client must refuse it
+    /// regardless.
+    hand_back_the_wrong_file: AtomicBool,
+    /// When set, durable opens are forgotten on disconnect, which is what a
+    /// server that actually restarted would do.
+    forget_opens_on_disconnect: AtomicBool,
+}
+
+impl NasDisk {
+    fn inode_of(&self, path: &str) -> u64 {
+        let mut inodes = self.inodes.lock().unwrap();
+        let next = inodes.len() as u64 + 1000;
+        *inodes.entry(path.to_string()).or_insert(next)
+    }
+
+    fn bytes_of(&self, path: &str) -> usize {
+        self.files
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+}
+
+/// A transport for one connection to [`NasDisk`], answering CREATE (durable
+/// contexts and all), WRITE, CLOSE, and ECHO.
+struct NasLink {
+    disk: Arc<NasDisk>,
+    outbox: Mutex<VecDeque<Vec<u8>>>,
+    ready: Notify,
+    /// When false the server answers nothing, which is how it looks when it
+    /// goes away.
+    answering: AtomicBool,
+}
+
+impl NasLink {
+    fn new(disk: &Arc<NasDisk>) -> Arc<Self> {
+        Arc::new(Self {
+            disk: Arc::clone(disk),
+            outbox: Mutex::new(VecDeque::new()),
+            ready: Notify::new(),
+            answering: AtomicBool::new(true),
+        })
+    }
+
+    fn push(&self, frame: Vec<u8>) {
+        self.outbox.lock().unwrap().push_back(frame);
+        self.ready.notify_one();
+    }
+
+    fn respond_to_create(&self, header: &Header, req: &CreateRequest) -> Vec<u8> {
+        let path = req.name.clone();
+        let asked = create_context::parse_contexts(&req.create_contexts).unwrap_or_default();
+        let mut answers = Vec::new();
+        let mut file_id = FileId {
+            persistent: 0,
+            volatile: 0,
+        };
+        let mut status = NtStatus::SUCCESS;
+
+        if let Some(dh2c) = create_context::find(&asked, create_context::NAME_DH2C) {
+            // A reclaim. Look the open up and check the guid the way MS-SMB2
+            // § 3.3.5.9.12 requires.
+            let persistent = u64::from_le_bytes(dh2c.data[0..8].try_into().unwrap());
+            let guid = dh2c.data[16..32].to_vec();
+            let held = self.disk.opens.lock().unwrap().get(&persistent).cloned();
+            match held {
+                Some(held) if held.create_guid == guid => {
+                    // A reclaimed open gets a NEW id, the way a real server
+                    // hands back a fresh volatile (and often persistent) id.
+                    // A client that kept writing through the old one would be
+                    // writing into nothing, which the tests below rely on to
+                    // stay detectable.
+                    let fresh = self.disk.next_id.fetch_add(1, Ordering::Relaxed) as u64 + 1;
+                    file_id = FileId {
+                        persistent: fresh,
+                        volatile: fresh,
+                    };
+                    let inode = if self.disk.hand_back_the_wrong_file.load(Ordering::Relaxed) {
+                        held.inode + 1
+                    } else {
+                        held.inode
+                    };
+                    let mut opens = self.disk.opens.lock().unwrap();
+                    opens.remove(&persistent);
+                    opens.insert(fresh, held);
+                    answers.push(on_disk_context(inode));
+                }
+                _ => status = NtStatus::OBJECT_NAME_NOT_FOUND,
+            }
+        } else {
+            let persistent = self.disk.next_id.fetch_add(1, Ordering::Relaxed) as u64 + 1;
+            file_id = FileId {
+                persistent,
+                volatile: persistent,
+            };
+            self.disk
+                .files
+                .lock()
+                .unwrap()
+                .entry(path.clone())
+                .or_default();
+            let inode = self.disk.inode_of(&path);
+            if let Some(dh2q) = create_context::find(&asked, create_context::NAME_DH2Q) {
+                self.disk.opens.lock().unwrap().insert(
+                    persistent,
+                    HeldOpen {
+                        path: path.clone(),
+                        create_guid: dh2q.data[16..32].to_vec(),
+                        inode,
+                    },
+                );
+                let mut grant = Vec::new();
+                grant.extend_from_slice(&180_000u32.to_le_bytes());
+                grant.extend_from_slice(&0u32.to_le_bytes());
+                answers.push(create_context::CreateContext::new(
+                    create_context::NAME_DH2Q,
+                    grant,
+                ));
+            }
+            if create_context::find(&asked, create_context::NAME_QFID).is_some() {
+                answers.push(on_disk_context(inode));
+            }
+        }
+
+        let mut h = Header::new_request(Command::Create);
+        h.flags.set_response();
+        h.message_id = header.message_id;
+        h.credits = 8;
+        h.status = status;
+        if status != NtStatus::SUCCESS {
+            return pack_message(
+                &h,
+                &crate::msg::header::ErrorResponse {
+                    error_context_count: 0,
+                    error_data: vec![],
+                },
+            );
+        }
+        pack_message(
+            &h,
+            &CreateResponse {
+                oplock_level: OplockLevel::Batch,
+                flags: 0,
+                create_action: CreateAction::FileOpened,
+                creation_time: FileTime::ZERO,
+                last_access_time: FileTime::ZERO,
+                last_write_time: FileTime::ZERO,
+                change_time: FileTime::ZERO,
+                allocation_size: 0,
+                end_of_file: 0,
+                file_attributes: 0,
+                file_id,
+                create_contexts: create_context::pack_contexts(&answers),
+            },
+        )
+    }
+
+    fn respond_to_write(&self, header: &Header, req: &WriteRequest) -> Vec<u8> {
+        let path = self
+            .disk
+            .opens
+            .lock()
+            .unwrap()
+            .get(&req.file_id.persistent)
+            .map(|o| o.path.clone());
+        let mut h = Header::new_request(Command::Write);
+        h.flags.set_response();
+        h.message_id = header.message_id;
+        h.credits = 8;
+
+        let Some(path) = path else {
+            // A write through a handle this server does not know. Real servers
+            // answer STATUS_FILE_CLOSED; answering anything friendlier would
+            // let a client that failed to adopt a reclaimed handle look like
+            // it was working.
+            h.status = NtStatus::FILE_CLOSED;
+            return pack_message(
+                &h,
+                &crate::msg::header::ErrorResponse {
+                    error_context_count: 0,
+                    error_data: vec![],
+                },
+            );
+        };
+
+        {
+            let mut files = self.disk.files.lock().unwrap();
+            let file = files.entry(path).or_default();
+            let end = req.offset as usize + req.data.len();
+            if file.len() < end {
+                file.resize(end, 0);
+            }
+            file[req.offset as usize..end].copy_from_slice(&req.data);
+        }
+        self.disk
+            .bytes_accepted
+            .fetch_add(req.data.len(), Ordering::Relaxed);
+
+        pack_message(
+            &h,
+            &WriteResponse {
+                count: req.data.len() as u32,
+                remaining: 0,
+                write_channel_info_offset: 0,
+                write_channel_info_length: 0,
+            },
+        )
+    }
+}
+
+fn on_disk_context(inode: u64) -> create_context::CreateContext {
+    let mut body = Vec::new();
+    body.extend_from_slice(&inode.to_le_bytes());
+    body.extend_from_slice(&42u64.to_le_bytes()); // one volume
+    body.extend_from_slice(&[0u8; 16]);
+    create_context::CreateContext::new(create_context::NAME_QFID, body)
+}
+
+#[async_trait]
+impl TransportSend for NasLink {
+    async fn send(&self, data: &[u8]) -> Result<()> {
+        let mut cursor = ReadCursor::new(data);
+        let Ok(header) = Header::unpack(&mut cursor) else {
+            return Ok(());
+        };
+        if !self.answering.load(Ordering::Relaxed) {
+            return Ok(()); // the socket takes it; nobody is home to answer
+        }
+        let frame = match header.command {
+            Command::Echo => {
+                let mut h = Header::new_request(Command::Echo);
+                h.flags.set_response();
+                h.message_id = header.message_id;
+                h.credits = 8;
+                Some(pack_message(&h, &EchoResponse))
+            }
+            Command::Create => CreateRequest::unpack(&mut cursor)
+                .ok()
+                .map(|req| self.respond_to_create(&header, &req)),
+            Command::Write => WriteRequest::unpack(&mut cursor)
+                .ok()
+                .map(|req| self.respond_to_write(&header, &req)),
+            Command::Close => {
+                let mut h = Header::new_request(Command::Close);
+                h.flags.set_response();
+                h.message_id = header.message_id;
+                h.credits = 8;
+                Some(pack_message(
+                    &h,
+                    &CloseResponse {
+                        flags: 0,
+                        creation_time: FileTime::ZERO,
+                        last_access_time: FileTime::ZERO,
+                        last_write_time: FileTime::ZERO,
+                        change_time: FileTime::ZERO,
+                        allocation_size: 0,
+                        end_of_file: 0,
+                        file_attributes: 0,
+                    },
+                ))
+            }
+            _ => None,
+        };
+        if let Some(frame) = frame {
+            self.push(frame);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TransportReceive for NasLink {
+    async fn receive(&self) -> Result<Vec<u8>> {
+        loop {
+            let queued = self.outbox.lock().unwrap().pop_front();
+            match queued {
+                Some(frame) => return Ok(frame),
+                None => self.ready.notified().await,
+            }
+        }
+    }
+}
+
+/// The NAS as a whole: one disk, a series of connections to it.
+struct Nas {
+    disk: Arc<NasDisk>,
+    links: Mutex<Vec<Arc<NasLink>>>,
+}
+
+impl Nas {
+    fn power_on() -> Arc<Self> {
+        let nas = Arc::new(Self {
+            disk: Arc::new(NasDisk::default()),
+            links: Mutex::new(Vec::new()),
+        });
+        nas.plug_in();
+        nas
+    }
+
+    fn plug_in(&self) -> Arc<NasLink> {
+        let link = NasLink::new(&self.disk);
+        self.links.lock().unwrap().push(Arc::clone(&link));
+        link
+    }
+
+    fn current(&self) -> Arc<NasLink> {
+        self.links.lock().unwrap().last().unwrap().clone()
+    }
+
+    /// The NAS stops answering, without the socket noticing.
+    fn goes_away(&self) {
+        self.current().answering.store(false, Ordering::Relaxed);
+        if self.disk.forget_opens_on_disconnect.load(Ordering::Relaxed) {
+            self.disk.opens.lock().unwrap().clear();
+        }
+    }
+}
+
+#[async_trait]
+impl SessionReviver for Nas {
+    async fn dial(&self) -> Result<(Box<dyn TransportSend>, Box<dyn TransportReceive>)> {
+        let link = self.plug_in();
+        Ok((Box::new(Arc::clone(&link)), Box::new(link)))
+    }
+
+    async fn reauthenticate(&self, conn: &mut Connection) -> Result<()> {
+        conn.set_test_params(crate::client::connection::NegotiatedParams {
+            dialect: Dialect::Smb3_1_1,
+            max_read_size: 65536,
+            max_write_size: 65536,
+            max_transact_size: 65536,
+            server_guid: Guid::ZERO,
+            signing_required: false,
+            capabilities: Capabilities::default(),
+            gmac_negotiated: false,
+            cipher: None,
+            compression_supported: false,
+        });
+        conn.set_credits(512);
+        conn.set_session_id(SessionId(0xBEEF));
+        Ok(())
+    }
+}
+
+fn a_share() -> Tree {
+    Tree {
+        tree_id: TreeId(1),
+        share_name: "share".to_string(),
+        server: "nas".to_string(),
+        is_dfs: false,
+        encrypt_data: false,
+    }
+}
+
+/// Connect to `nas`, armed to reconnect, negotiated as SMB 3.1.1.
+async fn attach(nas: &Arc<Nas>) -> Connection {
+    let mut conn =
+        Connection::from_transport(Box::new(nas.current()), Box::new(nas.current()), "nas");
+    conn.set_response_timeout(Some(Duration::from_secs(30)));
+    conn.set_keepalive(Some(KEEPALIVE));
+    conn.set_reviver(Some(Arc::clone(nas) as Arc<dyn SessionReviver>));
+    conn.set_reconnect_policy(test_policy());
+    nas.reauthenticate(&mut conn).await.unwrap();
+    conn
+}
+
+/// Write `data` at `offset` through `handle`.
+async fn write_chunk(
+    conn: &Connection,
+    handle: &DurableHandle,
+    offset: u64,
+    data: &[u8],
+) -> Result<()> {
+    let req = WriteRequest {
+        data_offset: 0x70,
+        write_channel_info_offset: 0,
+        write_channel_info_length: 0,
+        offset,
+        file_id: handle.file_id,
+        channel: 0,
+        remaining_bytes: 0,
+        flags: 0,
+        data: data.to_vec(),
+    };
+    let frame = conn.execute(Command::Write, &req, Some(TreeId(1))).await?;
+    if frame.header.status != NtStatus::SUCCESS {
+        return Err(Error::Protocol {
+            status: frame.header.status,
+            command: Command::Write,
+        });
+    }
+    Ok(())
+}
+
+const CHUNK: usize = 4096;
+
+/// M3's headline, end to end: a NAS goes away in the middle of a file and the
+/// transfer finishes on the other side of the blip without rewriting a byte it
+/// had already delivered.
+///
+/// Before M3 this ended the copy. Before M2 it hung forever.
+#[tokio::test]
+async fn a_transfer_interrupted_mid_file_resumes_instead_of_starting_over() {
+    let nas = Nas::power_on();
+    let mut conn = attach(&nas).await;
+    let share = a_share();
+
+    let open = share
+        .open_file_durable(&mut conn, "big.iso")
+        .await
+        .expect("the open must succeed");
+    let mut handle = open.durable.expect("this NAS grants durable handles");
+
+    // Ten chunks in, the NAS goes away.
+    let payload = vec![0xAB_u8; CHUNK];
+    for i in 0..10u64 {
+        write_chunk(&conn, &handle, i * CHUNK as u64, &payload)
+            .await
+            .expect("the first ten chunks land");
+    }
+    let delivered_before = nas.disk.bytes_accepted.load(Ordering::Relaxed);
+    assert_eq!(delivered_before, 10 * CHUNK);
+
+    nas.goes_away();
+    let stranded = write_chunk(&conn, &handle, 10 * CHUNK as u64, &payload).await;
+    assert!(
+        matches!(stranded, Err(Error::ServerUnresponsive { .. })),
+        "the dead session should surface first, got {stranded:?}"
+    );
+
+    // Recovery: bring the connection back, then claim the file back.
+    tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("the revival hung")
+        .expect("the NAS is answering again");
+    assert!(
+        !handle.is_current(&conn),
+        "the handle must know it has outlived its session"
+    );
+    handle = share
+        .reclaim_durable_handle(&mut conn, &handle, "big.iso")
+        .await
+        .expect("same NAS, same file, both proofs hold");
+    assert!(handle.is_current(&conn));
+
+    // Carry on from chunk 10, not from zero.
+    for i in 10..20u64 {
+        write_chunk(&conn, &handle, i * CHUNK as u64, &payload)
+            .await
+            .expect("the rest of the file lands on the new session");
+    }
+
+    assert_eq!(
+        nas.disk.bytes_of("big.iso"),
+        20 * CHUNK,
+        "the whole file should be on disk"
+    );
+    assert_eq!(
+        nas.disk.bytes_accepted.load(Ordering::Relaxed),
+        20 * CHUNK,
+        "the server accepted each byte exactly once: the ten chunks written \
+         before the blip were never re-sent, which is the difference between \
+         resuming and starting over"
+    );
+    assert_eq!(conn.metrics().reconnects_succeeded, 1);
+}
+
+/// The refusal, end to end: a NAS that matches the guid and hands back a
+/// different file gets nothing written to it.
+///
+/// No correct server does this. The client still has to behave as though one
+/// might, because the cost of being wrong is a user's bytes in a stranger's
+/// file.
+#[tokio::test]
+async fn a_nas_that_hands_back_the_wrong_file_gets_nothing_written_to_it() {
+    let nas = Nas::power_on();
+    let mut conn = attach(&nas).await;
+    let share = a_share();
+
+    let handle = share
+        .open_file_durable(&mut conn, "big.iso")
+        .await
+        .unwrap()
+        .durable
+        .unwrap();
+    write_chunk(&conn, &handle, 0, &vec![0xAB; CHUNK])
+        .await
+        .unwrap();
+
+    nas.goes_away();
+    let _ = write_chunk(&conn, &handle, CHUNK as u64, &vec![0xAB; CHUNK]).await;
+    tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("hung")
+        .unwrap();
+
+    nas.disk
+        .hand_back_the_wrong_file
+        .store(true, Ordering::Relaxed);
+    let outcome = share
+        .reclaim_durable_handle(&mut conn, &handle, "big.iso")
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Err(Error::DurableHandleLost {
+                reason: crate::error::DurableLoss::IdentityMismatch,
+                ..
+            })
+        ),
+        "expected a refusal, got {outcome:?}"
+    );
+    assert_eq!(
+        nas.disk.bytes_accepted.load(Ordering::Relaxed),
+        CHUNK,
+        "not one byte may reach a handle we could not prove"
+    );
+}
+
+/// A NAS that really rebooted has forgotten the open. A durable handle
+/// survives a dead connection, not dead storage — only a persistent handle on
+/// a continuously-available share does that, and this crate does not ask for
+/// one.
+///
+/// The transfer restarts, which is the correct outcome and a far better one
+/// than the permanent wedge this whole effort began with.
+#[tokio::test]
+async fn a_nas_that_actually_rebooted_reports_the_open_as_gone_rather_than_guessing() {
+    let nas = Nas::power_on();
+    nas.disk
+        .forget_opens_on_disconnect
+        .store(true, Ordering::Relaxed);
+    let mut conn = attach(&nas).await;
+    let share = a_share();
+
+    let handle = share
+        .open_file_durable(&mut conn, "big.iso")
+        .await
+        .unwrap()
+        .durable
+        .unwrap();
+    write_chunk(&conn, &handle, 0, &vec![0xAB; CHUNK])
+        .await
+        .unwrap();
+
+    nas.goes_away();
+    let _ = write_chunk(&conn, &handle, CHUNK as u64, &vec![0xAB; CHUNK]).await;
+    tokio::time::timeout(TEST_BUDGET, conn.reconnect_if_needed())
+        .await
+        .expect("hung")
+        .expect("the connection comes back even though the handle will not");
+
+    let outcome = share
+        .reclaim_durable_handle(&mut conn, &handle, "big.iso")
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(Error::DurableHandleLost {
+                reason: crate::error::DurableLoss::Expired,
+                ..
+            })
+        ),
+        "got {outcome:?}"
+    );
+
+    // And the connection is perfectly usable for starting the file again.
+    let fresh = share
+        .open_file_durable(&mut conn, "big.iso")
+        .await
+        .expect("a reopen must work");
+    assert!(fresh.durable.is_some());
+}
