@@ -80,10 +80,24 @@ Before that, only the response deadline removed a waiter, which inflated the dia
 `Connection::await_response` gives up with `Error::Timeout` after 30 s of silence, so a server that stops answering on a live socket can't hang a caller. Tune or disable with `set_response_timeout`.
 
 - The clock measures **silence, not elapsed time**: `Waiter.last_activity` is refreshed on every interim `STATUS_PENDING` and by `mark_sent`, so an acknowledged long operation is never cut short and a frame that crawled onto a slow link still gets the full budget afterwards. ❌ Don't remove either refresh to "simplify" the deadline — both are what make 30 s safe, and each has a test that fails without it.
-- CHANGE_NOTIFY is exempt (`is_long_poll`) — it waits for an event that may never come. Add any new wait-for-an-event command there.
+- **A request on a provably-alive connection gets `ALIVE_DEADLINE_FACTOR` × the budget** (6, so 3 minutes at the defaults) before being abandoned. See § Liveness below for what "provably" means; the counter is `response_deadline_extensions`.
+- CHANGE_NOTIFY is exempt (`is_long_poll`) — it waits for an event that may never come. Add any new wait-for-an-event command there. It is deliberately NOT exempt from the keepalive, which is the only thing that can tell a watcher its session died.
 - Timing out removes the waiter, so an abandoned request leaves no entry in the routing map.
-- **These are `Connection` setters, not `ClientConfig` fields**, like every other tunable here (credit wait, stale-request warning). `ClientConfig` has all-public fields and no `Default`, so adding one breaks every consumer's struct literal — a minor bump under this crate's pre-1.0 SemVer, spent to save a setter call.
-- **The four defaults are a set, not four independent numbers**: slow-send report (5 s) < send deadline (20 s) < response deadline (30 s), and the stale-request warning (15 s) plus one sweep (10 s) fits inside the response deadline so a wedge is always named in the log before its waiter disappears. `the_default_deadlines_are_layered` fails if a tuning pass breaks the ordering.
+- **These are `Connection` setters, not `ClientConfig` fields**, like every other tunable here (credit wait, stale-request warning, keepalive). `ClientConfig` has all-public fields and no `Default`, so adding one breaks every consumer's struct literal — a minor bump under this crate's pre-1.0 SemVer, spent to save a setter call.
+- **The defaults are a set, not independent numbers**: slow-send report (5 s) < send deadline (20 s) < response deadline (30 s); the stale-request warning (15 s) plus one sweep (10 s) fits inside the response deadline so a wedge is always named in the log before its waiter disappears; and the keepalive reaches its verdict (~17 s) before the response deadline would have fired anyway. `the_default_deadlines_are_layered` fails if a tuning pass breaks any of it.
+
+## Liveness: the ECHO keepalive
+
+Full rationale in `connection.rs` on `KEEPALIVE_AFTER` and `Connection::echo_probe`.
+
+A deadline alone cannot tell "slow" from "dead", so it has to be sized for the slowest healthy case and is therefore a poor detector of the dead one. SMB2 ECHO touches no share, handle, or disk, so an answer means the server is processing requests — which is what lets the deadline be both short and safe.
+
+- **`last_frame_at` is the liveness clock**, fed by EVERY received frame (responses, interim PENDING, oplock breaks, even strays), because all of them prove the same thing. `None` until the server has actually spoken: a connection that has never said anything has proven nothing, and ❌ the extension must never be granted on an assumption.
+- **The keepalive probes only when `quiet_for()` ≥ the threshold** (5 s, `set_keepalive`). `quiet_for` measures from the LATER of "the server last spoke" and "the oldest unanswered request went out" — a server can't be silent about a question it hasn't been asked, and a connection that never spoke is quiet from the first ask. `None` (nothing on the wire) means no probe: no work to protect. So a busy connection never probes at all, and an idle one doesn't either.
+- **Two unanswered probes tear the connection down** with `Error::ServerUnresponsive`, which `fan_error_to_waiters` preserves rather than collapsing to `Disconnected` (the two answer different questions for a consumer deciding between reconnect and retry-the-file). One isn't enough: on Samba the process answering ECHO is the one that may be blocked in a `pwrite` on a stalled disk.
+- **A probe that can't be sent is `Skipped`, never a failure.** ❌ Don't make it wait for credits: the window is fully spent exactly when the pipeline is deepest, so counting "couldn't ask" as "didn't answer" would make the busiest healthy transfers the likeliest to be torn down — the starvation hang from the client side. It takes its credit with `try_reserve` (via `dispatch_reserved`) or skips.
+- **Getting the probe onto the wire is the send deadline's business**, not the keepalive's, so `echo_probe` puts no timeout around the dispatch. A stuck socket already has an owner that tears the connection down; blaming the server for it is the misdiagnosis `sent_at` exists to prevent.
+- ❌ **Don't coarsen the loop's tick while idle.** The sleep is chosen before the check, so a long idle interval delays the round that would notice a `set_keepalive` change too. That cost 5 s of setter lag for one timer per second.
 
 ## Compound requests
 

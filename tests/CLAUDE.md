@@ -6,11 +6,28 @@ Four test categories, each serving a different purpose.
 
 Inline `#[cfg(test)]` modules, colocated with the code they test. Use `MockTransport` to simulate server responses without a network connection. Run with `cargo test`.
 
-~555 tests covering: pack/unpack roundtrips, wire format encoding, signing/encryption, NTLM auth (with MS-NLMP spec test vectors), compound construction, pipelined I/O, credit tracking, oplock break handling, session expiry, CANCEL requests.
+~920 tests covering: pack/unpack roundtrips, wire format encoding, signing/encryption, NTLM auth (with MS-NLMP spec test vectors), compound construction, pipelined I/O, credit tracking, oplock break handling, session expiry, CANCEL requests, and fault injection (see below).
 
 Property-based tests (proptest) cover pack/unpack for all primitive types and UTF-16LE strings.
 
 **Key pattern:** Most unit tests queue canned responses on `MockTransport`, call the method under test, and verify the result + the sent messages. For compound operations, queue one compound response frame (not separate responses).
+
+### Fault injection (`src/client/fault_injection_tests.rs`)
+
+The resilience bugs (a server that goes quiet on a live socket, a link that
+black-holes with no RST) are unreachable from a mock that replays a canned
+conversation, which is how they survived a year of testing. `ScriptedServer`
+is the tool for them: its send half always succeeds and its receive half
+never errors or EOFs, and a test switches its answering policy mid-flight.
+
+Two rules when adding one, both learned the hard way:
+
+- **Every wait is bounded and panics on expiry.** A test that can hang turns a
+  red build into a wedged one, and hangs are what this module is about.
+- **Assert one-sidedly.** A loaded machine can only make things take longer,
+  so `wait_until(cond)` is stable where `sleep(n); assert!(cond)` is a coin
+  flip. Prefer a counter that can only be explained by the behavior under test
+  (`response_deadline_extensions == 1`) over a wall-clock window.
 
 ## Integration tests (`tests/integration.rs`)
 

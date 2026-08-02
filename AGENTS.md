@@ -238,6 +238,7 @@ discover a new pitfall that involves 2+ modules, add it to this list.
     starvation waited out the full deadline instead of failing fast. A bounded ring of abandoned MessageIds keeps
     `responses_late_after_drop` distinguishable from `responses_stray`. See `client/connection.rs`.
 18. **Share-enum responses split two ways** ✅ -- A srvsvc `NetShareEnum` reply can arrive as multiple DCE/RPC fragments (MS-RPCE 2.2.2.6, `PFC_LAST_FRAG` only on the last) and/or as `STATUS_BUFFER_OVERFLOW` pipe reads (MS-SMB2 3.3.5.10) when it exceeds one read buffer. `client::shares::read_pipe_message` follows the overflow chain; `rpc_bind_and_request` loops `rpc::parse_response_fragment` until the last fragment, then NDR-decodes the joined stub. Treating either as a hard error (the old behavior) truncated or failed listings on servers that chunk large replies. Spans `rpc/` + `client/shares.rs`.
+19. **A deadline cannot tell slow from dead; ECHO can** ✅ -- A response deadline has to be sized for the slowest thing a healthy server does without a word, which makes it a poor detector of a dead one: too short and a large write to a loaded spinning-disk NAS is killed, too long and a dead session freezes a transfer. SMB2 ECHO (MS-SMB2 § 2.2.28) touches no share, handle, or disk, so an answer means the server is processing requests, full stop. `client/connection.rs` `keepalive_loop` probes a connection that has gone quiet with work outstanding (5 s, `Connection::set_keepalive`); a request on a connection it has just proven alive gets 6× the deadline before being abandoned, and two unanswered probes tear the connection down with `Error::ServerUnresponsive`. It measures *silence*, so a busy connection never probes and an idle one is not probed either. Two traps it is designed around: a probe that cannot get a credit is skipped and never counted as a death (the window is emptiest exactly when the pipeline is deepest, so the opposite would make the busiest healthy transfers the likeliest to be torn down), and getting the probe onto the wire stays the send deadline's problem. CHANGE_NOTIFY is exempt from the response deadline but deliberately NOT from this -- nothing else can tell a `Watcher` its session died. Spans `client/connection.rs` + `client/credits.rs`; see `client/CLAUDE.md` § Liveness.
 
 ## Testing
 
@@ -336,9 +337,10 @@ offline) so local clippy matches CI's always-latest stable, then runs `cargo fmt
 
 ## Diagnostics
 
-`SmbClient::diagnostics()` and `Connection::diagnostics()` return an in-process snapshot of the client's state plus 20
+`SmbClient::diagnostics()` and `Connection::diagnostics()` return an in-process snapshot of the client's state plus 25
 `AtomicU64` counters per connection (`requests_sent`, `wire_bytes_*`, the disjoint routing partition `responses_*`,
-`status_pending_loops`, `signature_failures`, `credit_waits` / `credit_starvations` / `response_timeouts`, etc.) and three client-level counters (`reconnects`,
+`status_pending_loops`, `signature_failures`, `credit_waits` / `credit_starvations` / `response_timeouts`,
+`keepalive_probes_sent` / `keepalive_probes_skipped` / `keepalive_failures` / `response_deadline_extensions`, etc.) and three client-level counters (`reconnects`,
 `dfs_referrals_resolved`, `dfs_cache_hits`). Eventually consistent, survives connection teardown, per-connection
 counters reset on reconnect. `OutstandingRequest::sent_age` says which side of the wire a request is on: `None` means
 it is still queued for the transport, so the server has not been asked and nothing about the server follows from it. `Display` impl for terminal output; optional `serde` feature for JSON.
