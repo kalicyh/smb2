@@ -6,7 +6,7 @@ exclude = ["benchmarks/smb", "benchmarks/smb-listing"]
 
 [package]
 name = "smb2"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -25,6 +25,9 @@ exclude = [
     "clippy.toml",
     "rustfmt.toml",
     "related-repos/",
+    # Agent tooling, not library source: the CodeGraph index directory ships
+    # nothing but its own .gitignore.
+    ".codegraph/",
     # tests/ is dev-only: integration tests + Docker fixtures for smb2's own
     # suite. Fixtures the published crate embeds (the `testing` feature's
     # consumer Docker files, the ccache test vectors) live under src/, so
