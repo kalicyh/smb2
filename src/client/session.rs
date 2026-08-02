@@ -98,7 +98,7 @@ impl Session {
             security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
             capabilities: Capabilities::default(),
             channel: 0,
-            previous_session_id: 0,
+            previous_session_id: conn.previous_session_id().0,
             security_buffer: type1_bytes,
         };
 
@@ -155,7 +155,7 @@ impl Session {
             security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
             capabilities: Capabilities::default(),
             channel: 0,
-            previous_session_id: 0,
+            previous_session_id: conn.previous_session_id().0,
             security_buffer: type3_bytes,
         };
 
@@ -380,7 +380,7 @@ impl Session {
             security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
             capabilities: Capabilities::default(),
             channel: 0,
-            previous_session_id: 0,
+            previous_session_id: conn.previous_session_id().0,
             security_buffer: token,
         };
 

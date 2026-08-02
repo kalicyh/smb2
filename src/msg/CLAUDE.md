@@ -9,7 +9,8 @@ One sub-module per SMB2 command. Each defines request and response structs with 
 | `mod.rs` | `trivial_message!` macro for 4-byte stub messages, module declarations |
 | `header.rs` | 64-byte SMB2 header (sync + async variants), `PROTOCOL_ID` (`0xFE 'S' 'M' 'B'`) |
 | `negotiate.rs` | Negotiate contexts (preauth integrity, encryption, signing, compression) |
-| `create.rs` | CREATE request/response with create contexts |
+| `create.rs` | CREATE request/response; `create_contexts` is a raw byte chain, decoded by `create_context.rs` |
+| `create_context.rs` | The CREATE context codec plus `DH2Q` / `DH2C` (durable handles v2) and `QFid` |
 | `transform.rs` | `TransformHeader` (encryption, protocol ID `0xFD`), `CompressionTransformHeader` (`0xFC`) |
 
 19 command modules total: negotiate, session_setup, logoff, tree_connect, tree_disconnect, create, close, flush, read, write, lock, ioctl, query_directory, change_notify, query_info, set_info, echo, cancel, oplock_break. Plus `dfs.rs` for DFS referral request/response wire format (used by IOCTL FSCTL_DFS_GET_REFERRALS) and `copychunk.rs` for the server-side copy structures (`SrvCopychunkCopy` / `SrvCopychunkResponse` / `SrvRequestResumeKeyResponse`, used by IOCTL FSCTL_SRV_COPYCHUNK / FSCTL_SRV_REQUEST_RESUME_KEY; the client API is in `client/copy.rs`).
@@ -20,6 +21,15 @@ One sub-module per SMB2 command. Each defines request and response structs with 
 - **Offset calculation**: All offsets in SMB2 are relative to the start of the SMB2 header (not the body, not the transport frame). When packing variable-length fields, compute `header_size + fixed_body_size` as the base offset.
 - **StructureSize validation**: `Unpack` implementations read `StructureSize` first and return an error if it doesn't match the expected value.
 - **`trivial_message!` macro**: Generates Pack/Unpack for 4-byte stub messages (StructureSize=4 + Reserved=0). Used by echo, cancel, logoff, tree_disconnect.
+
+## Create contexts
+
+`create_context.rs` packs and parses the name-tagged blob chain a CREATE carries (MS-SMB2 § 2.2.13.2): `Next` / `NameOffset` / `NameLength` / `DataOffset` / `DataLength`, name then data, every entry padded to 8 (the last one included — the spec only requires it of entries something follows, but Windows pads them all).
+
+- The parser rejects a chain whose `Next`, name, or data points outside the entry rather than walking off the buffer.
+- A context with no data reports `DataOffset = 0`, not a position past the end: servers read the field even when the length is 0.
+- ❌ A durable-reconnect context (`DH2C`) must be the ONLY context in its CREATE — MS-SMB2 § 3.3.5.9.12 lets a server reject one that travels with company, and Samba does. See `client/durable.rs`.
+- Wire layouts are pinned against the `smb-rs` reference implementation's own test vectors.
 
 ## Compound messages
 

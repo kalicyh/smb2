@@ -39,6 +39,7 @@ src/
     tree_connect.rs       # TreeConnectRequest/Response
     tree_disconnect.rs    # TreeDisconnectRequest/Response
     create.rs             # CreateRequest/Response, create contexts
+    create_context.rs     # Create-context codec + DH2Q/DH2C (durable handles v2) + QFid
     close.rs              # CloseRequest/Response
     copychunk.rs          # Server-side copy structures (SRV_COPYCHUNK_COPY/RESPONSE, RESUME_KEY)
     flush.rs              # FlushRequest/Response
@@ -94,6 +95,8 @@ src/
     shares.rs             # Share enumeration (IPC$ + srvsvc RPC)
     dfs.rs                # DFS referral IOCTL, DfsResolver with TTL cache
     copy.rs               # Server-side copy API (FSCTL_SRV_COPYCHUNK): resume-key + copychunk, batched convenience
+    durable.rs            # Durable handles: open, reclaim, and the two proofs that make a resume safe
+    fault_injection_tests.rs # Hostile-but-plausible servers: one that goes silent, one that goes away and comes back
 
 tests/
   pack_roundtrip.rs       # Property-based tests for pack/unpack
@@ -239,6 +242,8 @@ discover a new pitfall that involves 2+ modules, add it to this list.
     `responses_late_after_drop` distinguishable from `responses_stray`. See `client/connection.rs`.
 18. **Share-enum responses split two ways** ✅ -- A srvsvc `NetShareEnum` reply can arrive as multiple DCE/RPC fragments (MS-RPCE 2.2.2.6, `PFC_LAST_FRAG` only on the last) and/or as `STATUS_BUFFER_OVERFLOW` pipe reads (MS-SMB2 3.3.5.10) when it exceeds one read buffer. `client::shares::read_pipe_message` follows the overflow chain; `rpc_bind_and_request` loops `rpc::parse_response_fragment` until the last fragment, then NDR-decodes the joined stub. Treating either as a hard error (the old behavior) truncated or failed listings on servers that chunk large replies. Spans `rpc/` + `client/shares.rs`.
 19. **A deadline cannot tell slow from dead; ECHO can** ✅ -- A response deadline has to be sized for the slowest thing a healthy server does without a word, which makes it a poor detector of a dead one: too short and a large write to a loaded spinning-disk NAS is killed, too long and a dead session freezes a transfer. SMB2 ECHO (MS-SMB2 § 2.2.28) touches no share, handle, or disk, so an answer means the server is processing requests, full stop. `client/connection.rs` `keepalive_loop` probes a connection that has gone quiet with work outstanding (5 s, `Connection::set_keepalive`); a request on a connection it has just proven alive gets 6× the deadline before being abandoned, and two unanswered probes tear the connection down with `Error::ServerUnresponsive`. It measures *silence*, so a busy connection never probes and an idle one is not probed either. Two traps it is designed around: a probe that cannot get a credit is skipped and never counted as a death (the window is emptiest exactly when the pipeline is deepest, so the opposite would make the busiest healthy transfers the likeliest to be torn down), and getting the probe onto the wire stays the send deadline's problem. CHANGE_NOTIFY is exempt from the response deadline but deliberately NOT from this -- nothing else can tell a `Watcher` its session died. Spans `client/connection.rs` + `client/credits.rs`; see `client/CLAUDE.md` § Liveness.
+20. **A dead connection comes back under the handles that outlived it** ✅ -- `FileWriter`, `FileReader`, `Watcher`, and every pipelined task own a `Connection` clone, so a reconnect that minted a *new* `Connection` would leave all of them permanently dead and make the consumer rebuild the world. `Connection::reconnect_if_needed` swaps the transport in place under the shared `Arc<Inner>` and erases every scrap of the dead session (credits, message ids, signing keys, negotiated sizes, tree ids), then rebuilds all four background tasks -- three of which exit for good on `disconnected`, so a revival that only replaced the socket would come back with no keepalive and no stale-request warning, silently. One dial serves a whole pipeline's worth of callers. Every bound lives in `ReconnectPolicy`: the wall-clock budget wraps the ENTIRE revival (a per-attempt timeout multiplies by the attempt count, and an attempt that parks forever never reaches the second one), and a failed revival's verdict stands for a cooldown so 32 callers don't each pay the budget. ❌ `execute` never reconnects on your behalf: re-issuing an arbitrary request against a new session is a data-safety call only the layer that knows the operation's semantics can make. Spans `client/connection.rs` + `client/mod.rs` + `client/credits.rs`; see `client/CLAUDE.md` § Reconnection.
+21. **A reclaimed durable handle is proven, never assumed** ✅ -- Writing into the wrong file is far worse than a failed transfer, so `Tree::reclaim_durable_handle` needs two independent proofs: the `CreateGuid` the server matched (MS-SMB2 § 3.3.5.9.12), and a compounded `QUERY_INFO` saying which file the handle points at, read at open and again after the reclaim. Either one missing means the handle is closed and the transfer restarts. SMB 2.1's v1 durable handles are deliberately unimplemented (server-allocated `FileId` only, nothing the client contributed). Two findings a mock could never have surfaced, both verified against Samba 4.20.6 on 2026-08-02: a reclaim carrying any other create context is rejected outright (so the identity check cannot ride on the `QFid` context), and `FileIdInformation` (class 59) is answered `STATUS_INVALID_INFO_CLASS` (so it uses class 6 plus `FileFsVolumeInformation`). The batch oplock durability requires bills other clients ~35 s per unanswered break, so breaks are acknowledged. Spans `msg/create_context.rs` + `client/durable.rs` + `client/connection.rs`; see `client/CLAUDE.md` § Durable handles.
 
 ## Testing
 
@@ -340,7 +345,8 @@ offline) so local clippy matches CI's always-latest stable, then runs `cargo fmt
 `SmbClient::diagnostics()` and `Connection::diagnostics()` return an in-process snapshot of the client's state plus 25
 `AtomicU64` counters per connection (`requests_sent`, `wire_bytes_*`, the disjoint routing partition `responses_*`,
 `status_pending_loops`, `signature_failures`, `credit_waits` / `credit_starvations` / `response_timeouts`,
-`keepalive_probes_sent` / `keepalive_probes_skipped` / `keepalive_failures` / `response_deadline_extensions`, etc.) and three client-level counters (`reconnects`,
+`keepalive_probes_sent` / `keepalive_probes_skipped` / `keepalive_failures` / `response_deadline_extensions`,
+`reconnect_attempts` / `reconnects_succeeded` / `reconnects_failed`, etc.) and three client-level counters (`reconnects`,
 `dfs_referrals_resolved`, `dfs_cache_hits`). Eventually consistent, survives connection teardown, per-connection
 counters reset on reconnect. `OutstandingRequest::sent_age` says which side of the wire a request is on: `None` means
 it is still queued for the transport, so the server has not been asked and nothing about the server follows from it. `Display` impl for terminal output; optional `serde` feature for JSON.

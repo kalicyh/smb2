@@ -1356,6 +1356,7 @@ use crate::client::tree::Tree;
 use crate::msg::close::CloseResponse;
 use crate::msg::create::{CreateAction, CreateRequest, CreateResponse};
 use crate::msg::create_context::{self};
+use crate::msg::query_info::QueryInfoRequest;
 use crate::pack::{FileTime, Guid};
 use crate::types::flags::Capabilities;
 use crate::types::{Dialect, FileId, OplockLevel};
@@ -1420,6 +1421,10 @@ struct NasLink {
     /// When false the server answers nothing, which is how it looks when it
     /// goes away.
     answering: AtomicBool,
+    /// The handle the CREATE in the current compound produced, so the
+    /// QUERY_INFO chained behind it can resolve `FileId::SENTINEL` the way a
+    /// real server substitutes the previous sub-request's handle.
+    compound_handle: Mutex<Option<(FileId, u64)>>,
 }
 
 impl NasLink {
@@ -1429,6 +1434,7 @@ impl NasLink {
             outbox: Mutex::new(VecDeque::new()),
             ready: Notify::new(),
             answering: AtomicBool::new(true),
+            compound_handle: Mutex::new(None),
         })
     }
 
@@ -1446,7 +1452,24 @@ impl NasLink {
             volatile: 0,
         };
         let mut status = NtStatus::SUCCESS;
+        let mut inode_answered = 0u64;
 
+        // A reclaim's reconnect context must travel alone (MS-SMB2
+        // § 3.3.5.9.12); Samba rejects one that doesn't, so this NAS does too.
+        if create_context::find(&asked, create_context::NAME_DH2C).is_some() && asked.len() > 1 {
+            let mut h = Header::new_request(Command::Create);
+            h.flags.set_response();
+            h.message_id = header.message_id;
+            h.credits = 8;
+            h.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+            return pack_message(
+                &h,
+                &crate::msg::header::ErrorResponse {
+                    error_context_count: 0,
+                    error_data: vec![],
+                },
+            );
+        }
         if let Some(dh2c) = create_context::find(&asked, create_context::NAME_DH2C) {
             // A reclaim. Look the open up and check the guid the way MS-SMB2
             // § 3.3.5.9.12 requires.
@@ -1473,7 +1496,7 @@ impl NasLink {
                     let mut opens = self.disk.opens.lock().unwrap();
                     opens.remove(&persistent);
                     opens.insert(fresh, held);
-                    answers.push(on_disk_context(inode));
+                    inode_answered = inode;
                 }
                 _ => status = NtStatus::OBJECT_NAME_NOT_FOUND,
             }
@@ -1507,9 +1530,7 @@ impl NasLink {
                     grant,
                 ));
             }
-            if create_context::find(&asked, create_context::NAME_QFID).is_some() {
-                answers.push(on_disk_context(inode));
-            }
+            inode_answered = inode;
         }
 
         let mut h = Header::new_request(Command::Create);
@@ -1518,6 +1539,7 @@ impl NasLink {
         h.credits = 8;
         h.status = status;
         if status != NtStatus::SUCCESS {
+            *self.compound_handle.lock().unwrap() = None;
             return pack_message(
                 &h,
                 &crate::msg::header::ErrorResponse {
@@ -1526,6 +1548,7 @@ impl NasLink {
                 },
             );
         }
+        *self.compound_handle.lock().unwrap() = Some((file_id, inode_answered));
         pack_message(
             &h,
             &CreateResponse {
@@ -1598,24 +1621,43 @@ impl NasLink {
     }
 }
 
-fn on_disk_context(inode: u64) -> create_context::CreateContext {
-    let mut body = Vec::new();
-    body.extend_from_slice(&inode.to_le_bytes());
-    body.extend_from_slice(&42u64.to_le_bytes()); // one volume
-    body.extend_from_slice(&[0u8; 16]);
-    create_context::CreateContext::new(create_context::NAME_QFID, body)
+/// `FileInternalInformation` (MS-FSCC § 2.4.22): the file's index number.
+fn file_internal_information(inode: u64) -> Vec<u8> {
+    inode.to_le_bytes().to_vec()
+}
+
+/// `FileFsVolumeInformation` (MS-FSCC § 2.5.9) for this NAS's one volume.
+fn fs_volume_information() -> Vec<u8> {
+    let mut body = vec![0u8; 8]; // VolumeCreationTime
+    body.extend_from_slice(&42u32.to_le_bytes()); // VolumeSerialNumber
+    body.extend_from_slice(&0u32.to_le_bytes()); // VolumeLabelLength
+    body.extend_from_slice(&[0, 0]); // SupportsObjects + Reserved
+    body
 }
 
 #[async_trait]
 impl TransportSend for NasLink {
     async fn send(&self, data: &[u8]) -> Result<()> {
-        let mut cursor = ReadCursor::new(data);
-        let Ok(header) = Header::unpack(&mut cursor) else {
-            return Ok(());
-        };
         if !self.answering.load(Ordering::Relaxed) {
             return Ok(()); // the socket takes it; nobody is home to answer
         }
+        // A durable open is a compound (CREATE + QUERY_INFO), so every
+        // sub-request has to be answered. Answering them as separate frames is
+        // legal (MS-SMB2 § 3.3.4.1.3) and is what Samba and QNAP often do.
+        let subs = crate::client::connection::split_compound(data).unwrap_or_default();
+        for sub in subs {
+            self.answer_one(&sub);
+        }
+        Ok(())
+    }
+}
+
+impl NasLink {
+    fn answer_one(&self, data: &[u8]) {
+        let mut cursor = ReadCursor::new(data);
+        let Ok(header) = Header::unpack(&mut cursor) else {
+            return;
+        };
         let frame = match header.command {
             Command::Echo => {
                 let mut h = Header::new_request(Command::Echo);
@@ -1649,12 +1691,44 @@ impl TransportSend for NasLink {
                     },
                 ))
             }
+            Command::QueryInfo => QueryInfoRequest::unpack(&mut cursor)
+                .ok()
+                .map(|req| self.respond_to_query_info(&header, &req)),
             _ => None,
         };
         if let Some(frame) = frame {
             self.push(frame);
         }
-        Ok(())
+    }
+
+    /// Answer a `QUERY_INFO` chained behind a CREATE: the file's index number
+    /// or the volume it lives on, depending on the class asked for.
+    fn respond_to_query_info(&self, header: &Header, req: &QueryInfoRequest) -> Vec<u8> {
+        let mut h = Header::new_request(Command::QueryInfo);
+        h.flags.set_response();
+        h.message_id = header.message_id;
+        h.credits = 8;
+        match *self.compound_handle.lock().unwrap() {
+            Some((_, inode)) => pack_message(
+                &h,
+                &crate::msg::query_info::QueryInfoResponse {
+                    output_buffer: match req.info_type {
+                        crate::msg::query_info::InfoType::Filesystem => fs_volume_information(),
+                        _ => file_internal_information(inode),
+                    },
+                },
+            ),
+            None => {
+                h.status = NtStatus::FILE_CLOSED;
+                pack_message(
+                    &h,
+                    &crate::msg::header::ErrorResponse {
+                        error_context_count: 0,
+                        error_data: vec![],
+                    },
+                )
+            }
+        }
     }
 }
 

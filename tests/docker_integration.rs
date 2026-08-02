@@ -3947,3 +3947,172 @@ async fn a_real_server_answers_the_echo_keepalive_probe() {
         let _ = tree.disconnect(&mut conn).await;
     }
 }
+
+// ── Reconnect and durable handles (M3) ────────────────────────────────
+
+/// Real Samba, real socket: a connection torn down mid-session comes back and
+/// serves work again, with every `Connection` clone the caller was holding.
+///
+/// The unit tests prove this against a scripted server; this proves the same
+/// sequence survives a genuine negotiate + NTLM session setup on a fresh TCP
+/// connection, which is the part a mock cannot vouch for.
+#[tokio::test]
+#[ignore]
+async fn guest_reconnect_reestablishes_a_working_session() {
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: GUEST_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: String::new(),
+        password: String::new(),
+        domain: String::new(),
+        auto_reconnect: true,
+        compression: false,
+        dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
+    })
+    .await
+    .expect("connect to smb-guest");
+
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+    client
+        .list_directory(&mut tree, "")
+        .await
+        .expect("listing before the reconnect");
+
+    let held = client.connection_mut().clone();
+    assert_eq!(held.generation(), 0);
+
+    client.reconnect().await.expect("reconnect against Samba");
+
+    assert_eq!(held.generation(), 1, "the clone must come back too");
+    assert!(!held.is_disconnected());
+    assert_eq!(
+        client.diagnostics().primary.metrics.reconnects_succeeded,
+        1,
+        "the counter is what makes a survived blip visible after the fact"
+    );
+
+    // Tree ids died with the session, so the share is re-connected. The
+    // listing is not compared against the earlier one: these tests share a
+    // container and run concurrently, so its contents legitimately move.
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("re-connect_share");
+    client
+        .list_directory(&mut tree, "")
+        .await
+        .expect("listing after the reconnect");
+}
+
+/// What this Samba build actually does with a durable-handle request.
+///
+/// Deliberately adaptive rather than an assertion that a grant arrives: a
+/// durable handle needs `durable handles = yes`, kernel oplocks off, and the
+/// server willing to hand out a batch oplock, and the crate's contract is that
+/// **not** getting one is a normal outcome rather than an error. So the test
+/// pins the contract that holds either way (the open works, and a grant is
+/// always accompanied by an on-disk id) and prints which branch this container
+/// took, so a future change in the fixture is visible rather than silent.
+#[tokio::test]
+#[ignore]
+async fn guest_durable_open_is_either_granted_with_proof_or_declined_cleanly() {
+    let (mut conn, tree) = connect_guest().await;
+    let path = "durable_probe.bin";
+
+    let open = tree
+        .open_file_durable(&mut conn, path)
+        .await
+        .expect("a durable open must succeed whether or not durability is granted");
+
+    match open.durable {
+        Some(handle) => {
+            println!(
+                "smb-guest GRANTS durable handles: timeout={} ms, persistent={}, \
+                 identity volume={:#x} file={:#x}",
+                handle.grant.timeout_ms,
+                handle.grant.persistent,
+                handle.identity().volume_serial,
+                handle.identity().index_number,
+            );
+            assert!(
+                handle.is_current(&conn),
+                "a fresh handle belongs to the current session"
+            );
+        }
+        None => println!(
+            "smb-guest DECLINES durable handles; interrupted writes to it restart \
+             rather than resume, which is the crate's documented fallback"
+        ),
+    }
+
+    tree.close_handle(&mut conn, open.file_id)
+        .await
+        .expect("close");
+    tree.delete_file(&mut conn, path).await.ok();
+}
+
+/// A durable handle that Samba granted can be claimed back on a fresh
+/// connection, and the file it comes back as is the same one.
+///
+/// Skips itself when the container declines durability — see the test above
+/// for why that is a legitimate outcome rather than a failure.
+#[tokio::test]
+#[ignore]
+async fn guest_durable_handle_survives_a_reconnect_when_the_server_grants_one() {
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: GUEST_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: String::new(),
+        password: String::new(),
+        domain: String::new(),
+        auto_reconnect: true,
+        compression: false,
+        dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
+    })
+    .await
+    .expect("connect to smb-guest");
+    let tree = client.connect_share("public").await.expect("connect_share");
+    let path = "durable_resume.bin";
+
+    let open = {
+        let conn = client.connection_mut();
+        tree.open_file_durable(conn, path).await.expect("open")
+    };
+    let Some(handle) = open.durable else {
+        println!("smb-guest declines durable handles; nothing to reclaim");
+        let conn = client.connection_mut();
+        tree.close_handle(conn, open.file_id).await.ok();
+        tree.delete_file(conn, path).await.ok();
+        return;
+    };
+    let identity_at_open = handle.identity();
+
+    client.reconnect().await.expect("reconnect");
+    let tree = client
+        .connect_share("public")
+        .await
+        .expect("re-connect_share");
+
+    let conn = client.connection_mut();
+    match tree.reclaim_durable_handle(conn, &handle, path).await {
+        Ok(reclaimed) => {
+            assert_eq!(
+                reclaimed.identity(),
+                identity_at_open,
+                "a reclaim that changed which file it points at must never be \
+                 accepted -- if this ever fires, the guard is the only thing \
+                 between the user's bytes and the wrong file"
+            );
+            println!("smb-guest returned the durable handle across a reconnect");
+            tree.close_handle(conn, reclaimed.file_id).await.ok();
+        }
+        Err(e) => {
+            // Legitimate: Samba drops durable opens when the oplock is broken
+            // or the timeout is short. The contract is that it says so.
+            println!("smb-guest did not return the handle: {e}");
+        }
+    }
+    tree.delete_file(conn, path).await.ok();
+}

@@ -3981,20 +3981,9 @@ mod tests {
         pack_message(&h, &body)
     }
 
-    fn build_query_info_response(output_buffer: Vec<u8>) -> Vec<u8> {
-        build_query_info_response_with_status(NtStatus::SUCCESS, output_buffer)
-    }
-
-    fn build_query_info_response_with_status(status: NtStatus, output_buffer: Vec<u8>) -> Vec<u8> {
-        use crate::msg::query_info::QueryInfoResponse;
-        let mut h = Header::new_request(Command::QueryInfo);
-        h.flags.set_response();
-        h.credits = 32;
-        h.status = status;
-
-        let body = QueryInfoResponse { output_buffer };
-        pack_message(&h, &body)
-    }
+    use crate::client::test_helpers::{
+        build_query_info_response, build_query_info_response_with_status,
+    };
 
     fn build_set_info_response() -> Vec<u8> {
         use crate::msg::set_info::SetInfoResponse;

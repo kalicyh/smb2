@@ -316,3 +316,26 @@ pub(crate) fn build_compound_response_frame(responses: &[Vec<u8>]) -> Vec<u8> {
     }
     frame
 }
+
+/// Build a successful QUERY_INFO response wrapping `output_buffer`.
+pub(crate) fn build_query_info_response(output_buffer: Vec<u8>) -> Vec<u8> {
+    build_query_info_response_with_status(crate::types::status::NtStatus::SUCCESS, output_buffer)
+}
+
+/// Build a QUERY_INFO response the server refused, with no payload.
+pub(crate) fn build_query_info_error_response(status: crate::types::status::NtStatus) -> Vec<u8> {
+    build_query_info_response_with_status(status, Vec::new())
+}
+
+/// Build a QUERY_INFO response with an explicit status.
+pub(crate) fn build_query_info_response_with_status(
+    status: crate::types::status::NtStatus,
+    output_buffer: Vec<u8>,
+) -> Vec<u8> {
+    use crate::msg::query_info::QueryInfoResponse;
+    let mut h = Header::new_request(Command::QueryInfo);
+    h.flags.set_response();
+    h.credits = 32;
+    h.status = status;
+    pack_message(&h, &QueryInfoResponse { output_buffer })
+}

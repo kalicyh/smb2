@@ -984,6 +984,15 @@ struct Inner {
     /// Called on every reconnect lifecycle event, if a consumer asked to be
     /// told. See [`Connection::on_reconnect`].
     reconnect_observer: StdMutex<Option<ReconnectObserver>>,
+    /// The session id this connection had before it was revived, or `0`.
+    ///
+    /// SESSION_SETUP carries it as `PreviousSessionId` (MS-SMB2 § 2.2.5), which
+    /// is how a client says "this is me again" after a disconnect. Without it
+    /// the server has no way to connect the new session to the old one, so it
+    /// holds the dead session's state until its own timeout and — the reason
+    /// this exists — will not let the new session claim the old one's durable
+    /// opens.
+    previous_session_id: AtomicU64,
     /// The session most recently established on this connection.
     ///
     /// Exists so a session established behind a consumer's back — by a
@@ -1057,6 +1066,7 @@ impl Inner {
             revivals: AtomicU64::new(0),
             last_revive_failure: StdMutex::new(None),
             reconnect_observer: StdMutex::new(None),
+            previous_session_id: AtomicU64::new(0),
             session: StdMutex::new(None),
             server_name,
             params: StdMutex::new(None),
@@ -1524,7 +1534,7 @@ impl Connection {
     /// Perform the SMB2 NEGOTIATE exchange.
     pub async fn negotiate(&mut self) -> Result<()> {
         debug!("negotiate: sending request, dialects={:?}", Dialect::ALL);
-        let client_guid = random_guid();
+        let client_guid = client_guid();
 
         let mut negotiate_contexts = vec![
             NegotiateContext::PreauthIntegrity {
@@ -2920,11 +2930,23 @@ impl Connection {
         self.inner.oplock_trees.lock().unwrap().remove(&file_id);
     }
 
+    /// The session id this connection had before its last revival, or `0` if
+    /// it has never been revived.
+    ///
+    /// [`Session::setup`](crate::Session::setup) sends it as
+    /// `PreviousSessionId`. See the field docs for why it matters.
+    pub fn previous_session_id(&self) -> SessionId {
+        SessionId(self.inner.previous_session_id.load(Ordering::Acquire))
+    }
+
     /// Record the session that has just been established here.
     ///
     /// Called by [`Session::setup`](crate::Session::setup); consumers should
     /// not need it.
     pub fn adopt_session(&self, session: &crate::client::Session) {
+        // The old session is superseded; announcing it again on a later setup
+        // would point at something twice-dead.
+        self.inner.previous_session_id.store(0, Ordering::Release);
         *self.inner.session.lock().unwrap() = Some(Arc::new(session.snapshot()));
     }
 
@@ -3177,7 +3199,15 @@ impl Connection {
 
         inner.credits.reset();
         inner.next_message_id.store(0, Ordering::Release);
-        *inner.crypto.lock().unwrap() = CryptoState::new();
+        {
+            // Captured before the wipe: the next SESSION_SETUP announces it so
+            // the server can tie the new session to the old one.
+            let mut crypto = inner.crypto.lock().unwrap();
+            inner
+                .previous_session_id
+                .store(crypto.session_id.0, Ordering::Release);
+            *crypto = CryptoState::new();
+        }
         *inner.preauth_hasher.lock().unwrap() = PreauthHasher::new();
         *inner.params.lock().unwrap() = None;
         *inner.session.lock().unwrap() = None;
@@ -3918,6 +3948,26 @@ pub(crate) fn pack_message(header: &Header, body: &dyn Pack) -> Vec<u8> {
 /// Used for the client GUID at negotiate and for the `CreateGuid` that proves
 /// ownership of a durable handle. ❌ It must stay unpredictable: a guessable
 /// `CreateGuid` would let another client on the same server claim our open.
+/// This client's identity to every server it talks to, for the life of the
+/// process (MS-SMB2 § 3.2.1.1: `ClientGuid` is a property of the *client*, not
+/// of a connection).
+///
+/// ❌ Don't generate a fresh one per NEGOTIATE. A server matches the client
+/// guid when deciding whether a durable open may be claimed back
+/// (MS-SMB2 § 3.3.5.9.12), so a client that reintroduces itself on every
+/// connection can never resume anything: Samba 4.x answers a reconnect from a
+/// "different" client with `STATUS_OBJECT_NAME_NOT_FOUND` (observed against
+/// the `smb-guest` fixture, 2026-08-02, which grants a 60 s durable handle and
+/// then refused to give it back). The same value is what multichannel and
+/// lease keying key on, if either is ever added.
+///
+/// It is stable and therefore identifying, exactly as it is for every other
+/// SMB client — Windows and macOS both send a per-installation guid.
+fn client_guid() -> Guid {
+    static CLIENT_GUID: std::sync::OnceLock<Guid> = std::sync::OnceLock::new();
+    *CLIENT_GUID.get_or_init(random_guid)
+}
+
 pub(crate) fn random_guid() -> Guid {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("failed to generate random GUID");

@@ -17,6 +17,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `shares.rs` | Share enumeration via IPC$ + srvsvc RPC |
 | `dfs.rs` | DFS referral IOCTL helper, `DfsResolver` with TTL-based referral cache |
 | `copy.rs` | Server-side copy (`FSCTL_SRV_COPYCHUNK`): resume-key + copychunk primitives, batched range/whole-file convenience, `ResumeKey` / `CopyChunk` / `ServerSideCopyLimits` public types |
+| `durable.rs` | Durable handles: `open_file_durable` / `reclaim_durable_handle`, `DurableHandle`, `FileIdentity`, and the two-proof rule that makes a resume safe |
 
 ## Layering
 
@@ -223,7 +224,28 @@ Tree-level encryption: `connect_share()` checks the share's encrypt flag and act
 
 ## Reconnection
 
-`SmbClient::reconnect()` creates a fresh TCP connection, re-negotiates, and re-authenticates using stored credentials. All previous `Tree` handles and `FileId` values are invalidated. The caller must `connect_share` again.
+Full rationale on `Connection::reconnect_if_needed` and `ReconnectPolicy`.
+
+**A revival happens in place, under the existing `Arc<Inner>`.** `FileWriter`, `FileReader`, `Watcher`, and every pipelined task own a `Connection` clone; minting a new `Connection` would leave all of them permanently dead and force the consumer to rebuild the world. ❌ Don't "simplify" this back to returning a fresh `Connection`.
+
+- **Armed by the consumer, never assumed.** `Connection::set_reviver` supplies the two things this crate deliberately doesn't keep: an address and credentials. `ClientConfig::auto_reconnect` installs one built from the config. With none installed a dead connection reports `Error::Disconnected` and stays dead.
+- **Written for a stampede.** A 32-deep pipeline discovers the same dead session 32 times at once; `reconnect_if_needed` dials once and everyone else returns off the same attempt (`revive_lock` + the `revivals` counter, which is bumped only on success so the double-check can't see a half-built session).
+- **Every bound lives in `ReconnectPolicy`.** The wall-clock budget wraps the ENTIRE revival, not each attempt: a per-attempt timeout multiplies by the attempt count, and an attempt that parks forever never reaches the second one. A failed revival's verdict stands for `failure_cooldown`, or each caller pays the full budget in turn (32 × 60 s is the unbounded hang again).
+- **`install_transport` erases the dead session completely** and in a fixed order: tear down (which sets `disconnected` under the waiters lock), reset, rebuild, clear `disconnected` LAST. ❌ Nothing may carry over — a stale credit window out-spends the new server, a stale message id makes the server drop us for a sequence gap, stale keys fail verification on every frame. `send_queue_depth` is the deliberate exception (resetting it underflows a caller mid-increment).
+- **The plumbing is respawned, not just the socket.** The keepalive, the stale-request sweeper, and the receiver all exit for good on `disconnected`, so a revival that only swapped the transport would come back with no liveness detection, silently. `spawn_plumbing` is shared with construction so the two can't drift.
+- **The consumer always finds out**: `reconnects_succeeded` / `reconnects_failed` / `reconnect_attempts` counters (always on, answer "was this link quietly flaky?" after the fact), log lines, and a pushed `ReconnectEvent` via `Connection::on_reconnect` for a UI that wants to say "reconnected, resuming" while it happens.
+- **`SESSION_SETUP` announces `PreviousSessionId`** after a revival (`Connection::previous_session_id`), which is how a client says "this is me again" — MS-SMB2 § 2.2.5. Without it the server holds the dead session's state until its own timeout.
+- All previous `Tree` handles and `FileId` values are invalidated regardless; the caller must `connect_share` again. ❌ `execute` never reconnects on your behalf: re-issuing an arbitrary request against a new session is a data-safety decision only the layer that knows the operation's semantics can make. At the `SmbClient` level that means listings, reads, `stat`, and `fs_info` replay; `delete`, `rename`, `create`, and writes surface the error.
+
+## Durable handles
+
+Full rationale in `durable.rs`'s module docs. `Tree::open_file_durable` asks for an open the server keeps alive across a disconnect; `Tree::reclaim_durable_handle` claims it back so an interrupted write resumes instead of restarting.
+
+- **A reclaim is two independent proofs, and anything less fails.** (1) The `DH2C` context carries the `CreateGuid` the client chose at open, which the server matched (MS-SMB2 § 3.3.5.9.12). (2) A compounded `QUERY_INFO` says which file the handle points at, read at open and again after the reclaim. Writing into the wrong file is far worse than a failed transfer, so ❌ never relax either check or let a reclaim through on one.
+- ❌ **v1 durable handles (`DHnQ`/`DHnC`) are not implemented and must not be.** They identify the open by nothing but the server-allocated `FileId`, so a server that recycles ids could hand back a different file. On SMB 2.1 a dead session means the transfer restarts.
+- ❌ **The reconnect context must travel alone.** A server may reject a reclaim carrying any other create context (MS-SMB2 § 3.3.5.9.12) and Samba does, which is why the identity check is a compounded `QUERY_INFO` and not the tidier `QFid` create context. Use `FileInternalInformation` (class 6), not `FileIdInformation` (class 59): Samba 4.20 answers 59 with `STATUS_INVALID_INFO_CLASS`.
+- **A batch oplock is the price** (MS-SMB2 § 3.3.5.9.10) and it bills other clients ~35 s per break, so breaks are acknowledged from the receiver task on the tree the open belongs to (`Connection::register_oplock` / `forget_oplock`). Acknowledging gives the durability up, which is the right trade.
+- **Everything degrades quietly.** A pre-SMB3 server, durable handles off, a declined oplock, a server that won't answer the identity query: all produce a working handle with `DurableOpen::durable == None`, never an error.
 
 ## Connection internals: receiver task + `oneshot` routing
 
