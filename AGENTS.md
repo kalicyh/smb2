@@ -251,7 +251,7 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 
 See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 
-- `cargo test` — unit tests (~555), no server needed
+- `cargo test` — unit tests (~1,000), no server needed
 - `just check` — fmt + clippy + tests + doc
 - `cargo test --test integration -- --ignored` — real NAS/Pi tests (needs `.env`)
 - `just test-docker` — Docker container tests (needs Docker, ~28s locally)

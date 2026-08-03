@@ -936,6 +936,101 @@ async fn guest_watch_directory() {
         .await;
 }
 
+/// A Samba watch survives being cancelled and re-asked, repeatedly.
+///
+/// The QNAP is what motivated the refresh cycle and what proved it works on
+/// real hardware, but the cycle ships for every server, so the other major
+/// implementation has to tolerate it too. What is under test is the server's
+/// patience with CANCEL + re-issue on the same directory handle, over and over,
+/// with the watch still delivering afterwards.
+///
+/// Runs with the interval scaled down to 2 s so several cycles fit.
+#[tokio::test]
+#[ignore]
+async fn guest_watch_survives_repeated_refreshes() {
+    let _ = env_logger::try_init();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut watcher_client = guest_client().await;
+            watcher_client
+                .connection_mut()
+                .set_long_poll_refresh(Some(Duration::from_secs(2)));
+            let mut watcher_share = watcher_client
+                .connect_share("public")
+                .await
+                .expect("tree connect failed (watcher)");
+
+            // Its own directory: a sibling test writing into a shared one would
+            // end this watch before a single refresh had happened.
+            let _ = watcher_client
+                .create_directory(&mut watcher_share, "_test_refresh")
+                .await;
+            let test_file_path = "_test_refresh/docker_refresh_test.tmp";
+            let _ = watcher_client
+                .delete_file(&mut watcher_share, test_file_path)
+                .await;
+
+            let mut watcher = watcher_client
+                .watch(&watcher_share, "_test_refresh/", false)
+                .await
+                .expect("watch failed");
+
+            let writer_task = tokio::task::spawn_local(async move {
+                let mut writer_client = guest_client().await;
+                let mut writer_share = writer_client
+                    .connect_share("public")
+                    .await
+                    .expect("tree connect failed (writer)");
+                // Long enough for several cycles to have come and gone first.
+                tokio::time::sleep(Duration::from_secs(7)).await;
+                writer_client
+                    .write_file(&mut writer_share, test_file_path, b"refresh test")
+                    .await
+                    .expect("write_file failed");
+                (writer_client, writer_share)
+            });
+
+            let events = tokio::time::timeout(Duration::from_secs(25), watcher.next_events())
+                .await
+                .expect("timed out: the watch did not survive its refresh cycles")
+                .expect("next_events failed after refreshing");
+
+            let refreshes = watcher_client
+                .connection_mut()
+                .diagnostics()
+                .metrics
+                .long_poll_refreshes;
+            assert!(
+                refreshes >= 2,
+                "the test is supposed to span several cycles, saw {refreshes}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.filename.contains("docker_refresh_test")),
+                "expected an event for the written file after {refreshes} refresh(es), got: {:?}",
+                events
+                    .iter()
+                    .map(|e| format!("{}: {}", e.action, e.filename))
+                    .collect::<Vec<_>>()
+            );
+
+            watcher.close().await.expect("watcher close failed");
+            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
+            writer_client
+                .delete_file(&mut writer_share, test_file_path)
+                .await
+                .expect("delete_file failed");
+            let _ = writer_client.disconnect_share(&writer_share).await;
+            let _ = watcher_client
+                .delete_directory(&mut watcher_share, "_test_refresh")
+                .await;
+        })
+        .await;
+}
+
 /// Contract test for the CHANGE_NOTIFY loss window between consecutive requests.
 ///
 /// Today's `Watcher::next_events()` issues one CHANGE_NOTIFY, awaits the
