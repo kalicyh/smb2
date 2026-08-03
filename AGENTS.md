@@ -211,7 +211,7 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 5. **TCP framing is big-endian** ✅ -- 0x00 + 3-byte BE length. Only big-endian thing in SMB. See `transport/tcp.rs`.
 6. **STATUS_PENDING loop** ✅ -- `receive_response()` loops past interim responses, extracting credits. See
    `connection.rs`.
-7. **CANCEL two modes** ✅ -- `send_cancel()` handles sync (MessageId) and async (AsyncId + flag). See `connection.rs`.
+7. **CANCEL two modes, and a nonce bit that makes or breaks both** ✅ -- `send_cancel()` handles sync (MessageId) and async (AsyncId + flag); a request the server has answered with an interim STATUS_PENDING has an AsyncId and can ONLY be cancelled by it (MS-SMB2 § 3.2.4.24), which is why `Waiter` records it and `OutstandingRequest` exposes it. Under AES-GMAC the signature nonce carries a "this is a CANCEL" bit (§ 3.1.4.1) on both the sign and the verify path; without it a GMAC-negotiating server refuses the cancel, and since a cancel has no success response the client sees nothing and believes it let go of a request the server still holds. Spans `client/connection.rs` + `crypto/signing.rs`; see `crypto/CLAUDE.md`.
 8. **Session expiry** ✅ -- `receive_response()` detects STATUS_NETWORK_SESSION_EXPIRED, returns `Error::SessionExpired`.
    Caller reconnects. See `connection.rs`.
 9. **Compound encryption wraps entire chain** ✅ -- One TRANSFORM_HEADER for concatenated compound. See `connection.rs`

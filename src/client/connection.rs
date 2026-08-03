@@ -2759,7 +2759,12 @@ impl Connection {
             if should_sign {
                 let c = self.inner.crypto.lock().unwrap();
                 if let (Some(key), Some(algo)) = (&c.signing_key, &c.signing_algorithm) {
-                    signing::sign_message(&mut msg_bytes, key, *algo, original_msg_id.0, false)?;
+                    // `is_cancel = true`: the AES-GMAC nonce carries a bit for
+                    // it (MS-SMB2 § 3.1.4.1), and a server negotiating GMAC
+                    // rejects a CANCEL signed without it — silently, since a
+                    // cancel has no success response. So the request stays
+                    // outstanding and the client believes it was cancelled.
+                    signing::sign_message(&mut msg_bytes, key, *algo, original_msg_id.0, true)?;
                 }
             }
             self.inner
@@ -4058,6 +4063,7 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
 }
 
 /// Outcome of preparing a single sub-frame.
+#[derive(Debug)]
 pub(crate) enum SubFrameAction {
     /// Route this response to the waiter for `msg_id`.
     ///
@@ -4182,9 +4188,15 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
         let status = u32::from_le_bytes(sub[8..12].try_into().unwrap());
         let is_pending = status == NtStatus::PENDING.0;
         if is_signed && !is_pending {
+            // The `is_cancel` bit is part of the AES-GMAC nonce (MS-SMB2
+            // § 3.1.4.1), so a frame whose command is CANCEL has to be verified
+            // with it set or the MAC can never match. In practice that means
+            // the error response a server sends when it REJECTS a cancel — the
+            // one frame that says the cancel did not take.
+            let is_cancel = header.command == Command::Cancel;
             if let (Some(key), Some(algo)) = (signing_key, signing_algorithm) {
                 if let Err(e) =
-                    signing::verify_signature(sub, &key, algo, header.message_id.0, false)
+                    signing::verify_signature(sub, &key, algo, header.message_id.0, is_cancel)
                 {
                     inner
                         .metrics
@@ -5743,6 +5755,105 @@ mod tests {
         // Verify the signature is non-zero.
         let sig = &sent[48..64];
         assert_ne!(sig, &[0u8; 16], "signature should not be all zeros");
+    }
+
+    /// An outgoing CANCEL carries the CANCEL bit in its AES-GMAC nonce.
+    ///
+    /// MS-SMB2 § 3.1.4.1 puts a bit for "this message is an SMB2 CANCEL" in
+    /// the nonce, so a cancel signed without it has a signature no
+    /// GMAC-negotiating server will accept. And a rejected cancel is silent —
+    /// a cancel has no success response — so the request simply stays
+    /// outstanding while the client believes it let go of it. Verified against
+    /// a QNAP TS-464 on 2026-08-03: with the bit missing, every CANCEL for a
+    /// parked CHANGE_NOTIFY was refused and the watch stopped delivering
+    /// events; with it set, the same watch survived repeated cancels and kept
+    /// reporting changes.
+    #[tokio::test]
+    async fn a_cancel_is_signed_with_the_cancel_bit_in_its_gmac_nonce() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        let key = vec![0xCC; 16];
+        conn.activate_signing(key.clone(), SigningAlgorithm::AesGmac);
+        conn.set_session_id(SessionId(0xDDDD));
+
+        conn.send_cancel(MessageId(50), Some(0x77)).await.unwrap();
+        let sent = mock.sent_message(0).unwrap();
+
+        // Re-sign the very bytes that went out, both ways. Only one of them can
+        // reproduce the signature on the wire.
+        let mut with_bit = sent.clone();
+        signing::sign_message(&mut with_bit, &key, SigningAlgorithm::AesGmac, 50, true).unwrap();
+        let mut without_bit = sent.clone();
+        signing::sign_message(&mut without_bit, &key, SigningAlgorithm::AesGmac, 50, false)
+            .unwrap();
+
+        assert_eq!(
+            &sent[48..64],
+            &with_bit[48..64],
+            "the CANCEL has to be signed with the cancel nonce bit set"
+        );
+        assert_ne!(
+            &sent[48..64],
+            &without_bit[48..64],
+            "a signature that matches the no-cancel-bit nonce is the bug this pins"
+        );
+    }
+
+    /// And the receive side reads the same bit back.
+    ///
+    /// The one frame this reaches in practice is the error response a server
+    /// sends when it rejects a CANCEL — the single frame that says the cancel
+    /// did not take. Verifying it with the bit cleared turns that report into
+    /// a `signature_failures` tick and a scary log line about a protocol
+    /// anomaly, which is the opposite of what it is.
+    #[tokio::test]
+    async fn a_cancel_response_is_verified_with_the_cancel_bit() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        let key = vec![0xAB; 16];
+        conn.activate_signing(key.clone(), SigningAlgorithm::AesGmac);
+        let _guard = conn.register_waiter(MessageId(9), Command::Cancel).unwrap();
+
+        let mut h = Header::new_request(Command::Cancel);
+        h.flags.set_response();
+        h.flags.set_signed();
+        h.message_id = MessageId(9);
+        h.status = NtStatus::INVALID_PARAMETER;
+        let body = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+
+        let mut good = pack_message(&h, &body);
+        signing::sign_message_as_server(&mut good, &key, SigningAlgorithm::AesGmac, 9, true)
+            .unwrap();
+        let action = prepare_sub_frame(&good, false, &conn.inner).unwrap();
+        assert!(
+            matches!(action, SubFrameAction::Route(_, Ok(_))),
+            "a correctly signed CANCEL response must verify, got {action:?}"
+        );
+        assert_eq!(conn.metrics().signature_failures, 0);
+
+        // The same frame signed with the bit cleared is what the old verifier
+        // was effectively checking against, and it must NOT pass.
+        let mut wrong = pack_message(&h, &body);
+        signing::sign_message_as_server(&mut wrong, &key, SigningAlgorithm::AesGmac, 9, false)
+            .unwrap();
+        let action = prepare_sub_frame(&wrong, false, &conn.inner).unwrap();
+        assert!(
+            matches!(action, SubFrameAction::Route(_, Err(_))),
+            "the cancel bit has to be part of the check, got {action:?}"
+        );
+        assert_eq!(conn.metrics().signature_failures, 1);
     }
 
     // ── Encryption tests ─────────────────────────────────────────────

@@ -7,6 +7,11 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Connection::send_cancel` never actually cancelled anything on an SMB 3.1.1 server negotiating AES-GMAC.** The GMAC signature nonce carries a bit for "this message is an SMB2 CANCEL" (MS-SMB2 § 3.1.4.1) and the crate signed every cancel with it cleared, so the server refused the request. A CANCEL has no success response, so the refusal was invisible: `explicit_cancels_sent` ticked while the server went on holding the operation. The matching read is fixed too -- the server's rejection response is itself a CANCEL-command frame, so verifying it with the bit cleared reported a `signature_failures` tick and a protocol-anomaly log line instead of the one frame that said the cancel had not taken.
+  - Found by running the new watch refresh cycle against a QNAP TS-464 (2026-08-03): with the bit missing, every cancel was refused, the abandoned CHANGE_NOTIFYs stayed registered, and the directory watch stopped delivering events entirely. With it set, the same watch survived three cancel-and-re-issue rounds and reported the change. **Only AES-GMAC signing is affected** — HMAC-SHA256 and AES-CMAC don't use a nonce, so SMB 3.0/3.0.2 and any 3.1.1 server that didn't negotiate GMAC were never wrong.
+
 ### Added
 
 - **A directory watch now heals itself when a server quietly drops the subscription.** Every liveness verdict this crate reaches is about the *connection* -- the ECHO probes, `quiet_for`, `unresponsive_for`, and the long-poll bound built on them. A server that keeps answering everything while it has silently forgotten one CHANGE_NOTIFY is, to all of them, perfectly healthy, so the watch waited on an event that could never arrive with nothing anywhere able to say so. Measured on a QNAP TS-464 (2026-08-03): two CHANGE_NOTIFY requests outstanding for 6,186 s, while `fs_info` on the same connection round-tripped in 4 ms and every ECHO probe was answered.

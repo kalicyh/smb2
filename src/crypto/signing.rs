@@ -103,6 +103,27 @@ pub fn sign_message(
     Ok(())
 }
 
+/// Sign a message the way a SERVER would, so a test can build a frame the
+/// client's verifier is supposed to accept.
+///
+/// Test-only: nothing in this crate ever signs as a server. It exists because
+/// the role bit and the CANCEL bit both live in the AES-GMAC nonce, and the
+/// only way to pin that the receive path passes the right one is to hand it a
+/// frame that is correct except for that bit.
+#[cfg(test)]
+pub(crate) fn sign_message_as_server(
+    message: &mut [u8],
+    key: &[u8],
+    algorithm: SigningAlgorithm,
+    message_id: u64,
+    is_cancel: bool,
+) -> Result<(), Error> {
+    message[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_LEN].fill(0);
+    let signature = compute_signature(message, key, algorithm, message_id, is_cancel, true)?;
+    message[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_LEN].copy_from_slice(&signature);
+    Ok(())
+}
+
 /// Verify the signature on a received SMB2 message (server → client).
 ///
 /// Returns `Ok(())` if the signature matches, or [`Error::InvalidData`]
