@@ -5,7 +5,7 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.17.0] - 2026-08-03
 
 ### Fixed
 
@@ -26,6 +26,11 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 - **A parked CHANGE_NOTIFY is no longer logged as a stalled request.** The stale-request sweeper's every line means "this should have come back by now", which for a long poll is false by construction -- the deadline exempts it precisely because hours of silence is healthy. Warning about it every 10 s anyway was the sweeper contradicting the deadline, and at that volume it buried the lines that matter: a file manager watching two panes logged 5,911 `WARN`s in six hours about requests nothing was ever going to answer.
   - They stay observable, in the two places worth being observable: at `TRACE` on every sweep, and named in full at `WARN` whenever a genuine stale request is reported, because a wedge investigation wants the whole in-flight picture rather than a filtered one. The per-request naming that the 2026-07-31 incident asked for is untouched for every command that can actually stall.
   - With the refresh cycle above, a long poll no longer stays parked longer than the interval either, so the state the old lines described is now bounded rather than perpetual.
+
+### Notes
+
+- **Nothing breaks, and a minor bump anyway.** `MetricsSnapshot` and `OutstandingRequest` are both `#[non_exhaustive]`, so their new fields are additive, and `send_cancel` relaxing from `&mut self` to `&self` accepts strictly more callers. The bump is minor because the behavior on the wire changes for everyone holding a `Watcher`: a subscription is now cancelled and re-issued every 10 minutes where it used to sit forever. Nobody should have to discover that from a patch release.
+- **Nothing to do to adopt it.** The refresh is on by default and `Watcher::next_events` looks the same from the outside — a handover is not an answer, so the caller never sees one. `Connection::set_long_poll_refresh(None)` restores the old behavior if a consumer would rather manage its own watcher lifetime.
 
 ## [0.16.1] - 2026-08-02
 
