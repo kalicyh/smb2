@@ -299,7 +299,8 @@ For when you want to do one thing and get the result:
 - `client.download(&share, path)`: Streaming download with progress (memory-efficient)
 - `client.upload(&share, path, data)`: Streaming upload with progress
 - `client.write_file_streamed(&mut share, path, callback)`: Write from a streaming source (memory-efficient, pipelined)
-- `client.watch(&share, path, recursive)`: Watch for file changes (CHANGE_NOTIFY)
+- `client.watch(&share, path, recursive)`: Watch for file changes (CHANGE_NOTIFY). Re-issues its subscription every
+  10 minutes (`Connection::set_long_poll_refresh`), so a server that quietly drops one heals itself
 - `client.fs_info(&mut share)`: Disk space (total, free, used)
 - `client.reconnect()`: Reconnect after network failure
 - `client.credits()`: Current available credits

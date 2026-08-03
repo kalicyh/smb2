@@ -16,8 +16,9 @@
 
 use log::debug;
 
-use crate::client::connection::{Connection, WaiterGuard};
+use crate::client::connection::{Connection, LongPollOutcome, WaiterGuard};
 use crate::client::tree::Tree;
+use crate::client::Frame;
 use crate::error::Result;
 use crate::msg::change_notify::{
     ChangeNotifyRequest, ChangeNotifyResponse, FILE_NOTIFY_CHANGE_ATTRIBUTES,
@@ -26,7 +27,7 @@ use crate::msg::change_notify::{
 };
 use crate::pack::{ReadCursor, Unpack};
 use crate::types::status::NtStatus;
-use crate::types::{Command, FileId};
+use crate::types::{Command, FileId, MessageId};
 use crate::Error;
 
 /// Default completion filter: watch for most common changes.
@@ -183,32 +184,44 @@ impl Watcher {
     /// request is already on the wire so no events arriving during the
     /// re-scan get lost.
     pub async fn next_events(&mut self) -> Result<Vec<FileNotifyEvent>> {
-        // Cold start: no request has been issued yet. Dispatch the first.
-        if self.pending.is_none() {
-            let rx = self.dispatch_next().await?;
-            self.pending = Some(rx);
-        }
-        // Take the currently in-flight receiver, then immediately
-        // pre-issue the next request before awaiting this one. The
-        // `dispatch` call below `.await`s only the transport.send(), so
-        // when it returns, the next CHANGE_NOTIFY is on the wire and the
-        // server has somewhere to put new events even while we process
-        // the response for the previous one.
-        let in_flight = self.pending.take().expect("pending populated above");
-        let next_rx = self.dispatch_next().await?;
-        self.pending = Some(next_rx);
+        let frame = loop {
+            // Cold start: no request has been issued yet. Dispatch the first.
+            if self.pending.is_none() {
+                let rx = self.dispatch_next().await?;
+                self.pending = Some(rx);
+            }
+            // Take the currently in-flight receiver, then immediately
+            // pre-issue the next request before awaiting this one. The
+            // `dispatch` call below `.await`s only the transport.send(), so
+            // when it returns, the next CHANGE_NOTIFY is on the wire and the
+            // server has somewhere to put new events even while we process
+            // the response for the previous one.
+            let in_flight = self.pending.take().expect("pending populated above");
+            let next_rx = self.dispatch_next().await?;
+            self.pending = Some(next_rx);
 
-        // ❌ Not `in_flight.recv()`. A bare await on the guard walks past
-        // every bound the connection has: CHANGE_NOTIFY is exempt from the
-        // request deadline by design, so `await_response` is the only thing
-        // that applies the one bound it does have — connection-wide silence,
-        // in `await_long_poll`. Awaiting the guard directly left a watcher on
-        // a silent-but-open session waiting forever, which is the exact
-        // failure the long-poll bound exists to end.
-        let frame = self
-            .conn
-            .await_response(in_flight, Command::ChangeNotify)
-            .await?;
+            // ❌ Not `in_flight.recv()`. A bare await on the guard walks past
+            // every bound the connection has: CHANGE_NOTIFY is exempt from the
+            // request deadline by design, so the connection is the only thing
+            // that applies the two bounds it does have — connection-wide
+            // silence, and the refresh cycle. Awaiting the guard directly left
+            // a watcher on a silent-but-open session waiting forever, which is
+            // the exact failure the long-poll bound exists to end.
+            match self
+                .conn
+                .await_long_poll_refreshable(in_flight, Command::ChangeNotify)
+                .await?
+            {
+                LongPollOutcome::Answered(frame) => break frame,
+                LongPollOutcome::RefreshDue { msg_id, async_id } => {
+                    match self.refresh(msg_id, async_id).await? {
+                        // The sibling had an answer waiting after all.
+                        Some(frame) => break frame,
+                        None => continue,
+                    }
+                }
+            }
+        };
 
         if frame.header.status == NtStatus::NOTIFY_ENUM_DIR {
             return Err(Error::Protocol {
@@ -248,6 +261,78 @@ impl Watcher {
         self.conn
             .dispatch(Command::ChangeNotify, &req, Some(self.tree.tree_id))
             .await
+    }
+
+    /// Replace both of the watcher's subscriptions with fresh ones.
+    ///
+    /// Reached when a request has been registered with the server longer than
+    /// `Connection::set_long_poll_refresh` allows. Nothing is known to be
+    /// wrong, and nothing can be: a subscription the server has forgotten and a
+    /// directory nobody has touched are the same silence. This declines to bet
+    /// on which, at the cost of three frames per cycle.
+    ///
+    /// **Both** get replaced, not just the one that aged out. The watcher
+    /// pre-issues its successor in the same breath as the request it awaits, so
+    /// the two are the same age and a server that dropped one has every reason
+    /// to have dropped the other.
+    ///
+    /// **Order is the whole correctness argument.** The replacement goes out
+    /// before either retirement, so the server is never without an outstanding
+    /// request — leaving that gap open is exactly what the pipelined watcher
+    /// exists to prevent, and a strict server drops the events that land in it.
+    ///
+    /// Returns any events the retiring sibling turned out to be holding: an
+    /// answer that arrived in the handover is a real answer, and it also
+    /// settles the only question worth asking here, which is that this
+    /// subscription was alive.
+    async fn refresh(
+        &mut self,
+        retired: MessageId,
+        async_id: Option<u64>,
+    ) -> Result<Option<Frame>> {
+        debug!(
+            "watcher: refreshing its subscription (msg_id={} retired)",
+            retired.0
+        );
+        // 1. Arm the replacement first. Everything after this can fail without
+        //    leaving the directory unwatched.
+        let fresh = self.dispatch_next().await?;
+
+        // 2. Retire the request that aged out. Best-effort: a server that has
+        //    forgotten the subscription will ignore the cancel too, which is
+        //    the case being healed rather than a new failure. ❌ Skipping it is
+        //    not an option though — on a server that DID remember, every cycle
+        //    would leave one more abandoned CHANGE_NOTIFY registered for the
+        //    life of the watch.
+        self.retire(retired, async_id).await;
+
+        // 3. And its equally-old sibling, salvaging an answer if it has one.
+        let mut answered = None;
+        if let Some(mut sibling) = self.pending.take() {
+            let (msg_id, async_id) = (sibling.msg_id(), sibling.async_id());
+            answered = sibling.try_recv().transpose()?;
+            drop(sibling);
+            if answered.is_none() {
+                self.retire(msg_id, async_id).await;
+            }
+        }
+
+        self.pending = Some(fresh);
+        Ok(answered)
+    }
+
+    /// Tell the server to let go of a request we have stopped waiting for.
+    ///
+    /// Failure is logged and swallowed: the cancel is housekeeping, and a
+    /// connection too broken to carry it will surface itself through the next
+    /// real request with a far better error than this one could offer.
+    async fn retire(&self, msg_id: MessageId, async_id: Option<u64>) {
+        if let Err(e) = self.conn.send_cancel(msg_id, async_id).await {
+            debug!(
+                "watcher: could not cancel the retired CHANGE_NOTIFY (msg_id={}): {e}",
+                msg_id.0
+            );
+        }
     }
 
     /// Close the directory handle.

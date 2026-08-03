@@ -58,6 +58,13 @@ const BASE_DEADLINE: Duration = Duration::from_millis(600);
 /// tripping it means something genuinely hung rather than ran slowly on a
 /// loaded machine.
 const TEST_BUDGET: Duration = Duration::from_secs(20);
+/// How long a long poll is left registered before it is retired for a fresh
+/// one. Real default: 10 minutes.
+///
+/// Above the response deadline, the shipping relationship: the refresh is the
+/// slowest clock on a connection by a wide margin, because everything faster
+/// than it is about detecting death, and a refresh detects nothing.
+const LONG_POLL_REFRESH: Duration = Duration::from_millis(900);
 
 // ── The scripted server ────────────────────────────────────────────────────
 
@@ -97,6 +104,11 @@ struct ScriptedServer {
     answer: Mutex<Answer>,
     /// Requests seen, in order, and whether they have been answered.
     seen: Mutex<Vec<(Command, MessageId, bool)>>,
+    /// CANCELs received, as the client addressed them: `(MessageId, AsyncId)`.
+    ///
+    /// The `AsyncId` is the part that decides whether a cancel does anything
+    /// at all (MS-SMB2 § 3.2.4.24), so it is recorded rather than counted.
+    cancels: Mutex<Vec<(MessageId, Option<u64>)>>,
     echoes: AtomicUsize,
 }
 
@@ -107,8 +119,19 @@ impl ScriptedServer {
             ready: Notify::new(),
             answer: Mutex::new(answer),
             seen: Mutex::new(Vec::new()),
+            cancels: Mutex::new(Vec::new()),
             echoes: AtomicUsize::new(0),
         })
+    }
+
+    /// The `AsyncId` this harness hands out for a request it intends to hold,
+    /// derived from the `MessageId` so a test can predict it.
+    fn async_id_for(msg_id: MessageId) -> u64 {
+        0xA5A5_0000_0000_0000 | msg_id.0
+    }
+
+    fn cancels(&self) -> Vec<(MessageId, Option<u64>)> {
+        self.cancels.lock().unwrap().clone()
     }
 
     fn set_answer(&self, answer: Answer) {
@@ -117,6 +140,27 @@ impl ScriptedServer {
 
     fn echo_count(&self) -> usize {
         self.echoes.load(Ordering::Relaxed)
+    }
+
+    /// How many requests of this command the server has been sent.
+    fn count_of(&self, command: Command) -> usize {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _, _)| *c == command)
+            .count()
+    }
+
+    /// Every command seen, in arrival order. For assertions about ORDERING,
+    /// which is what "the wire is never left unarmed" comes down to.
+    fn command_order(&self) -> Vec<Command> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(c, _, _)| *c)
+            .collect()
     }
 
     /// Answer every request seen so far that has not been answered yet.
@@ -205,6 +249,27 @@ impl TransportSend for ScriptedServer {
             .lock()
             .unwrap()
             .push((header.command, header.message_id, will_answer));
+        if header.command == Command::Cancel {
+            self.cancels
+                .lock()
+                .unwrap()
+                .push((header.message_id, header.async_id));
+        }
+        // A server that intends to HOLD a request says so with an interim
+        // STATUS_PENDING carrying an AsyncId, and every real one does this for
+        // CHANGE_NOTIFY. It is the only frame that ever states the id a CANCEL
+        // has to carry. A server playing dead sends nothing at all, so this is
+        // conditional on the policy rather than on the command.
+        if header.command == Command::ChangeNotify && answer != Answer::Nothing {
+            let mut h = Header::new_request(Command::ChangeNotify);
+            h.flags.set_response();
+            h.flags.set_async();
+            h.message_id = header.message_id;
+            h.credits = 8;
+            h.status = NtStatus::PENDING;
+            h.async_id = Some(Self::async_id_for(header.message_id));
+            self.push(pack_message(&h, &EchoResponse));
+        }
         if will_answer {
             let frame = if answer == Answer::EchoExpired && is_echo {
                 Some(build_expired_response(header.message_id))
@@ -774,6 +839,150 @@ async fn a_real_watcher_on_a_dead_server_is_told_instead_of_waiting_forever() {
         "the verdict has to rest on probes, saw {}",
         server.echo_count()
     );
+}
+
+/// The gap the connection-level bound cannot cover: the server is answering
+/// everything except the one subscription it has quietly forgotten.
+///
+/// Every liveness verdict this crate reaches is about the CONNECTION —
+/// `quiet_for`, the ECHO probes, `unresponsive_for`, and the long-poll bound
+/// built on them. On a link where responses keep flowing they all read
+/// "healthy", correctly, and a CHANGE_NOTIFY the server dropped on the floor
+/// waits behind them forever. A QNAP TS-464 did exactly this for 6,186 s while
+/// answering `fs_info` in 4 ms on the same connection (2026-08-03).
+///
+/// ❌ There is nothing here to detect: a forgotten subscription and an
+/// untouched directory both look like silence. What ends it is refusing to
+/// trust one subscription indefinitely — retire it on a cycle and issue a
+/// fresh one, which heals the loss without ever having to be right about it.
+#[tokio::test]
+async fn a_subscription_the_server_forgot_is_re_issued_rather_than_trusted_forever() {
+    let server = ScriptedServer::new(Answer::EchoOnly);
+    let conn = connect(&server);
+    conn.set_long_poll_refresh(Some(LONG_POLL_REFRESH));
+
+    let mut watcher = crate::client::watcher::Watcher::new(
+        crate::client::tree::Tree {
+            tree_id: TreeId(1),
+            share_name: "test".to_string(),
+            server: "scripted-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        },
+        conn.clone(),
+        crate::types::FileId {
+            persistent: 1,
+            volatile: 2,
+        },
+        true,
+    );
+    let watching = tokio::spawn(async move { watcher.next_events().await });
+
+    // A watcher opens with two CHANGE_NOTIFY requests: the one it awaits and
+    // the successor it pre-issues so the server always has somewhere to put an
+    // event. A third means the refresh cycle ran.
+    let watched = Arc::clone(&server);
+    wait_until("the watcher to re-issue its subscription", || {
+        watched.count_of(Command::ChangeNotify) >= 3
+    })
+    .await;
+
+    let cancels = server.cancels();
+    assert!(
+        cancels.len() >= 2,
+        "a retired subscription has to be CANCELled, or the server accumulates one \
+         abandoned CHANGE_NOTIFY per cycle for the life of the watch; saw {cancels:?}"
+    );
+    // The part that decides whether a cancel does anything at all. A server
+    // that has sent an interim STATUS_PENDING has assigned the request an
+    // AsyncId, and a cancel that does not carry it matches nothing (MS-SMB2
+    // § 3.2.4.24) — so a client that forgot the id would think it was retiring
+    // subscriptions while the server quietly kept every one of them.
+    for (msg_id, async_id) in &cancels {
+        assert_eq!(
+            *async_id,
+            Some(ScriptedServer::async_id_for(*msg_id)),
+            "the CANCEL for msg_id={} has to carry the AsyncId the server assigned it, \
+             or the server never lets the subscription go",
+            msg_id.0
+        );
+    }
+    // The whole point of the pipelined watcher is that the server is never
+    // without an outstanding request, so the replacement must go out BEFORE
+    // the retirements. A strict server drops events that land in that gap.
+    let order = server.command_order();
+    let third_notify = order
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == Command::ChangeNotify)
+        .nth(2)
+        .map(|(i, _)| i)
+        .expect("a third CHANGE_NOTIFY was just waited for");
+    let first_cancel = order
+        .iter()
+        .position(|c| *c == Command::Cancel)
+        .expect("a CANCEL was just asserted");
+    assert!(
+        third_notify < first_cancel,
+        "the replacement must reach the wire before the stale requests are retired, \
+         or the refresh opens the very loss window the pipelined watcher exists to \
+         close; saw {order:?}"
+    );
+    assert!(
+        conn.metrics().long_poll_refreshes >= 1,
+        "a consumer has to be able to see cycles happening"
+    );
+    assert!(
+        !watching.is_finished(),
+        "a refresh is a handover, not a failure: the watch continues"
+    );
+    watching.abort();
+}
+
+/// The same watch with the refresh turned off keeps one subscription forever.
+///
+/// Deliberate, and the reason the knob exists: a consumer that re-creates its
+/// own watchers on a schedule has no use for a second cycle underneath it, and
+/// the crate should not force wire chatter on it. ❌ The cost is that a
+/// subscription the server drops stays dropped, so this is opt-in silence.
+#[tokio::test]
+async fn a_long_poll_with_the_refresh_off_keeps_one_subscription_forever() {
+    let server = ScriptedServer::new(Answer::EchoOnly);
+    let conn = connect(&server);
+    conn.set_long_poll_refresh(None);
+
+    let mut watcher = crate::client::watcher::Watcher::new(
+        crate::client::tree::Tree {
+            tree_id: TreeId(1),
+            share_name: "test".to_string(),
+            server: "scripted-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        },
+        conn.clone(),
+        crate::types::FileId {
+            persistent: 1,
+            volatile: 2,
+        },
+        true,
+    );
+    let watching = tokio::spawn(async move { watcher.next_events().await });
+
+    let watched = Arc::clone(&server);
+    wait_until("the watcher to arm itself", || {
+        watched.count_of(Command::ChangeNotify) >= 2
+    })
+    .await;
+    tokio::time::sleep(LONG_POLL_REFRESH * 4).await;
+
+    assert_eq!(
+        server.count_of(Command::ChangeNotify),
+        2,
+        "with the refresh off nothing should re-issue"
+    );
+    assert_eq!(conn.metrics().long_poll_refreshes, 0);
+    assert!(!watching.is_finished());
+    watching.abort();
 }
 
 /// A probe answered with an error is still a probe answered.

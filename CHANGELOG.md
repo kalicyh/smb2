@@ -5,6 +5,17 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A directory watch now heals itself when a server quietly drops the subscription.** Every liveness verdict this crate reaches is about the *connection* -- the ECHO probes, `quiet_for`, `unresponsive_for`, and the long-poll bound built on them. A server that keeps answering everything while it has silently forgotten one CHANGE_NOTIFY is, to all of them, perfectly healthy, so the watch waited on an event that could never arrive with nothing anywhere able to say so. Measured on a QNAP TS-464 (2026-08-03): two CHANGE_NOTIFY requests outstanding for 6,186 s, while `fs_info` on the same connection round-tripped in 4 ms and every ECHO probe was answered.
+  - **This cannot be detected, so it isn't.** A subscription the server has forgotten and a directory nobody has touched produce the identical observation: nothing. Hours of silence is the healthy case -- it is why CHANGE_NOTIFY is exempt from the response deadline in the first place -- so any rule that "notices" a dead watch also ends live ones. Instead the client stops relying on one subscription surviving indefinitely: `Connection::set_long_poll_refresh` (10 minutes, on by default) retires each request and issues a fresh one, and a server-side loss heals within a cycle with no verdict to get wrong.
+  - **The wire is never left unarmed.** The replacement goes out before either retirement, so the pipelined watcher's guarantee -- the server always has an outstanding request to deliver events into -- holds through the handover. Strict servers (older Samba, NAS firmware) drop events that land in such a gap, which is the bug the pipelining was written to fix.
+  - **Retired requests are CANCELled properly.** A request the server has answered with an interim `STATUS_PENDING` has been assigned an `AsyncId`, and a cancel that does not carry it matches nothing (MS-SMB2 § 3.2.4.24) -- so without this the server would keep every subscription the cycle walked away from, one more per interval for the life of the watch. The client now records the `AsyncId` from the interim response and cancels with it.
+  - **Cost and settings.** Three frames per cycle per watched directory. `set_long_poll_refresh(None)` restores the old behavior, which suits a consumer that re-creates its own watchers on a schedule. Watch `MetricsSnapshot::long_poll_refreshes` to see cycles happening -- it counts handovers, never faults. ❌ Shortening the interval detects nothing faster; there is nothing to detect.
+  - **No API breaks.** `Connection::set_long_poll_refresh` / `long_poll_refresh` and `MetricsSnapshot::long_poll_refreshes` are new; `OutstandingRequest` gained an `async_id` field (a struct nothing constructs outside the crate); `Connection::send_cancel` relaxed from `&mut self` to `&self`, which accepts strictly more callers. `Watcher::next_events` behaves the same from the outside: a refresh is a handover, so the caller never sees one.
+
 ## [0.16.1] - 2026-08-02
 
 ### Fixed

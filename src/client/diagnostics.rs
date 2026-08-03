@@ -220,6 +220,15 @@ pub struct OutstandingRequest {
     /// server cannot answer a question it was never asked. `Some(d)` with a
     /// large `d` is the genuine "server went quiet" case.
     pub sent_age: Option<Duration>,
+    /// The `AsyncId` the server assigned in its interim `STATUS_PENDING`, or
+    /// `None` if it has not sent one.
+    ///
+    /// What a
+    /// [`Connection::send_cancel`](crate::client::connection::Connection::send_cancel)
+    /// for this request has to carry: once a request has an `AsyncId`, a
+    /// cancel against its `MessageId` alone matches nothing (MS-SMB2
+    /// § 3.2.4.24).
+    pub async_id: Option<u64>,
 }
 
 /// Signing state.
@@ -435,6 +444,18 @@ pub struct MetricsSnapshot {
     /// A rising count next to a flat `response_timeouts` is the keepalive
     /// working exactly as intended.
     pub response_deadline_extensions: u64,
+    /// Long-poll requests (CHANGE_NOTIFY) retired and re-issued because they
+    /// reached
+    /// [`Connection::set_long_poll_refresh`](crate::client::connection::Connection::set_long_poll_refresh).
+    ///
+    /// ❌ Not an error count and not a detection count. Nothing can tell a
+    /// subscription the server has forgotten from a directory nobody has
+    /// touched — both are silence — so the client re-issues on a cycle instead
+    /// of trying, and this ticks every time it does. On a healthy watch it
+    /// climbs at roughly one per interval per watched directory. Zero while a
+    /// watcher has been open for longer than the interval means the refresh is
+    /// turned off, which is what leaves a dropped subscription dead forever.
+    pub long_poll_refreshes: u64,
 
     /// Dials made trying to bring this connection back, across every revival.
     pub reconnect_attempts: u64,
@@ -586,6 +607,9 @@ fn fmt_connection_body(c: &ConnectionDiagnostics, f: &mut fmt::Formatter<'_>) ->
         m.keepalive_failures,
         m.response_deadline_extensions,
     )?;
+    if m.long_poll_refreshes > 0 {
+        writeln!(f, "  long polls: {} refreshed", m.long_poll_refreshes)?;
+    }
     if m.reconnect_attempts > 0 {
         writeln!(
             f,
@@ -961,7 +985,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn explicit_cancels_sent_ticks_on_send_cancel() {
         let mock = Arc::new(MockTransport::new());
-        let mut conn = Connection::from_transport(
+        let conn = Connection::from_transport(
             Box::new(mock.clone()),
             Box::new(mock.clone()),
             "test-server",

@@ -1,7 +1,11 @@
 # How much silence a watcher survives, measured
 
-What ends a parked CHANGE_NOTIFY is connection-wide silence, not a missed ECHO probe. This note records what real
-servers actually do, because the two are wildly different numbers and only the first one decides anything.
+What ends a parked CHANGE_NOTIFY *on a dead link* is connection-wide silence, not a missed ECHO probe. This note records
+what real servers actually do, because the two are wildly different numbers and only the first one decides anything.
+
+Scope: everything below is about the link dying. A subscription that dies on its own while the link stays healthy is
+invisible to every number here, by construction — see `src/client/CLAUDE.md` § The long-poll refresh cycle for the
+separate mechanism that covers it.
 
 Reproduce with `cargo run --release --example liveness_probe` (its header lists the knobs). It runs two connections
 against the same server at once: a **measured** one (keepalive and response deadline off, one CHANGE_NOTIFY parked,

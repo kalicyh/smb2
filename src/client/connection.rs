@@ -46,6 +46,17 @@ struct Waiter {
     /// said anything", and a request still in the send queue has not asked
     /// it anything yet.
     last_activity: std::time::Instant,
+    /// The `AsyncId` the server assigned in its interim STATUS_PENDING, if it
+    /// sent one.
+    ///
+    /// Load-bearing for CANCEL and nothing else. Once a request has been given
+    /// an `AsyncId`, MS-SMB2 § 3.2.4.24 says a cancel must carry it with
+    /// `SMB2_FLAGS_ASYNC_COMMAND` set; one sent against the `MessageId`
+    /// instead matches nothing and the server keeps the request. Every long
+    /// poll gets one (a CHANGE_NOTIFY the server intends to hold is exactly
+    /// what interim responses are for), so without this a retired
+    /// subscription could never actually be retired.
+    async_id: Option<u64>,
 }
 
 /// A registered waiter that deregisters itself if its caller goes away.
@@ -70,6 +81,27 @@ impl WaiterGuard {
     /// The id this guard is holding a slot for.
     pub(crate) fn msg_id(&self) -> MessageId {
         self.msg_id
+    }
+
+    /// The `AsyncId` the server assigned this request, if it has sent an
+    /// interim STATUS_PENDING. What a CANCEL for it has to carry.
+    pub(crate) fn async_id(&self) -> Option<u64> {
+        self.inner.async_id_for(self.msg_id)
+    }
+
+    /// Take an answer that has ALREADY arrived, without waiting for one.
+    ///
+    /// The last look before a caller walks away from a request it is about to
+    /// retire: a response that landed in the moment between "this has been
+    /// parked long enough" and "drop the guard" is a real answer, and throwing
+    /// it away would turn a routine handover into lost events.
+    pub(crate) fn try_recv(&mut self) -> Option<Result<Frame>> {
+        let rx = self.rx.as_mut()?;
+        match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(Error::Disconnected)),
+        }
     }
 
     /// Await this request's response.
@@ -213,6 +245,36 @@ const LIVENESS_WINDOW_PROBES: u32 = 3;
 /// request" is a server-side stall that waiting cannot fix, and reconnecting
 /// beats waiting.
 const ALIVE_DEADLINE_FACTOR: u32 = 6;
+
+/// How long one long-poll request may sit registered with the server before
+/// the client retires it and issues a fresh one.
+///
+/// **This is a self-healing cycle, not a detector, and it cannot be anything
+/// else.** A CHANGE_NOTIFY the server has silently forgotten and one watching a
+/// directory nobody has touched produce the identical observation: nothing. No
+/// amount of correlating it against other traffic tells them apart, because a
+/// healthy watch is *defined* by hours of silence — which is also why
+/// [`is_long_poll`] exempts these from the response deadline to begin with. So
+/// the only sound answer is to stop relying on a single subscription surviving
+/// indefinitely: re-issue it periodically and a server-side loss heals itself
+/// within one cycle, with no verdict to get wrong and no healthy watch ever
+/// ended.
+///
+/// It has to exist because the connection-level bound cannot cover this case.
+/// [`Connection::await_long_poll`] ends a watch when the whole wire goes quiet,
+/// which catches a dead session — but a server that keeps answering everything
+/// else while one subscription is dead is, by that reading, perfectly healthy.
+/// Measured against a QNAP TS-464 on 2026-08-03: two CHANGE_NOTIFY requests
+/// outstanding for 6,186 s with no response, while `fs_info` on the same
+/// connection round-tripped in 4 ms and every ECHO probe was answered.
+///
+/// 10 minutes trades healing latency against wire chatter: a lost subscription
+/// costs at most one cycle of missed events, and the cycle itself costs three
+/// frames (one replacement CHANGE_NOTIFY plus a CANCEL for each retired
+/// request) per watched directory. ❌ Don't shorten it to "detect faster" — it
+/// detects nothing, and each cycle is one more handover an event can slip
+/// through.
+const LONG_POLL_REFRESH: Duration = Duration::from_secs(600);
 
 /// How many frames may be queued for the writer task before callers block.
 ///
@@ -367,6 +429,32 @@ fn spawn_stale_waiter_sweeper(inner: &Arc<Inner>) {
     if let Some(old) = inner.sweeper_task.lock().unwrap().replace(handle) {
         old.abort();
     }
+}
+
+/// How a long poll's wait ended.
+///
+/// A long poll is the one request in the crate that can finish without the
+/// server having said anything, so "did we get a frame" is not a yes/no
+/// question here.
+pub(crate) enum LongPollOutcome {
+    /// The server answered.
+    Answered(Frame),
+    /// The request has been registered with the server longer than the refresh
+    /// interval, so it has been given up on. **Nothing is wrong** — see
+    /// [`LONG_POLL_REFRESH`].
+    ///
+    /// Its waiter is already deregistered. The caller owes the server two
+    /// things, in this order: a replacement request (so the wire is never left
+    /// unarmed, which is what the pipelined `Watcher` exists to guarantee) and
+    /// then a CANCEL carrying these ids, without which the server accumulates
+    /// one abandoned subscription per cycle for the life of the watch.
+    RefreshDue {
+        /// The retired request's id.
+        msg_id: MessageId,
+        /// The `AsyncId` the server gave it, which its CANCEL must carry
+        /// (MS-SMB2 § 3.2.4.24).
+        async_id: Option<u64>,
+    },
 }
 
 /// What one probe round learned about the server.
@@ -882,6 +970,10 @@ struct Inner {
     /// How much server silence, with work outstanding, triggers an ECHO probe,
     /// or `None` to never probe. See `Connection::set_keepalive`.
     keepalive_after: StdMutex<Option<Duration>>,
+    /// How long a long-poll request may stay registered with the server before
+    /// it is retired for a fresh one, or `None` to keep one forever. See
+    /// `Connection::set_long_poll_refresh`.
+    long_poll_refresh: StdMutex<Option<Duration>>,
     /// The server's credit budget. Every send reserves its `CreditCharge`
     /// here before the bytes go out; the receiver task banks the grant off
     /// every frame (orphans included). See `credits.rs`.
@@ -1029,6 +1121,7 @@ impl Inner {
             response_timeout: StdMutex::new(Some(RESPONSE_TIMEOUT)),
             last_frame_at: StdMutex::new(None),
             keepalive_after: StdMutex::new(Some(KEEPALIVE_AFTER)),
+            long_poll_refresh: StdMutex::new(Some(LONG_POLL_REFRESH)),
             credits: CreditPool::new(),
             next_message_id: AtomicU64::new(0),
             crypto: StdMutex::new(CryptoState::new()),
@@ -1310,6 +1403,30 @@ impl Inner {
         (quiet >= after * LIVENESS_WINDOW_PROBES).then_some(quiet)
     }
 
+    /// How long ago `msg_id`'s frame reached the wire, or `None` if it is no
+    /// longer outstanding or has not been sent yet.
+    ///
+    /// The clock a long poll's refresh cycle runs on: "how long has the server
+    /// been holding this subscription". Deliberately NOT `last_activity`,
+    /// which an interim STATUS_PENDING restarts — a long poll gets exactly one
+    /// of those, right at the start, and a clock that restarted there would
+    /// measure the same thing while claiming to measure registration age.
+    fn waiter_sent_age(&self, msg_id: MessageId) -> Option<Duration> {
+        let now = std::time::Instant::now();
+        self.waiters
+            .lock()
+            .unwrap()
+            .get(&msg_id)
+            .and_then(|w| w.sent_at)
+            .map(|t| now.saturating_duration_since(t))
+    }
+
+    /// The `AsyncId` the server assigned `msg_id`, if it has sent an interim
+    /// STATUS_PENDING for it.
+    fn async_id_for(&self, msg_id: MessageId) -> Option<u64> {
+        self.waiters.lock().unwrap().get(&msg_id)?.async_id
+    }
+
     /// How long `msg_id` has gone without a sign of life, or `None` if it is
     /// no longer outstanding (its response has been routed).
     fn waiter_idle_for(&self, msg_id: MessageId) -> Option<Duration> {
@@ -1398,6 +1515,9 @@ pub(crate) struct Metrics {
     /// keepalive is earning its place: each tick is a slow-but-healthy
     /// operation that the deadline alone would have killed.
     pub response_deadline_extensions: AtomicU64,
+    /// Long-poll requests retired and re-issued on the refresh cycle. Says a
+    /// handover happened, never that anything was wrong.
+    pub long_poll_refreshes: AtomicU64,
 
     // Reconnect
     /// Dials made trying to bring this connection back, across all revivals.
@@ -1449,6 +1569,7 @@ impl Metrics {
             keepalive_probes_skipped: self.keepalive_probes_skipped.load(Relaxed),
             keepalive_failures: self.keepalive_failures.load(Relaxed),
             response_deadline_extensions: self.response_deadline_extensions.load(Relaxed),
+            long_poll_refreshes: self.long_poll_refreshes.load(Relaxed),
             reconnect_attempts: self.reconnect_attempts.load(Relaxed),
             reconnects_succeeded: self.reconnects_succeeded.load(Relaxed),
             reconnects_failed: self.reconnects_failed.load(Relaxed),
@@ -2526,8 +2647,18 @@ impl Connection {
     }
 
     /// Send a CANCEL request for an outstanding operation.
+    ///
+    /// `async_id` is not optional in practice: once the server has sent an
+    /// interim STATUS_PENDING it has assigned the request an `AsyncId`, and a
+    /// cancel that does not carry it matches nothing (MS-SMB2 § 3.2.4.24).
+    /// [`outstanding_requests`](Self::outstanding_requests) reports the id for
+    /// each in-flight request, which is where a consumer gets it.
+    ///
+    /// Takes `&self`: cancelling touches only shared connection state, and a
+    /// caller who has just decided to abandon a request usually holds nothing
+    /// exclusively.
     pub async fn send_cancel(
-        &mut self,
+        &self,
         original_msg_id: MessageId,
         async_id: Option<u64>,
     ) -> Result<()> {
@@ -2684,6 +2815,7 @@ impl Connection {
                 registered_at: now,
                 sent_at: None,
                 last_activity: now,
+                async_id: None,
             },
         );
         trace!("register_waiter: msg_id={}", msg_id.0);
@@ -2726,6 +2858,7 @@ impl Connection {
                 message_id: id.0,
                 age: now.saturating_duration_since(w.registered_at),
                 sent_age: w.sent_at.map(|t| now.saturating_duration_since(t)),
+                async_id: w.async_id,
             })
             .collect();
         out.sort_by_key(|r| std::cmp::Reverse(r.age));
@@ -2766,7 +2899,20 @@ impl Connection {
             return guard.recv().await;
         };
         if is_long_poll(command) {
-            return self.await_long_poll(guard, command, timeout).await;
+            // No refresh on this path. Retiring a subscription is only useful
+            // to whoever can issue its replacement, and a caller who reached a
+            // long poll through `execute` has already handed us the only
+            // handle to it. `Watcher` owns that loop and takes
+            // `await_long_poll_refreshable` instead.
+            return match self
+                .await_long_poll(guard, command, Some(timeout), None)
+                .await?
+            {
+                LongPollOutcome::Answered(frame) => Ok(frame),
+                LongPollOutcome::RefreshDue { .. } => unreachable!(
+                    "the refresh is switched off on this path, so nothing can ask for one"
+                ),
+            };
         }
         // Bounded even when the connection is healthy: "alive" is a reason for
         // more patience, never for unlimited patience. A server answering ECHO
@@ -2836,63 +2982,124 @@ impl Connection {
         }
     }
 
+    /// Wait for a long-poll command, with a refresh cycle underneath it.
+    ///
+    /// The entry point for whoever owns the subscription loop — in this crate,
+    /// [`Watcher`](crate::Watcher). It can end two ways a plain
+    /// [`await_response`](Self::await_response) cannot express: the server
+    /// answered, or the request has been registered long enough that it should
+    /// be replaced. See [`LONG_POLL_REFRESH`] for why the second one exists at
+    /// all, and [`LongPollOutcome::RefreshDue`] for what the caller owes.
+    pub(crate) async fn await_long_poll_refreshable(
+        &self,
+        guard: WaiterGuard,
+        command: Command,
+    ) -> Result<LongPollOutcome> {
+        let budget = *self.inner.response_timeout.lock().unwrap();
+        let refresh = *self.inner.long_poll_refresh.lock().unwrap();
+        self.await_long_poll(guard, command, budget, refresh).await
+    }
+
     /// Wait for a long-poll command, bounded by the connection rather than by
-    /// the request.
+    /// the request, and retired on a cycle rather than trusted forever.
     ///
     /// A CHANGE_NOTIFY has no deadline of its own by design: it waits for an
     /// event that may never come, and hours of silence is the healthy case.
     /// That leaves it as the one wait in the crate with nothing to end it, so
-    /// a dead server used to park a `Watcher` on an event that could never
-    /// arrive. What ends it here is the connection going silent, which is a
-    /// reading only the keepalive makes meaningful — with probing off, a quiet
-    /// connection is just a quiet connection and this waits forever, as it
-    /// always did.
+    /// two separate things have to stand in for a deadline, and neither
+    /// substitutes for the other:
     ///
-    /// The clock is [`Inner::quiet_for`], not the request's own idle time: a
-    /// watcher that has been open for an hour is not a symptom of anything,
-    /// and measuring from the later of "the server last spoke" and "we asked"
-    /// gives a watch registered on an already-quiet connection its full budget
-    /// before anyone concludes anything from it.
+    /// - **`budget` ends a watch on a DEAD CONNECTION.** The clock is
+    ///   [`Inner::quiet_for`], not the request's own idle time: a watcher open
+    ///   for an hour is not a symptom of anything, while a wire that has gone
+    ///   completely silent is. Only the keepalive makes that reading mean
+    ///   anything, so with probing off a quiet connection is just a quiet
+    ///   connection and this waits forever, deliberately.
+    /// - **`refresh` retires a subscription the connection cannot speak for.**
+    ///   A server answering everything else while it has quietly forgotten one
+    ///   CHANGE_NOTIFY is, to every reading above, perfectly healthy — and it
+    ///   is what a QNAP TS-464 did for 6,186 s on 2026-08-03. ❌ This is not a
+    ///   detector and cannot be built into one: a forgotten subscription and an
+    ///   untouched directory are the same observation. It just declines to
+    ///   trust one request indefinitely.
+    ///
+    /// The death verdict is checked first. A refresh on a corpse would replace
+    /// a subscription on a session that has nothing left to subscribe to, and
+    /// hide the error the consumer needs.
     async fn await_long_poll(
         &self,
         mut guard: WaiterGuard,
         command: Command,
-        budget: Duration,
-    ) -> Result<Frame> {
+        budget: Option<Duration>,
+        refresh: Option<Duration>,
+    ) -> Result<LongPollOutcome> {
         let msg_id = guard.msg_id();
-        let tick = (budget / 4).clamp(Duration::from_millis(25), Duration::from_secs(1));
-        let mut receiving = Box::pin(guard.recv());
+        // Nothing to wake up for: no death bound and no refresh means the wait
+        // is exactly as unbounded as the crate used to make it.
+        let Some(shortest) = [budget, refresh].into_iter().flatten().min() else {
+            return guard.recv().await.map(LongPollOutcome::Answered);
+        };
+        let tick = (shortest / 4).clamp(Duration::from_millis(25), Duration::from_secs(1));
         loop {
-            let idle_check = Box::pin(tokio::time::sleep(tick));
-            match select(receiving, idle_check).await {
-                Either::Left((frame, _)) => return frame,
-                Either::Right((_, still_receiving)) => {
-                    receiving = still_receiving;
-                    // The response has been routed and the next poll will
-                    // produce it — never a timeout.
-                    if self.inner.waiter_idle_for(msg_id).is_none() {
-                        continue;
-                    }
-                    // The same verdict an ordinary request's deadline reaches,
-                    // on the connection's clock instead of the request's, and
-                    // held to the response deadline's budget rather than to
-                    // the shorter window that merely withholds an extension.
-                    let Some(quiet) = self.inner.unresponsive_for().filter(|q| *q >= budget) else {
-                        continue;
-                    };
-                    self.remove_waiter(msg_id);
-                    self.inner
-                        .metrics
-                        .response_timeouts
-                        .fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "no sign of life: cmd={:?}, msg_id={}, nothing on the wire for {:?} \
-                         while this long poll waited; giving up on it",
-                        command, msg_id.0, quiet
-                    );
-                    return Err(self.declare_unresponsive(quiet));
-                }
+            // A fresh `recv()` future per tick rather than one long-lived one.
+            // Cancelling it loses nothing — the `oneshot` holds the value until
+            // a poll takes it — and unlike a pinned future held across the loop
+            // it leaves the guard free to be inspected and retired below.
+            match tokio::time::timeout(tick, guard.recv()).await {
+                Ok(frame) => return frame.map(LongPollOutcome::Answered),
+                Err(_tick_elapsed) => {}
             }
+            // The response has been routed and the next poll will produce
+            // it — never a timeout.
+            if self.inner.waiter_idle_for(msg_id).is_none() {
+                continue;
+            }
+            // The same verdict an ordinary request's deadline reaches, on the
+            // connection's clock instead of the request's, and held to the
+            // response deadline's budget rather than to the shorter window that
+            // merely withholds an extension.
+            if let Some(quiet) =
+                budget.and_then(|b| self.inner.unresponsive_for().filter(|q| *q >= b))
+            {
+                self.remove_waiter(msg_id);
+                self.inner
+                    .metrics
+                    .response_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "no sign of life: cmd={:?}, msg_id={}, nothing on the wire for {:?} \
+                     while this long poll waited; giving up on it",
+                    command, msg_id.0, quiet
+                );
+                return Err(self.declare_unresponsive(quiet));
+            }
+            let Some(registered_for) =
+                refresh.and_then(|r| self.inner.waiter_sent_age(msg_id).filter(|age| *age >= r))
+            else {
+                continue;
+            };
+            // One last look before walking away. A response that landed in the
+            // moment between "parked long enough" and "retire it" is a real
+            // answer, and discarding it would turn a routine handover into lost
+            // events.
+            if let Some(frame) = guard.try_recv() {
+                return frame.map(LongPollOutcome::Answered);
+            }
+            let async_id = guard.async_id();
+            // Dropping the guard deregisters the waiter, so a response that
+            // arrives after this counts as late-after-drop rather than as a
+            // frame nobody asked for.
+            drop(guard);
+            self.inner
+                .metrics
+                .long_poll_refreshes
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "long poll refresh: cmd={:?}, msg_id={}, registered {:?} ago; retiring it for \
+                 a fresh one (routine, not a fault)",
+                command, msg_id.0, registered_for
+            );
+            return Ok(LongPollOutcome::RefreshDue { msg_id, async_id });
         }
     }
 
@@ -2996,6 +3203,45 @@ impl Connection {
     /// session is re-dialed. Neither switches the other on.
     pub fn set_keepalive(&self, after: Option<Duration>) {
         *self.inner.keepalive_after.lock().unwrap() = after;
+    }
+
+    /// How long one long-poll request (CHANGE_NOTIFY) may stay registered with
+    /// the server before the client retires it and issues a fresh one. `None`
+    /// keeps a single subscription open indefinitely.
+    ///
+    /// Defaults to 10 minutes. **It is a self-healing cycle, not a detector.**
+    /// A subscription the server has silently dropped and a directory nobody
+    /// has touched look identical from here — both are silence — so nothing can
+    /// tell them apart and any attempt to would end healthy watches. Re-issuing
+    /// on a cycle needs no such judgment: a lost subscription comes back within
+    /// one interval, and a live one is never disturbed by more than a handover.
+    ///
+    /// This is the only bound a long poll has of its own.
+    /// [`set_response_timeout`](Self::set_response_timeout) exempts it (waiting
+    /// for an event that may never come is the job), and the connection-level
+    /// bound behind [`set_keepalive`](Self::set_keepalive) only fires when the
+    /// whole wire goes quiet — so a server answering everything except this one
+    /// subscription is invisible to both. A QNAP TS-464 held two CHANGE_NOTIFY
+    /// requests for 6,186 s that way while answering `fs_info` in 4 ms
+    /// (2026-08-03).
+    ///
+    /// Watch [`MetricsSnapshot::long_poll_refreshes`](crate::client::diagnostics::MetricsSnapshot::long_poll_refreshes)
+    /// to see cycles happening. On a healthy watch it climbs at roughly one per
+    /// interval per watched directory; it says a refresh happened, never that
+    /// anything was wrong.
+    ///
+    /// Shorten it if a stale watch is expensive for your application, but
+    /// ❌ don't shorten it hoping to detect faster: there is nothing to detect,
+    /// and each cycle is one more handover an event can slip through. `None`
+    /// suits a consumer that re-creates its own watchers periodically.
+    pub fn set_long_poll_refresh(&self, after: Option<Duration>) {
+        *self.inner.long_poll_refresh.lock().unwrap() = after;
+    }
+
+    /// The current long-poll refresh interval. See
+    /// [`set_long_poll_refresh`](Self::set_long_poll_refresh).
+    pub fn long_poll_refresh(&self) -> Option<Duration> {
+        *self.inner.long_poll_refresh.lock().unwrap()
     }
 
     /// Frames handed to the writer task and not yet written.
@@ -3858,6 +4104,12 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
         // slow operation the server has acknowledged would be timed out.
         if let Some(waiter) = inner.waiters.lock().unwrap().get_mut(&header.message_id) {
             waiter.last_activity = std::time::Instant::now();
+            // Remember the id a CANCEL for this request will have to carry
+            // (MS-SMB2 § 3.2.4.24). The interim response is the only place the
+            // server ever states it.
+            if let Some(async_id) = header.async_id {
+                waiter.async_id = Some(async_id);
+            }
         }
         debug!(
             "recv: STATUS_PENDING (interim), cmd={:?}, msg_id={}",
@@ -4564,6 +4816,18 @@ mod tests {
             "'alive' is a reason for more patience, not unlimited patience: nobody \
              watching a frozen transfer waits out five minutes"
         );
+        assert!(
+            LONG_POLL_REFRESH > RESPONSE_TIMEOUT.saturating_mul(ALIVE_DEADLINE_FACTOR),
+            "the refresh is the slowest clock on a connection, and has to stay that way: \
+             everything faster than it is about detecting a death, and a refresh detects \
+             nothing. One that fired inside the window where a request can still be \
+             declared dead would replace subscriptions on a session about to be torn down"
+        );
+        assert!(
+            LONG_POLL_REFRESH >= Duration::from_secs(60),
+            "a refresh costs three frames per watched directory and heals nothing faster \
+             for being frequent — there is nothing to detect, only a bet not to make"
+        );
     }
 
     /// CHANGE_NOTIFY waits for an event that may never come. Applying a
@@ -5170,6 +5434,52 @@ mod tests {
             Some(Duration::from_millis(0))
         );
         warn_on_stale_waiters(&conn.inner); // must not panic, and must consider it
+    }
+
+    /// A CANCEL has to carry the `AsyncId` the server assigned, so the client
+    /// has to remember it from the one frame that ever states it.
+    ///
+    /// Without this a retired long poll cannot be retired: MS-SMB2 § 3.2.4.24
+    /// says a cancel for a request that has been given an `AsyncId` must carry
+    /// it, and one sent against the `MessageId` alone matches nothing — so the
+    /// server would keep every subscription the refresh cycle walks away from.
+    #[tokio::test]
+    async fn an_interim_pending_response_records_the_async_id_a_cancel_needs() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        let guard = conn
+            .register_waiter(MessageId(5), Command::ChangeNotify)
+            .unwrap();
+        assert_eq!(guard.async_id(), None, "nothing has been told to us yet");
+
+        let mut h = Header::new_request(Command::ChangeNotify);
+        h.flags.set_response();
+        h.flags.set_async();
+        h.message_id = MessageId(5);
+        h.status = NtStatus::PENDING;
+        h.async_id = Some(0xFEED_FACE_DEAD_BEEF);
+        let interim = pack_message(&h, &crate::msg::echo::EchoResponse);
+        let action = prepare_sub_frame(&interim, false, &conn.inner)
+            .expect("the interim response should be handled");
+        assert!(
+            matches!(action, SubFrameAction::Skip),
+            "an interim response is not the answer, so nothing is routed"
+        );
+
+        assert_eq!(
+            guard.async_id(),
+            Some(0xFEED_FACE_DEAD_BEEF),
+            "the interim STATUS_PENDING is the only frame that ever states the AsyncId"
+        );
+        assert_eq!(
+            conn.outstanding_requests()[0].async_id,
+            Some(0xFEED_FACE_DEAD_BEEF),
+            "and a consumer driving send_cancel itself has to be able to read it"
+        );
     }
 
     #[tokio::test]
