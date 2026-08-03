@@ -1581,18 +1581,24 @@ async fn a_watch_survives_repeated_refreshes_on_the_nas() {
                 .connect_share("naspi")
                 .await
                 .expect("tree connect failed (watcher)");
+            // Its own directory, not the shared `_test/`: the other watch test
+            // creates and deletes files there, and a sibling test's event would
+            // end this watch before a single refresh had happened.
             let _ = watcher_client
                 .create_directory(&mut watcher_share, "_test")
                 .await;
-            let test_file_path = "_test/smb2_refresh_test.tmp";
-            // A leftover from an earlier run would make the write a "modified"
-            // rather than an "added", and would survive a panicking run.
+            let _ = watcher_client
+                .create_directory(&mut watcher_share, "_test/refresh_probe")
+                .await;
+            let test_file_path = "_test/refresh_probe/smb2_refresh_test.tmp";
+            // A leftover would survive a panicking run and make the write a
+            // "modified" rather than an "added".
             let _ = watcher_client
                 .delete_file(&mut watcher_share, test_file_path)
                 .await;
 
             let mut watcher = watcher_client
-                .watch(&watcher_share, "_test/", false)
+                .watch(&watcher_share, "_test/refresh_probe/", false)
                 .await
                 .expect("watch failed");
             let writer_task = tokio::task::spawn_local(async move {
