@@ -16,6 +16,12 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
   - **Cost and settings.** Three frames per cycle per watched directory. `set_long_poll_refresh(None)` restores the old behavior, which suits a consumer that re-creates its own watchers on a schedule. Watch `MetricsSnapshot::long_poll_refreshes` to see cycles happening -- it counts handovers, never faults. ❌ Shortening the interval detects nothing faster; there is nothing to detect.
   - **No API breaks.** `Connection::set_long_poll_refresh` / `long_poll_refresh` and `MetricsSnapshot::long_poll_refreshes` are new; `OutstandingRequest` gained an `async_id` field (a struct nothing constructs outside the crate); `Connection::send_cancel` relaxed from `&mut self` to `&self`, which accepts strictly more callers. `Watcher::next_events` behaves the same from the outside: a refresh is a handover, so the caller never sees one.
 
+### Changed
+
+- **A parked CHANGE_NOTIFY is no longer logged as a stalled request.** The stale-request sweeper's every line means "this should have come back by now", which for a long poll is false by construction -- the deadline exempts it precisely because hours of silence is healthy. Warning about it every 10 s anyway was the sweeper contradicting the deadline, and at that volume it buried the lines that matter: a file manager watching two panes logged 5,911 `WARN`s in six hours about requests nothing was ever going to answer.
+  - They stay observable, in the two places worth being observable: at `TRACE` on every sweep, and named in full at `WARN` whenever a genuine stale request is reported, because a wedge investigation wants the whole in-flight picture rather than a filtered one. The per-request naming that the 2026-07-31 incident asked for is untouched for every command that can actually stall.
+  - With the refresh cycle above, a long poll no longer stays parked longer than the interval either, so the state the old lines described is now bounded rather than perpetual.
+
 ## [0.16.1] - 2026-08-02
 
 ### Fixed

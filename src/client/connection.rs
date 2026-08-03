@@ -404,6 +404,39 @@ fn is_long_poll(command: Command) -> bool {
     matches!(command, Command::ChangeNotify)
 }
 
+/// Split what is outstanding into "should have come back by now" and "waiting
+/// for an event, as designed".
+///
+/// Separated from the logging so the split itself can be tested: which bucket a
+/// command lands in is the decision, and the rest is formatting.
+#[allow(clippy::type_complexity)]
+fn classify_outstanding(
+    inner: &Inner,
+    threshold: std::time::Duration,
+) -> (
+    Vec<(
+        MessageId,
+        Command,
+        std::time::Duration,
+        Option<std::time::Duration>,
+    )>,
+    Vec<(MessageId, Command, std::time::Duration)>,
+) {
+    let now = std::time::Instant::now();
+    let mut stale = Vec::new();
+    let mut parked = Vec::new();
+    for (id, w) in inner.waiters.lock().unwrap().iter() {
+        let age = now.saturating_duration_since(w.registered_at);
+        if is_long_poll(w.command) {
+            parked.push((*id, w.command, age));
+        } else if age >= threshold {
+            let sent_age = w.sent_at.map(|t| now.saturating_duration_since(t));
+            stale.push((*id, w.command, age, sent_age));
+        }
+    }
+    (stale, parked)
+}
+
 /// Periodically report requests that have gone unanswered, for as long as the
 /// connection lives.
 ///
@@ -600,28 +633,23 @@ async fn keepalive_loop(weak: Weak<Inner>) {
 /// Deliberately re-reports on every sweep: a connection that keeps serving small
 /// requests while a large write hangs looks healthy by every other measure, so
 /// the repetition is the signal.
+///
+/// ❌ **Long polls are not warned about.** The premise of every line here is
+/// "this should have come back by now", and for a CHANGE_NOTIFY that premise is
+/// false by construction — [`is_long_poll`] exempts it from the deadline
+/// precisely because hours of silence is the healthy case, so warning about it
+/// every sweep is the sweeper contradicting the deadline. A file manager
+/// watching two panes produced 5,911 WARN lines in six hours that way, about
+/// requests nothing was ever going to answer, and noise at that volume costs
+/// the genuine lines their meaning. They stay observable two ways instead: at
+/// TRACE every sweep, and named in full whenever a REAL stale request is
+/// warned about, since a wedge investigation wants the whole in-flight picture.
 fn warn_on_stale_waiters(inner: &Inner) {
     let Some(threshold) = *inner.stale_request_after.lock().unwrap() else {
         return; // consumer turned the warning off
     };
-    let now = std::time::Instant::now();
-    let stale: Vec<(
-        MessageId,
-        Command,
-        std::time::Duration,
-        Option<std::time::Duration>,
-    )> = inner
-        .waiters
-        .lock()
-        .unwrap()
-        .iter()
-        .filter_map(|(id, w)| {
-            let age = now.saturating_duration_since(w.registered_at);
-            let sent_age = w.sent_at.map(|t| now.saturating_duration_since(t));
-            (age >= threshold).then_some((*id, w.command, age, sent_age))
-        })
-        .collect();
-    for (msg_id, command, age, sent_age) in stale {
+    let (stale, parked) = classify_outstanding(inner, threshold);
+    for (msg_id, command, age, sent_age) in &stale {
         match sent_age {
             Some(sent) => warn!(
                 "outstanding request: cmd={:?}, msg_id={}, sent {:?} ago, no response",
@@ -638,6 +666,31 @@ fn warn_on_stale_waiters(inner: &Inner) {
                 inner.send_queue_depth.load(Ordering::Relaxed)
             ),
         }
+    }
+    if parked.is_empty() {
+        return;
+    }
+    let describe = || {
+        parked
+            .iter()
+            .map(|(id, command, age)| format!("{command:?}/{} parked {age:?}", id.0))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if stale.is_empty() {
+        // The healthy shape, and by far the common one. Nothing is wrong, so
+        // nothing above TRACE should say anything.
+        trace!(
+            "long polls outstanding (waiting for events, as designed): {}",
+            describe()
+        );
+    } else {
+        // Something IS wrong, and a reader diagnosing it wants every request
+        // on the connection named, not just the ones that broke a threshold.
+        warn!(
+            "also outstanding, but waiting for events by design rather than stalled: {}",
+            describe()
+        );
     }
 }
 
@@ -5434,6 +5487,45 @@ mod tests {
             Some(Duration::from_millis(0))
         );
         warn_on_stale_waiters(&conn.inner); // must not panic, and must consider it
+    }
+
+    /// A parked long poll is never reported as a stalled request.
+    ///
+    /// The sweeper's every line means "this should have come back by now", and
+    /// for a CHANGE_NOTIFY that is false by construction — the deadline exempts
+    /// it precisely because hours of silence is the healthy case. Warning about
+    /// it anyway is the sweeper contradicting the deadline, and at the
+    /// sweeper's cadence it buries every genuine line: a file manager watching
+    /// two panes logged 5,911 WARNs in six hours that way (2026-08-03).
+    #[tokio::test]
+    async fn a_parked_long_poll_is_never_reported_as_a_stalled_request() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        let _watch = conn
+            .register_waiter(MessageId(1), Command::ChangeNotify)
+            .unwrap();
+        let _write = conn.register_waiter(MessageId(2), Command::Write).unwrap();
+
+        // Zero threshold: everything outstanding is old enough to be called
+        // out, so only the classification can keep the long poll out.
+        let (stale, parked) = classify_outstanding(&conn.inner, Duration::from_millis(0));
+
+        assert_eq!(
+            stale.iter().map(|s| s.1).collect::<Vec<_>>(),
+            vec![Command::Write],
+            "only the request the server actually owes an answer for is stale"
+        );
+        assert_eq!(
+            parked.iter().map(|p| p.1).collect::<Vec<_>>(),
+            vec![Command::ChangeNotify],
+            "the long poll still has to be VISIBLE — it is reported at TRACE, and named \
+             in full whenever a real stale request is warned about, because a wedge \
+             investigation wants the whole in-flight picture"
+        );
     }
 
     /// A CANCEL has to carry the `AsyncId` the server assigned, so the client

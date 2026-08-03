@@ -72,6 +72,7 @@ Before that, only the response deadline removed a waiter, which inflated the dia
   queued for the transport. ❌ Never read a large `age` as "the server didn't answer" without checking `sent_age`
   first — that conflation is what sent three investigations after an innocent server.
 - The stale-request warning says which case it is, and reports the send-queue depth when a request isn't on the wire.
+- ❌ **Long polls are never warned about.** Every line the sweeper writes means "this should have come back by now", which for a CHANGE_NOTIFY is false by construction, so warning about one is the sweeper contradicting the deadline. At the sweeper's cadence it also buries the genuine lines: a file manager watching two panes logged 5,911 `WARN`s in six hours about requests nothing was ever going to answer (2026-08-03). They stay observable at `TRACE` every sweep, and named in full at `WARN` alongside any REAL stale request, because a wedge investigation wants the whole in-flight picture. `classify_outstanding` owns the split so it can be tested apart from the formatting.
 - Dropping a guard records the id in a bounded ring so a late response still counts as `responses_late_after_drop`
   rather than `responses_stray`; without it, routine cancellation would drown the "we got a frame we never asked for"
   signal.
