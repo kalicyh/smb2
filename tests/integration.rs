@@ -1552,6 +1552,108 @@ async fn watch_directory_on_nas() {
         .await;
 }
 
+/// A watch survives the refresh cycle on a real server, and still delivers.
+///
+/// The cycle exists because a QNAP TS-464 held two CHANGE_NOTIFY requests for
+/// 6,186 s without answering while it answered everything else on the same
+/// connection (2026-08-03), and nothing can tell that apart from a directory
+/// nobody has touched. So the client stops trusting one subscription and
+/// re-issues on a timer instead -- which is only safe if a real server tolerates
+/// being CANCELled and re-asked repeatedly on the same handle. A mock cannot
+/// answer that; this can.
+///
+/// Runs with the interval scaled down to 3 s so several cycles fit in a test.
+#[tokio::test]
+#[ignore]
+async fn a_watch_survives_repeated_refreshes_on_the_nas() {
+    let _ = env_logger::try_init();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut watcher_client = connect_client_to_nas().await;
+            // Well under the 10-minute default, so the test observes cycles
+            // rather than the clock.
+            watcher_client
+                .connection_mut()
+                .set_long_poll_refresh(Some(Duration::from_secs(3)));
+            let mut watcher_share = watcher_client
+                .connect_share("naspi")
+                .await
+                .expect("tree connect failed (watcher)");
+            let _ = watcher_client
+                .create_directory(&mut watcher_share, "_test")
+                .await;
+            let test_file_path = "_test/smb2_refresh_test.tmp";
+            // A leftover from an earlier run would make the write a "modified"
+            // rather than an "added", and would survive a panicking run.
+            let _ = watcher_client
+                .delete_file(&mut watcher_share, test_file_path)
+                .await;
+
+            let mut watcher = watcher_client
+                .watch(&watcher_share, "_test/", false)
+                .await
+                .expect("watch failed");
+            let writer_task = tokio::task::spawn_local(async move {
+                let mut writer_client = connect_client_to_nas().await;
+                let mut writer_share = writer_client
+                    .connect_share("naspi")
+                    .await
+                    .expect("tree connect failed (writer)");
+                // Long enough for several refresh cycles to have come and gone
+                // before anything happens in the directory.
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                writer_client
+                    .write_file(&mut writer_share, test_file_path, b"refresh test")
+                    .await
+                    .expect("write_file failed");
+                (writer_client, writer_share)
+            });
+
+            // The whole test: the watch is parked across several handovers and
+            // still sees the event afterwards. A server that objected to being
+            // CANCELled and re-asked would surface here as an error or a miss.
+            let events = tokio::time::timeout(Duration::from_secs(30), watcher.next_events())
+                .await
+                .expect("timed out: the watch did not survive its refresh cycles")
+                .expect("next_events failed after refreshing");
+
+            let refreshes = watcher_client
+                .connection_mut()
+                .diagnostics()
+                .metrics
+                .long_poll_refreshes;
+            println!("refreshes during the watch: {refreshes}");
+            assert!(
+                refreshes >= 2,
+                "the test is supposed to span several cycles, saw {refreshes}"
+            );
+            // Which action the server reports is its business (a leftover file
+            // from a previous run turns "added" into "modified"); that an event
+            // about this file arrived at all is the whole assertion.
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.filename.contains("smb2_refresh_test")),
+                "expected an event for the written file after {refreshes} refresh(es), got: {:?}",
+                events
+                    .iter()
+                    .map(|e| format!("{}: {}", e.action, e.filename))
+                    .collect::<Vec<_>>()
+            );
+
+            watcher.close().await.expect("watcher close failed");
+            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
+            writer_client
+                .delete_file(&mut writer_share, test_file_path)
+                .await
+                .expect("delete_file failed");
+            let _ = writer_client.disconnect_share(&writer_share).await;
+        })
+        .await;
+}
+
 /// Probes whether the QNAP accepts **two simultaneous CHANGE_NOTIFY
 /// requests on the same directory handle** — the property the pipelined-
 /// watcher fix depends on.
