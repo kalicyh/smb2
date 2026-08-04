@@ -508,9 +508,10 @@ fn classify_status(status: NtStatus) -> ErrorKind {
         NtStatus::PATH_NOT_COVERED => ErrorKind::DfsReferral,
 
         // Unsupported operation (server lacks the feature, e.g. server-side copy)
-        NtStatus::NOT_SUPPORTED | NtStatus::INVALID_DEVICE_REQUEST | NtStatus::NOT_IMPLEMENTED => {
-            ErrorKind::Unsupported
-        }
+        NtStatus::NOT_SUPPORTED
+        | NtStatus::INVALID_INFO_CLASS
+        | NtStatus::INVALID_DEVICE_REQUEST
+        | NtStatus::NOT_IMPLEMENTED => ErrorKind::Unsupported,
 
         // Everything else
         _ => ErrorKind::Other,
@@ -568,6 +569,7 @@ mod tests {
         (NtStatus::PATH_NOT_COVERED, ErrorKind::DfsReferral),
         // Unsupported operation
         (NtStatus::NOT_SUPPORTED, ErrorKind::Unsupported),
+        (NtStatus::INVALID_INFO_CLASS, ErrorKind::Unsupported),
         (NtStatus::INVALID_DEVICE_REQUEST, ErrorKind::Unsupported),
         (NtStatus::NOT_IMPLEMENTED, ErrorKind::Unsupported),
         // Documented `Other` (no current consumer demand for a typed variant)
